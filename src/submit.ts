@@ -55,6 +55,7 @@ export async function submitClaim(req: SubmitClaimRequest): Promise<any> {
       topic: req.topic,
       author: req.author,
       claim_type: ct,
+      attribution: req.attribution,
     });
     return { ...result, dossier_slug: slug, source_url: req.source_url };
   }

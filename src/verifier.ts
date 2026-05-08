@@ -123,6 +123,7 @@ export async function verifyClaim(
     topic?: string;
     author?: string;
     claim_type?: ClaimType;
+    attribution?: string;
   } = {},
 ): Promise<VerifyResult & { claim_id: number }> {
   const dossier = store.getDossier(dossierSlug);
@@ -150,8 +151,10 @@ export async function verifyClaim(
     content.length <= CHUNK_SIZE * 2 ? content : await retrieveRelevant(content, claim);
   const result = await verifyClaimAgainstSource(claim, source);
 
-  // Auto-attribution: prefer dossier.author_attribution, fall back to title
-  const attribution = dossier.author_attribution || dossier.title || null;
+  // Attribution priority: explicit --attribution arg > dossier.author_attribution.
+  // Do NOT auto-fill from dossier.title — title often defaults to the URL when
+  // --source-title isn't passed, which is a poor "attribution" string.
+  const attribution = opts.attribution || dossier.author_attribution || null;
 
   // Locate source quote position in dossier content (best-effort substring search
   // — only meaningful for ATOMIC/QUOTATION where source_quote was provided
