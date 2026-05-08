@@ -12,7 +12,7 @@
  */
 import * as store from "./store.ts";
 import { embedOne } from "./embedder.ts";
-import { verifyClaim } from "./verifier.ts";
+import { TransientVerifierError, verifyClaim } from "./verifier.ts";
 import { findQuoteInContent } from "./quote-match.ts";
 import type { ClaimType, SubmitClaimRequest } from "./types.ts";
 

@@ -12,6 +12,7 @@ import * as store from "./store.ts";
 import { submitClaim } from "./submit.ts";
 import { embedOne } from "./embedder.ts";
 import { fetchAndStore } from "./fetch.ts";
+import { TransientVerifierError } from "./verifier.ts";
 import type { ClaimType } from "./types.ts";
 
 const program = new Command()
@@ -97,19 +98,34 @@ program
           .filter((n) => !isNaN(n))
       : undefined;
     const sources = opts.sources ? JSON.parse(opts.sources) : undefined;
-    const result = await submitClaim({
-      text,
-      claim_type: type,
-      topic: opts.topic,
-      attribution: opts.attribution,
-      author: opts.author,
-      dossier_slug: opts.dossier,
-      source_quote: opts.sourceQuote,
-      sources,
-      depends_on_ids: dependsOn,
-      soft_score: opts.softScore,
-    });
-    emit(result);
+    try {
+      const result = await submitClaim({
+        text,
+        claim_type: type,
+        topic: opts.topic,
+        attribution: opts.attribution,
+        author: opts.author,
+        dossier_slug: opts.dossier,
+        source_quote: opts.sourceQuote,
+        sources,
+        depends_on_ids: dependsOn,
+        soft_score: opts.softScore,
+      });
+      emit(result);
+    } catch (e: any) {
+      if (e instanceof TransientVerifierError) {
+        // Surface transient/system errors clearly. NOT recorded in the KB —
+        // these don't carry information about the (claim, source) pair.
+        emit({
+          error: e.message,
+          kind: e.kind,
+          hint: e.hint,
+          recorded: false,
+        });
+        process.exit(2);
+      }
+      throw e;
+    }
   });
 
 // ---------- list-claims ----------

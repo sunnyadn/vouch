@@ -7,6 +7,43 @@ import { embedBatch } from "./embedder.ts";
 import * as store from "./store.ts";
 import type { ClaimType, VerifyResult } from "./types.ts";
 
+/** Thrown when the verifier failed for a system reason (auth expired, network
+ *  unreachable, provider quota) — NOT for an evidence outcome. Caller must
+ *  bail without recording the claim, since these errors are not informative
+ *  about the (claim, source) pair. */
+export class TransientVerifierError extends Error {
+  constructor(public kind: "auth" | "network" | "quota" | "unknown", message: string, public hint?: string) {
+    super(message);
+    this.name = "TransientVerifierError";
+  }
+}
+
+function classifyError(e: unknown): TransientVerifierError | null {
+  const msg = (e instanceof Error ? e.message : String(e)) || "";
+  const lower = msg.toLowerCase();
+  if (
+    lower.includes("invalid_rapt") ||
+    lower.includes("reauth") ||
+    lower.includes("invalid_grant") ||
+    lower.includes("could not load the default credentials") ||
+    lower.includes("unauthenticated") ||
+    /\b401\b/.test(msg)
+  ) {
+    return new TransientVerifierError(
+      "auth",
+      "Vertex / provider auth expired or missing.",
+      "Refresh credentials. For Vertex: run `gcloud auth application-default login`. For OpenAI/Anthropic: check the API key env var.",
+    );
+  }
+  if (lower.includes("rate limit") || /\b429\b/.test(msg) || lower.includes("resource_exhausted")) {
+    return new TransientVerifierError("quota", `Provider rate limit / quota: ${msg.slice(0, 200)}`);
+  }
+  if (lower.includes("econnrefused") || lower.includes("etimedout") || lower.includes("enetunreach")) {
+    return new TransientVerifierError("network", `Network unreachable: ${msg.slice(0, 200)}`);
+  }
+  return null;
+}
+
 const CHUNK_SIZE = 1500;
 const CHUNK_OVERLAP = 300;
 const RETRIEVAL_K = 3;
@@ -107,6 +144,12 @@ export async function verifyClaimAgainstSource(
       verifier: VERIFIER_MODEL,
     };
   } catch (e: any) {
+    // Re-throw transient/system errors so the caller can bail without
+    // recording a phantom claim. Only "verifier returned an answer that
+    // wasn't parseable" or other content-level issues fall through to the
+    // insufficient-status path.
+    const transient = classifyError(e);
+    if (transient) throw transient;
     return {
       status: "insufficient",
       score: 0,
