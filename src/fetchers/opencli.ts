@@ -12,8 +12,9 @@
  *  Chrome browser-bridge extension connected (`opencli doctor` should be
  *  green). If either is missing this fetcher throws a clear actionable error.
  */
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, isAbsolute } from "node:path";
 
 import type { Fetcher, FetcherResult } from "./types.ts";
 import { stripInlineMarkdown } from "./markitdown.ts";
@@ -39,19 +40,27 @@ interface OpenCliReadResult {
   title?: string;
   author?: string;
   publish_time?: string;
-  size?: number;
+  size?: string | number;
+  /** OpenCLI v1.7 envelope field — relative path to saved Markdown file. */
+  saved?: string;
+  /** Resolved absolute path; populated by the wrapper. */
+  resolvedPath?: string;
   content?: string;
-  output_path?: string;
   url?: string;
   error?: string;
 }
 
 async function readViaOpenCli(url: string, opts: { wait?: number } = {}): Promise<OpenCliReadResult> {
+  // Use a per-call temp dir so we can find the output deterministically and
+  // clean up after ourselves regardless of the caller's cwd.
+  const tmpDir = mkdtempSync(join(tmpdir(), "vouch-opencli-"));
   const args = [
     "web",
     "read",
     "--url",
     url,
+    "--output",
+    tmpDir,
     "--download-images",
     "false",
     "--wait",
@@ -60,6 +69,7 @@ async function readViaOpenCli(url: string, opts: { wait?: number } = {}): Promis
     "json",
   ];
   const proc = Bun.spawn(["opencli", ...args], {
+    cwd: tmpDir,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -91,7 +101,31 @@ async function readViaOpenCli(url: string, opts: { wait?: number } = {}): Promis
   if (r?.status && r.status !== "success" && r.status !== "ok") {
     throw new Error(`opencli web read status=${r.status}: ${JSON.stringify(r).slice(0, 300)}`);
   }
+  if (r) {
+    r.resolvedPath = resolveSavedPath(r.saved, tmpDir);
+  }
+  // Caller is responsible for reading content first, then cleaning the tmp dir.
+  // We stash the path so cleanup can happen in the outer fetch() in a finally.
+  (r as any)._tmpDir = tmpDir;
   return r || {};
+}
+
+function resolveSavedPath(saved: string | undefined, baseDir: string): string | undefined {
+  if (!saved) return undefined;
+  if (isAbsolute(saved) && existsSync(saved)) return saved;
+  const rel = join(baseDir, saved);
+  if (existsSync(rel)) return rel;
+  // OpenCLI sometimes writes relative to its own cwd which we set to baseDir,
+  // but if a future version changes the prefix we still try a few sensible
+  // bases before giving up.
+  const candidates = [
+    join(process.cwd(), saved),
+    join(baseDir, saved.replace(/^web-articles\//, "")),
+  ];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return undefined;
 }
 
 export class OpenCliBridgeError extends Error {
@@ -101,29 +135,24 @@ export class OpenCliBridgeError extends Error {
   }
 }
 
-/** Read the markdown content opencli wrote to disk for this URL. opencli's
- *  web read emits the body to a file (in --output dir) and only reports
- *  metadata + the file path in the JSON envelope. */
+/** Read the markdown content opencli wrote to disk for this URL. */
 async function readMarkdownFile(result: OpenCliReadResult): Promise<string> {
   if (result.content && result.content.length > 100) return result.content;
-  const path = (result as any).output_path || (result as any).path || (result as any).file;
-  if (path && existsSync(path)) {
-    return await Bun.file(path).text();
+  if (result.resolvedPath && existsSync(result.resolvedPath)) {
+    return await Bun.file(result.resolvedPath).text();
   }
-  // Some opencli versions write to ./web-articles/<slug>.md
-  // Fallback: scan default output dir for the most recent .md file
-  const defaultDir = join(process.cwd(), "web-articles");
-  if (existsSync(defaultDir)) {
+  // Last-resort: scan the tmp dir we passed as --output for the newest .md
+  const tmpDir = (result as any)._tmpDir as string | undefined;
+  if (tmpDir && existsSync(tmpDir)) {
     const files = await Array.fromAsync(
-      new Bun.Glob("*.md").scan({ cwd: defaultDir }),
+      new Bun.Glob("**/*.md").scan({ cwd: tmpDir }),
     );
     if (files.length) {
-      // Use most recently modified
       const stats = await Promise.all(
         files.map(async (f) => {
-          const fullPath = join(defaultDir, f);
-          const stat = await Bun.file(fullPath).stat();
-          return { path: fullPath, mtime: stat.mtimeMs };
+          const full = join(tmpDir, f);
+          const stat = await Bun.file(full).stat();
+          return { path: full, mtime: stat.mtimeMs };
         }),
       );
       stats.sort((a, b) => b.mtime - a.mtime);
@@ -145,34 +174,51 @@ export class OpenCliFetcher implements Fetcher {
   async fetch(url: string): Promise<FetcherResult> {
     if (!opencliAvailable()) {
       throw new Error(
-        "opencli CLI is not on PATH. Install: npm install -g @jackwener/opencli",
+        "opencli CLI is not on PATH. Install: bun install -g @jackwener/opencli",
       );
     }
 
     const result = await readViaOpenCli(url);
-    const rawMd = await readMarkdownFile(result);
-    if (!rawMd || rawMd.length < 50) {
-      throw new Error(
-        `opencli web read returned empty or near-empty content for ${url} (got ${rawMd.length} chars)`,
-      );
+    const tmpDir = (result as any)._tmpDir as string | undefined;
+    try {
+      const rawMd = await readMarkdownFile(result);
+      if (!rawMd || rawMd.length < 50) {
+        throw new Error(
+          `opencli web read returned empty or near-empty content for ${url} (got ${rawMd.length} chars). saved=${result.saved}`,
+        );
+      }
+      const text = stripInlineMarkdown(rawMd);
+      return {
+        content: text.slice(0, 300_000),
+        title: result.title || url.slice(0, 200),
+        source_type: "opencli",
+        publication_date: result.publish_time
+          ? toIsoDate(result.publish_time)
+          : null,
+        author_attribution: result.author || null,
+        metadata: {
+          fetched_via: "opencli web read",
+          fetched_at: new Date().toISOString(),
+          size_reported: result.size,
+          text_chars: text.length,
+          original_md_chars: rawMd.length,
+        },
+      };
+    } finally {
+      if (tmpDir && existsSync(tmpDir)) {
+        try {
+          rmSync(tmpDir, { recursive: true, force: true });
+        } catch {
+          // ignore cleanup failures
+        }
+      }
     }
-
-    const text = stripInlineMarkdown(rawMd);
-    return {
-      content: text.slice(0, 300_000),
-      title: result.title || url.slice(0, 200),
-      source_type: "opencli",
-      publication_date: result.publish_time
-        ? result.publish_time.slice(0, 10)
-        : null,
-      author_attribution: result.author || null,
-      metadata: {
-        fetched_via: "opencli web read",
-        fetched_at: new Date().toISOString(),
-        size_reported: result.size,
-        text_chars: text.length,
-        original_md_chars: rawMd.length,
-      },
-    };
   }
+}
+
+function toIsoDate(s: string): string | null {
+  // OpenCLI returns dates like "Apr 16, 2026" — try to coerce to YYYY-MM-DD.
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
 }
