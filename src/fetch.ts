@@ -16,6 +16,10 @@ interface FetchResult {
   content_chars: number;
   cached: boolean;
   fetched_at: string;
+  /** Set when the content is suspiciously thin (likely JS-rendered) and the
+   *  OpenCLI fallback couldn't help (extension not connected, errored, etc.).
+   *  Caller should consider re-fetching with a connected browser bridge. */
+  warning?: string;
 }
 
 export async function fetchAndStore(url: string, opts: { hint?: string; forceRefetch?: boolean } = {}): Promise<FetchResult> {
