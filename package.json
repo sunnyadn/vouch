@@ -1,6 +1,6 @@
 {
   "name": "vouch",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Verified-claim KB CLI — Fetch Before Claim (FBC) pattern.",
   "type": "module",
   "module": "src/cli.ts",

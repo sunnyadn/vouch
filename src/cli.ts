@@ -12,6 +12,7 @@ import * as store from "./store.ts";
 import { submitClaim } from "./submit.ts";
 import { embedOne } from "./embedder.ts";
 import { fetchAndStore } from "./fetch.ts";
+import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
 import type { ClaimType } from "./types.ts";
 
@@ -21,7 +22,7 @@ const program = new Command()
     "Verified-claim KB CLI — Fetch Before Claim (FBC) pattern. " +
       "Submit claims with sources, get NLI verification, build a queryable provenance graph.",
   )
-  .version("0.2.0")
+  .version("0.3.0")
   .option("--pretty", "Pretty-print JSON output");
 
 function emit(obj: unknown) {
@@ -53,6 +54,53 @@ program
       emit(result);
     } catch (e: any) {
       fail(`fetch failed: ${e?.message || String(e)}`);
+    }
+  });
+
+// ---------- attest ----------
+program
+  .command("attest")
+  .description(
+    "Create a user-attested dossier. The user takes responsibility for the content; " +
+      "vouch does not fetch or independently verify it. Downstream claims still verify " +
+      "via quote-in-dossier + NLI.",
+  )
+  .requiredOption("--slug <slug>", "stable slug; lowercase + dashes/underscores only")
+  .option("--content <text>", "attested content (inline)")
+  .option("--content-file <path>", "attested content (from file)")
+  .requiredOption("--attribution <name>", "who attests (e.g., 'sunny')")
+  .option("--date <YYYY-MM-DD>", "attestation date; defaults to today UTC")
+  .option("--topic <topic>", "searchability tag")
+  .option("--force-overwrite", "replace existing attestation at same slug")
+  .action(async (opts: any) => {
+    let content = opts.content;
+    if (!content && opts.contentFile) {
+      content = await Bun.file(opts.contentFile).text();
+    }
+    if (!content) {
+      console.error(
+        JSON.stringify({
+          error: "--content or --content-file required",
+          reason: "missing-content",
+        }),
+      );
+      process.exit(2);
+    }
+    try {
+      const result = await attestAndStore({
+        slug: opts.slug,
+        content,
+        attribution: opts.attribution,
+        date: opts.date,
+        topic: opts.topic,
+        forceOverwrite: opts.forceOverwrite,
+      });
+      emit(result);
+    } catch (e: any) {
+      console.error(
+        JSON.stringify({ error: e.message, reason: "attest-failed" }),
+      );
+      process.exit(1);
     }
   });
 
