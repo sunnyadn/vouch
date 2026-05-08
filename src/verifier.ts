@@ -124,6 +124,12 @@ export async function verifyClaim(
     author?: string;
     claim_type?: ClaimType;
     attribution?: string;
+    /** Verbatim quote — when provided (the strict-mode path post-`vouch fetch`),
+     *  NLI runs against THIS, not against retrieved chunks of the full dossier.
+     *  The caller has already verified that this quote appears in the dossier. */
+    source_quote?: string;
+    source_offset_start?: number | null;
+    source_offset_end?: number | null;
   } = {},
 ): Promise<VerifyResult & { claim_id: number }> {
   const dossier = store.getDossier(dossierSlug);
@@ -137,7 +143,11 @@ export async function verifyClaim(
     };
   }
   const content = dossier.content || "";
-  if (content.length < 50) {
+
+  let source: string;
+  if (opts.source_quote) {
+    source = opts.source_quote;
+  } else if (content.length < 50) {
     return {
       status: "insufficient",
       score: 0,
@@ -145,10 +155,11 @@ export async function verifyClaim(
       verifier: VERIFIER_MODEL,
       claim_id: 0,
     };
+  } else if (content.length <= CHUNK_SIZE * 2) {
+    source = content;
+  } else {
+    source = await retrieveRelevant(content, claim);
   }
-
-  const source =
-    content.length <= CHUNK_SIZE * 2 ? content : await retrieveRelevant(content, claim);
   const result = await verifyClaimAgainstSource(claim, source);
 
   // Attribution priority: explicit --attribution arg > dossier.author_attribution.
@@ -156,16 +167,10 @@ export async function verifyClaim(
   // --source-title isn't passed, which is a poor "attribution" string.
   const attribution = opts.attribution || dossier.author_attribution || null;
 
-  // Locate source quote position in dossier content (best-effort substring search
-  // — only meaningful for ATOMIC/QUOTATION where source_quote was provided
-  // verbatim and stored as the dossier content).
-  let offsetStart: number | null = null;
-  let offsetEnd: number | null = null;
-  if (result.status === "supported" && content.length < 10000) {
-    // For Claude-submitted dossiers, content === source_quote, offsets are 0..len
-    offsetStart = 0;
-    offsetEnd = content.length;
-  }
+  // Quote position: prefer caller-provided offsets (computed from quote-match);
+  // fall back to null. The legacy "whole quote-only dossier" heuristic is gone.
+  const offsetStart = opts.source_offset_start ?? null;
+  const offsetEnd = opts.source_offset_end ?? null;
 
   // Embed the claim text so /search_kb can index it
   let claimEmbedding: Float32Array | null = null;

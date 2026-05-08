@@ -59,28 +59,38 @@ without code changes.
 
 ## Quick start
 
+vouch is a **two-phase tool**: first fetch a source (vouch does the fetch),
+then make claims against the resulting dossier.
+
 ```bash
-# Submit a claim with its source quote
+# Phase 1 — vouch fetches the URL and persists the full content as a dossier
+vouch fetch https://arxiv.org/abs/2410.05779
+# → {"dossier_slug":"evidence/arxiv/...","title":"LightRAG: Simple and Fast...","content_chars":68151,...}
+
+# Read the dossier text vouch saved (use this to find quotes that will match)
+vouch get-dossier evidence/arxiv/... --full
+
+# Phase 2 — submit a claim against the dossier with a verbatim quote
 vouch claim "LightRAG outperforms GraphRAG on Agriculture, CS, Legal datasets" \
   --type ATOMIC \
-  --source-url https://arxiv.org/abs/2410.05779 \
-  --source-quote "On the Agriculture, CS, and Legal datasets, LightRAG shows a clear advantage, significantly surpassing GraphRAG." \
+  --dossier evidence/arxiv/... \
+  --source-quote "On the Agriculture, CS, and Legal datasets, LightRAG shows a clear advantage..." \
   --topic rag-systems \
   --attribution "Guo et al. 2024"
-# → {"status":"supported","score":1,"claim_id":1,...}
+# → {"status":"supported","score":1,"claim_id":1,"quote_match":"exact",...}
 
 # List what's in the KB
 vouch list-claims --topic rag-systems
 vouch list-topics
 
-# Build derived claims with dependency chain
+# Build derived claims with dependency chain (no source step needed)
 vouch claim "LightRAG is competitive with GraphRAG on UltraDomain" \
   --type INFERENCE --depends-on 1 --topic rag-systems --soft-score 0.8
 
 # Walk the dependency DAG
 vouch chain 2 --pretty
 
-# Hybrid search across claims + dossier quotes
+# Hybrid search across claims + dossier content
 vouch search "which RAG system wins" --top-k 5 --pretty
 
 # Self-correct: supersede an earlier claim (preserves audit trail)
@@ -121,17 +131,55 @@ provider, returns JSON. Cold start ~0.5s.
 ## The "Fetch Before Claim" pattern
 
 The principle: every factual claim in an LLM's output must trace to a verbatim
-source quote that *the LLM itself fetched* — not invented from latent knowledge,
-not hallucinated as a "probably-correct citation". `vouch` enforces this by
-making the source quote part of the claim's primary key:
+source quote that *vouch itself fetched* — not invented from latent knowledge,
+not hallucinated as a "probably-correct citation", not a quote the agent
+copied from a different summary. `vouch` enforces this in two layers:
 
-- ATOMIC claim without `--source-quote` → rejected
-- Quote that doesn't actually support the claim → NLI marks `unsupported`, claim still stored but flagged
-- Derived claim without `--depends-on` → rejected for INFERENCE/INTERPRETATION
-- Self-correction → `supersede` with reason; both versions remain visible
+1. **Trust-establishing fetch.** `vouch fetch <url>` is the primary entry
+   point. vouch — not the agent — performs the HTTP request and persists the
+   resulting content (markitdown-converted when available, in-process strip
+   as fallback). The dossier is the canonical record of what was at the URL
+   at fetch time.
 
-The result: a KB where every "supported" claim has a recoverable provenance
-trail down to a verbatim source, and every derivation is explicit.
+2. **Quote-in-dossier check + NLI.** `vouch claim` rejects on two layers:
+   - The submitted quote must appear in the fetched dossier content (after
+     light normalization for whitespace, smart quotes, punctuation spacing).
+     Forged or paraphrased quotes are rejected before reaching the verifier.
+   - An LLM-as-judge (default Vertex Gemini 3.1 Pro) then verifies the
+     claim is supported by the quote. NLI is strict — overshooting the
+     quote ("most widely deployed" claimed from a quote that says only
+     "is widely deployed") gets rejected.
+
+3. **Self-correction.** `vouch supersede` records corrections with reason;
+   both old and new claims stay queryable. The KB grows an audit trail.
+
+## Threat model
+
+vouch is honest about what it does and doesn't guarantee:
+
+| Threat | Caught by vouch? |
+|---|---|
+| Agent invents a quote that isn't in the source | ✅ quote-in-dossier check |
+| Agent paraphrases instead of quoting verbatim | ✅ quote-in-dossier check (with light normalization) |
+| Agent submits a quote that doesn't actually support its claim | ✅ NLI judge |
+| Agent claims more than the quote says (overreach) | ✅ NLI judge — strict by design |
+| Agent submits an absent claim ("source does not mention X") incorrectly | ✅ NLI judge with absence prompt |
+| Agent submits a real quote out of context | ⚠️ partial — frontier verifier sometimes catches, sometimes not |
+| Agent fabricates the URL itself (URL doesn't exist or doesn't say what's claimed) | ❌ vouch fetch errors on bad URLs but trusts whatever returns |
+| Agent intentionally games the verifier with trivial-but-supported claims | ❌ no defense; relies on visible audit trail + supersede |
+| Source page changes after fetch | ⚠️ source_hash records the fetched state; drift detectable on re-fetch |
+| Verifier model itself hallucinates a "supported" verdict | ⚠️ choose stronger verifier; rotate occasionally for high-stakes claims |
+
+**Trust assumption**: vouch's trust boundary is the fetcher. If `vouch fetch
+<url>` returns content X, vouch treats X as canonical for that URL at that
+time. URL spoofing (fake URL → real-looking content via a controlled server)
+is out of scope.
+
+**Non-goal**: cryptographic attestation. vouch is a *discipline-imposing*
+record-keeping system, not a notarized fact archive. It makes sloppy claims
+hard, not malicious claims impossible. For adversarial scenarios needing
+cryptographic guarantees, layer in archive.org submission or third-party
+attestation — out of vouch's scope.
 
 ## License
 

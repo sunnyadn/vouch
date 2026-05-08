@@ -63,12 +63,14 @@ export interface SubmitClaimRequest {
   topic?: string;
   attribution?: string;
   author?: string;
-  source_url?: string;
+  /** ATOMIC/QUOTATION: dossier_slug from a prior `vouch fetch`. */
+  dossier_slug?: string;
+  /** ATOMIC/QUOTATION: verbatim 1–3 sentence quote from the dossier. */
   source_quote?: string;
-  source_title?: string;
-  publication_date?: string;
-  author_attribution?: string;
-  sources?: { url: string; quote: string; title?: string }[];
+  /** SYNTHESIS: ≥2 (dossier_slug, quote) pairs. */
+  sources?: { dossier_slug: string; quote: string }[];
+  /** INFERENCE/INTERPRETATION/HYPOTHESIS: upstream claim IDs (DAG edges). */
   depends_on_ids?: number[];
+  /** HYPOTHESIS / soft cases: caller's own confidence. */
   soft_score?: number;
 }

@@ -11,6 +11,7 @@ import { Command } from "commander";
 import * as store from "./store.ts";
 import { submitClaim } from "./submit.ts";
 import { embedOne } from "./embedder.ts";
+import { fetchAndStore } from "./fetch.ts";
 import type { ClaimType } from "./types.ts";
 
 const program = new Command()
@@ -33,27 +34,48 @@ function fail(msg: string, code = 1): never {
   process.exit(code);
 }
 
+// ---------- fetch ----------
+program
+  .command("fetch <url>")
+  .description(
+    "Fetch a URL and persist it as a dossier (the trust-establishing step). " +
+      "Subsequent `vouch claim` references the returned dossier_slug.",
+  )
+  .option("--fetcher <name>", "Force a specific fetcher (arxiv | generic)")
+  .option("--force-refetch", "Skip 24h cache and re-fetch even if dossier exists")
+  .action(async (url: string, opts: any) => {
+    try {
+      const result = await fetchAndStore(url, {
+        hint: opts.fetcher,
+        forceRefetch: opts.forceRefetch,
+      });
+      emit(result);
+    } catch (e: any) {
+      fail(`fetch failed: ${e?.message || String(e)}`);
+    }
+  });
+
 // ---------- claim ----------
 program
   .command("claim <text>")
-  .description("Submit a claim with sources for NLI verification + storage")
+  .description(
+    "Submit a claim. Strict mode: ATOMIC/QUOTATION/SYNTHESIS need a dossier from `vouch fetch`. " +
+      "INFERENCE/INTERPRETATION need --depends-on. HYPOTHESIS is freeform.",
+  )
   .requiredOption(
     "-t, --type <type>",
     "ATOMIC | SYNTHESIS | INFERENCE | INTERPRETATION | HYPOTHESIS | QUOTATION",
   )
   .option("--topic <topic>")
-  .option("--attribution <attribution>", "e.g. 'Guo et al. 2024'")
+  .option("--attribution <attribution>", "Override the dossier-derived attribution, e.g. 'Guo et al. 2024'")
   .option("--author <author>", "claude-skill | user-edit | etc", "claude-skill")
-  .option("--source-url <url>", "ATOMIC/QUOTATION single source URL")
-  .option("--source-quote <quote>", "Verbatim 1-3 sentence quote from the source")
-  .option("--source-title <title>")
-  .option("--publication-date <date>", "YYYY-MM-DD source publication date")
-  .option("--author-attribution <name>", "Source author/org (e.g. 'Guo et al.')")
+  .option("--dossier <slug>", "ATOMIC/QUOTATION: slug from prior `vouch fetch`")
+  .option("--source-quote <quote>", "ATOMIC/QUOTATION: verbatim 1-3 sentence quote (must appear in the dossier)")
   .option(
     "--sources <json>",
-    'SYNTHESIS multi-source JSON: \'[{"url":"...","quote":"..."}]\'',
+    'SYNTHESIS multi-source JSON: \'[{"dossier_slug":"...","quote":"..."}, ...]\' (≥2 entries; dossiers must be pre-fetched)',
   )
-  .option("--depends-on <ids>", "INFERENCE/INTERPRETATION upstream IDs, comma-separated")
+  .option("--depends-on <ids>", "INFERENCE/INTERPRETATION upstream claim IDs, comma-separated")
   .option("--soft-score <num>", "0..1 confidence for HYPOTHESIS-like claims", parseFloat)
   .action(async (text: string, opts: any) => {
     const type = opts.type as ClaimType;
@@ -81,11 +103,8 @@ program
       topic: opts.topic,
       attribution: opts.attribution,
       author: opts.author,
-      source_url: opts.sourceUrl,
+      dossier_slug: opts.dossier,
       source_quote: opts.sourceQuote,
-      source_title: opts.sourceTitle,
-      publication_date: opts.publicationDate,
-      author_attribution: opts.authorAttribution,
       sources,
       depends_on_ids: dependsOn,
       soft_score: opts.softScore,
@@ -168,10 +187,23 @@ program
 // ---------- get-dossier ----------
 program
   .command("get-dossier <slug>")
-  .description("Get dossier with content preview")
-  .action((slug: string) => {
+  .description("Get dossier with content (default: 4000-char preview; --full for entire content)")
+  .option("--full", "Return entire dossier content (may be very large for full papers)")
+  .option("--offset <n>", "Start of content slice (with --limit)", (v) => parseInt(v, 10))
+  .option("--limit <n>", "Length of content slice (with --offset)", (v) => parseInt(v, 10))
+  .action((slug: string, opts: any) => {
     const d = store.getDossier(slug);
     if (!d) fail(`dossier ${slug} not found`);
+    const fullContent = d!.content || "";
+    let content: string;
+    if (opts.full) content = fullContent;
+    else if (typeof opts.offset === "number" || typeof opts.limit === "number") {
+      const off = opts.offset || 0;
+      const lim = opts.limit || 4000;
+      content = fullContent.slice(off, off + lim);
+    } else {
+      content = fullContent.slice(0, 4000);
+    }
     const out = {
       slug: d!.slug,
       title: d!.title,
@@ -181,8 +213,8 @@ program
       source_hash: d!.source_hash,
       publication_date: d!.publication_date,
       author_attribution: d!.author_attribution,
-      content_preview: (d!.content || "").slice(0, 4000),
-      content_total_chars: (d!.content || "").length,
+      content,
+      content_total_chars: fullContent.length,
     };
     emit(out);
   });

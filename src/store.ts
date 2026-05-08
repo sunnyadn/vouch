@@ -94,6 +94,21 @@ export function slugFromUrl(sourceType: string, url: string): string {
   return `evidence/${sourceType}/${safe}-${today}`;
 }
 
+/** Look up the most recent dossier ingested via vouch fetch (source_type
+ *  derived from a fetcher, not "agent-quote"). Used for cache hits within the
+ *  freshness window. */
+export function getRecentFetchedDossier(url: string, withinHours = 24): Dossier | null {
+  const cutoff = new Date(Date.now() - withinHours * 3600 * 1000).toISOString();
+  const row = getDb()
+    .prepare(
+      "SELECT * FROM dossiers WHERE source_url = ? AND source_type != 'agent-quote' AND capture_date >= ? ORDER BY capture_date DESC LIMIT 1",
+    )
+    .get(url, cutoff) as any;
+  if (!row) return null;
+  row.embedding = blobToEmb(row.embedding);
+  return row as Dossier;
+}
+
 export function sha256Hex(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
