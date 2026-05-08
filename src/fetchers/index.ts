@@ -1,5 +1,6 @@
 import { ArxivFetcher } from "./arxiv.ts";
 import { GenericFetcher } from "./generic.ts";
+import { GitHubFetcher } from "./github.ts";
 import { OpenCliFetcher, opencliAvailable, OpenCliBridgeError } from "./opencli.ts";
 import type { Fetcher, FetcherResult } from "./types.ts";
 
@@ -11,6 +12,7 @@ export { OpenCliBridgeError } from "./opencli.ts";
  * opencli OR auto-fallback when generic content looks thin/JS-shell-only. */
 const FETCHERS: Fetcher[] = [
   new ArxivFetcher(),
+  new GitHubFetcher(),
   new GenericFetcher(),
   // OpenCLI registered explicitly (for --fetcher hint resolution + introspection)
   // but does not match() proactively — see auto-fallback in fetchUrl.

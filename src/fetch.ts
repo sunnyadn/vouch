@@ -20,6 +20,7 @@ interface FetchResult {
    *  OpenCLI fallback couldn't help (extension not connected, errored, etc.).
    *  Caller should consider re-fetching with a connected browser bridge. */
   warning?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export async function fetchAndStore(url: string, opts: { hint?: string; forceRefetch?: boolean } = {}): Promise<FetchResult> {
@@ -73,5 +74,6 @@ export async function fetchAndStore(url: string, opts: { hint?: string; forceRef
     content_chars: result.content.length,
     cached: false,
     fetched_at: new Date().toISOString(),
+    metadata: result.metadata,
   };
 }

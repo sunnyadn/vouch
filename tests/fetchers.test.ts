@@ -1,6 +1,7 @@
 /** Fetcher router + URL-pattern tests (no network calls). */
 import { describe, expect, it } from "bun:test";
 import { getFetcher } from "../src/fetchers/index.ts";
+import { GitHubFetcher, buildMetadataBlock } from "../src/fetchers/github.ts";
 import { stripHtml } from "../src/fetchers/generic.ts";
 import { stripInlineMarkdown } from "../src/fetchers/markitdown.ts";
 
@@ -13,7 +14,7 @@ describe("fetcher router", () => {
 
   it("falls back to generic for non-arxiv URLs", () => {
     expect(getFetcher("https://en.wikipedia.org/wiki/SQLite").name).toBe("generic");
-    expect(getFetcher("https://github.com/foo/bar").name).toBe("generic");
+    expect(getFetcher("https://github.com/foo/bar").name).toBe("github");
   });
 
   it("respects --fetcher hint", () => {
@@ -75,5 +76,72 @@ describe("stripInlineMarkdown", () => {
 
   it("strips footnote refs", () => {
     expect(stripInlineMarkdown("Important fact[^1] here")).toBe("Important fact here");
+  });
+});
+
+describe("fetcher router (github)", () => {
+  it("routes github.com repo URLs to github fetcher", () => {
+    expect(getFetcher("https://github.com/foo/bar").name).toBe("github");
+    expect(getFetcher("https://github.com/foo/bar/").name).toBe("github");
+    expect(getFetcher("https://github.com/foo/bar/tree/main").name).toBe("github");
+    expect(getFetcher("https://github.com/foo/bar/blob/main/README.md").name).toBe("github");
+    expect(getFetcher("https://github.com/foo/bar.git").name).toBe("github");
+  });
+
+  it("does NOT route github.com issue/PR URLs to github fetcher", () => {
+    expect(getFetcher("https://github.com/foo/bar/issues/123").name).toBe("generic");
+    expect(getFetcher("https://github.com/foo/bar/pull/45").name).toBe("generic");
+  });
+
+  it("does NOT route non-github URLs", () => {
+    expect(getFetcher("https://gitlab.com/foo/bar").name).toBe("generic");
+    expect(getFetcher("https://github.io/foo").name).toBe("generic");
+  });
+});
+
+describe("buildMetadataBlock", () => {
+  it("emits exactly one line per fact", () => {
+    const block = buildMetadataBlock({
+      full_name: "foo/bar",
+      description: "test",
+      stargazers_count: 100,
+      forks_count: 20,
+      subscribers_count: 5,
+      open_issues_count: 3,
+      license: { spdx_id: "MIT", name: "MIT License" },
+      default_branch: "main",
+      language: "TypeScript",
+      created_at: "2024-01-15T00:00:00Z",
+      pushed_at: "2026-04-01T00:00:00Z",
+      size: 4096,
+      html_url: "https://github.com/foo/bar",
+      owner: { login: "foo" },
+    });
+    expect(block).toContain("Stars: 100");
+    expect(block).toContain("Forks: 20");
+    expect(block).toContain("License: MIT (MIT License)");
+    expect(block).toContain("Last pushed: 2026-04-01");
+    expect(block.split("\n").length).toBeGreaterThan(8);
+  });
+
+  it("handles null license + null description gracefully", () => {
+    const block = buildMetadataBlock({
+      full_name: "foo/bar",
+      description: null,
+      stargazers_count: 0,
+      forks_count: 0,
+      subscribers_count: 0,
+      open_issues_count: 0,
+      license: null,
+      default_branch: "main",
+      language: null,
+      created_at: "2024-01-15T00:00:00Z",
+      pushed_at: "2026-04-01T00:00:00Z",
+      size: 0,
+      html_url: "https://github.com/foo/bar",
+      owner: { login: "foo" },
+    });
+    expect(block).toContain("License: none (no license)");
+    expect(block).toContain("Description: (no description)");
   });
 });
