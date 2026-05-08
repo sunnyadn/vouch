@@ -6,7 +6,7 @@ export type ClaimType =
   | "HYPOTHESIS"
   | "QUOTATION";
 
-export type ClaimStatus = "supported" | "unsupported" | "insufficient";
+export type ClaimStatus = "supported" | "unsupported" | "insufficient" | "recorded";
 
 export type DependencyType = "inference" | "support";
 
@@ -42,6 +42,7 @@ export interface Claim {
   source_offset_start: number | null;
   source_offset_end: number | null;
   embedding: Float32Array | null;
+  verification: string | null;
 }
 
 export interface ClaimDependency {
@@ -67,6 +68,8 @@ export interface SubmitClaimRequest {
   dossier_slug?: string;
   /** ATOMIC/QUOTATION: verbatim 1–3 sentence quote from the dossier. */
   source_quote?: string;
+  /** ATOMIC only: let vouch pick the best supporting passage from the dossier. */
+  auto_quote?: boolean;
   /** SYNTHESIS: ≥2 (dossier_slug, quote) pairs. */
   sources?: { dossier_slug: string; quote: string }[];
   /** INFERENCE/INTERPRETATION/HYPOTHESIS: upstream claim IDs (DAG edges). */

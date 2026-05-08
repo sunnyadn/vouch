@@ -51,6 +51,18 @@ function initSchema(db: Database) {
       source_offset_end INTEGER,
       embedding BLOB
     );
+  `);
+  // Additive migration: verification column (v0.2). SQLite lacks ADD COLUMN IF NOT EXISTS.
+  try {
+    db.exec(`ALTER TABLE claims ADD COLUMN verification TEXT;`);
+  } catch (e: any) {
+    if (e?.message?.includes("duplicate column")) {
+      // Column already exists — no-op for idempotency
+    } else {
+      throw e;
+    }
+  }
+  db.exec(`
     CREATE TABLE IF NOT EXISTS claim_dependencies (
       claim_id INTEGER NOT NULL,
       depends_on_id INTEGER NOT NULL,
@@ -232,7 +244,7 @@ export function getDossierEmbedding(slug: string): Float32Array | null {
 export interface RecordClaimInput {
   dossier_slug: string;
   claim_text: string;
-  score: number;
+  score: number | null;
   status: string;
   source_passage?: string | null;
   claim_type?: ClaimType;
@@ -245,6 +257,7 @@ export interface RecordClaimInput {
   source_offset_start?: number | null;
   source_offset_end?: number | null;
   embedding?: number[] | Float32Array | null;
+  verification?: string | null;
 }
 
 export function recordClaim(input: RecordClaimInput): number {
@@ -257,8 +270,8 @@ export function recordClaim(input: RecordClaimInput): number {
       `INSERT INTO claims
        (dossier_slug, claim_text, source_passage, nli_score, status, verified_at,
         claim_type, topic, author, soft_score, attribution,
-        source_offset_start, source_offset_end, embedding)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        source_offset_start, source_offset_end, embedding, verification)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       input.dossier_slug,
@@ -275,6 +288,7 @@ export function recordClaim(input: RecordClaimInput): number {
       input.source_offset_start ?? null,
       input.source_offset_end ?? null,
       embBlob,
+      input.verification ?? null,
     );
   const cid = Number(result.lastInsertRowid);
 
@@ -293,7 +307,7 @@ export function recordClaim(input: RecordClaimInput): number {
 const CLAIM_USER_COLS =
   "id, dossier_slug, claim_text, source_passage, nli_score, status, verified_at, " +
   "claim_type, topic, author, soft_score, attribution, superseded_by, supersede_reason, " +
-  "source_offset_start, source_offset_end";
+  "source_offset_start, source_offset_end, verification";
 
 export function getClaim(id: number): (Claim & { depends_on: ClaimDependency[] }) | null {
   const db = getDb();
@@ -339,7 +353,7 @@ export function listClaims(opts: ListClaimsOpts = {}): Claim[] {
     params.push(`%${opts.contains}%`);
   }
   let sql =
-    "SELECT id, dossier_slug, claim_text, source_passage, nli_score, status, verified_at, claim_type, topic, author, soft_score, attribution, superseded_by, supersede_reason, source_offset_start, source_offset_end FROM claims";
+    "SELECT id, dossier_slug, claim_text, source_passage, nli_score, status, verified_at, claim_type, topic, author, soft_score, attribution, superseded_by, supersede_reason, source_offset_start, source_offset_end, verification FROM claims";
   if (where.length) sql += " WHERE " + where.join(" AND ");
   sql += " ORDER BY id DESC LIMIT ?";
   params.push(opts.limit ?? 50);

@@ -5,7 +5,8 @@ import { MAX_SOURCE_CHARS, VERIFIER_MODEL } from "./config.ts";
 import { getLanguageModel } from "./providers.ts";
 import { embedBatch } from "./embedder.ts";
 import * as store from "./store.ts";
-import type { ClaimType, VerifyResult } from "./types.ts";
+import { findQuoteInContent } from "./quote-match.ts";
+import type { Claim, ClaimDependency, ClaimType, VerifyResult } from "./types.ts";
 
 /** Thrown when the verifier failed for a system reason (auth expired, network
  *  unreachable, provider quota) — NOT for an evidence outcome. Caller must
@@ -18,7 +19,7 @@ export class TransientVerifierError extends Error {
   }
 }
 
-function classifyError(e: unknown): TransientVerifierError | null {
+export function classifyError(e: unknown): TransientVerifierError | null {
   const msg = (e instanceof Error ? e.message : String(e)) || "";
   const lower = msg.toLowerCase();
   if (
@@ -237,7 +238,244 @@ export async function verifyClaim(
     source_offset_start: offsetStart,
     source_offset_end: offsetEnd,
     embedding: claimEmbedding,
+    verification: "nli-quote",
   });
 
   return { ...result, claim_id: cid };
+}
+
+// ---------------------------------------------------------------------------
+// INFERENCE / INTERPRETATION verifiers (v0.2)
+// ---------------------------------------------------------------------------
+
+const INFERENCE_PROMPT_TEMPLATE = `You verify whether a CONCLUSION follows logically from a set of PREMISES.
+
+PREMISES:
+{PREMISES_BLOCK}
+
+CONCLUSION: "{CLAIM}"
+
+Question: Does the CONCLUSION follow strictly from the PREMISES?
+
+Rules:
+- supported = the conclusion follows from the premises alone, without needing
+  unstated assumptions, world knowledge, or facts not in the premises.
+- unsupported = the conclusion needs unstated premises, OR overreaches what
+  the premises actually say, OR doesn't follow at all.
+- A conclusion that is *probably true* in the world but does NOT follow
+  strictly from the premises = unsupported.
+- A conclusion that adds new factual content not in the premises = unsupported.
+
+Return: { supported, score (0..1 confidence), reason (one sentence) }.`;
+
+const INTERPRETATION_PROMPT_TEMPLATE = `You verify whether a NEW STATEMENT is a faithful reframing of a SOURCE CLAIM.
+
+SOURCE CLAIM:
+{SOURCE_BLOCK}
+
+NEW STATEMENT: "{CLAIM}"
+
+Question: Is the NEW STATEMENT a faithful reframing of the SOURCE CLAIM?
+
+Rules:
+- supported = the new statement says the same factual content with different
+  words. Paraphrase, summary, or restatement — but no new facts.
+- unsupported = the new statement adds factual content not in the source,
+  OR drops factual qualifiers that change the meaning, OR generalizes beyond
+  the source's actual scope.
+- "Same fact, different words" = supported.
+- "Source said X applies to Y; reframing says X applies broadly" = unsupported.
+
+Return: { supported, score (0..1 confidence), reason (one sentence) }.`;
+
+export async function verifyInferenceClaim(
+  claim: string,
+  upstreamClaimIds: number[],
+): Promise<VerifyResult> {
+  const upstreams: (Claim & { depends_on: ClaimDependency[] })[] = [];
+  const missing: number[] = [];
+  for (const id of upstreamClaimIds) {
+    const c = store.getClaim(id);
+    if (!c) missing.push(id);
+    else upstreams.push(c);
+  }
+  if (missing.length) {
+    return {
+      status: "insufficient",
+      score: 0,
+      source_passage: `depends_on references missing claim(s): ${missing.join(", ")}`,
+      verifier: VERIFIER_MODEL,
+    };
+  }
+
+  const broken: string[] = [];
+  for (const c of upstreams) {
+    if (c.status === "unsupported") {
+      broken.push(`${c.id} (status=unsupported)`);
+    }
+    if (c.superseded_by != null) {
+      broken.push(`${c.id} (superseded by ${c.superseded_by})`);
+    }
+  }
+  if (broken.length) {
+    return {
+      status: "unsupported",
+      score: 0,
+      source_passage: `depends on broken-chain claim(s): ${broken.join(", ")}`,
+      verifier: VERIFIER_MODEL,
+    };
+  }
+
+  const premisesBlock = upstreams
+    .map((c) => `[Claim ${c.id}, ${c.claim_type}, ${c.status}]: ${c.claim_text}`)
+    .join("\n");
+
+  const prompt = INFERENCE_PROMPT_TEMPLATE.replace("{PREMISES_BLOCK}", premisesBlock).replace(
+    "{CLAIM}",
+    claim,
+  );
+
+  try {
+    const { object } = await generateObject({
+      model: getLanguageModel(VERIFIER_MODEL),
+      schema: VerifySchema,
+      prompt,
+      temperature: 0.0,
+    });
+    return {
+      status: object.supported ? "supported" : "unsupported",
+      score: object.score,
+      source_passage: object.reason,
+      verifier: VERIFIER_MODEL,
+    };
+  } catch (e: any) {
+    const transient = classifyError(e);
+    if (transient) throw transient;
+    return {
+      status: "insufficient",
+      score: 0,
+      source_passage: `verifier error: ${e?.message || String(e)}`.slice(0, 300),
+      verifier: `${VERIFIER_MODEL}-error`,
+    };
+  }
+}
+
+export async function verifyInterpretationClaim(
+  claim: string,
+  upstreamClaimIds: number[],
+): Promise<VerifyResult> {
+  if (upstreamClaimIds.length !== 1) {
+    return {
+      status: "insufficient",
+      score: 0,
+      source_passage: `INTERPRETATION requires exactly one upstream claim, got ${upstreamClaimIds.length}`,
+      verifier: VERIFIER_MODEL,
+    };
+  }
+  const upstreamClaimId = upstreamClaimIds[0]!;
+  const c = store.getClaim(upstreamClaimId);
+  if (!c) {
+    return {
+      status: "insufficient",
+      score: 0,
+      source_passage: `depends_on references missing claim: ${upstreamClaimId}`,
+      verifier: VERIFIER_MODEL,
+    };
+  }
+  if (c.status === "unsupported") {
+    return {
+      status: "unsupported",
+      score: 0,
+      source_passage: `depends on broken-chain claim: ${c.id} (status=unsupported)`,
+      verifier: VERIFIER_MODEL,
+    };
+  }
+  if (c.superseded_by != null) {
+    return {
+      status: "unsupported",
+      score: 0,
+      source_passage: `depends on broken-chain claim: ${c.id} (superseded by ${c.superseded_by})`,
+      verifier: VERIFIER_MODEL,
+    };
+  }
+
+  const sourceBlock = `[Claim ${c.id}, ${c.claim_type}, ${c.status}]: ${c.claim_text}`;
+  const prompt = INTERPRETATION_PROMPT_TEMPLATE.replace("{SOURCE_BLOCK}", sourceBlock).replace(
+    "{CLAIM}",
+    claim,
+  );
+
+  try {
+    const { object } = await generateObject({
+      model: getLanguageModel(VERIFIER_MODEL),
+      schema: VerifySchema,
+      prompt,
+      temperature: 0.0,
+    });
+    return {
+      status: object.supported ? "supported" : "unsupported",
+      score: object.score,
+      source_passage: object.reason,
+      verifier: VERIFIER_MODEL,
+    };
+  } catch (e: any) {
+    const transient = classifyError(e);
+    if (transient) throw transient;
+    return {
+      status: "insufficient",
+      score: 0,
+      source_passage: `verifier error: ${e?.message || String(e)}`.slice(0, 300),
+      verifier: `${VERIFIER_MODEL}-error`,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auto-quote selector (v0.2)
+// ---------------------------------------------------------------------------
+
+const AutoQuoteSchema = z.object({
+  found: z.boolean(),
+  quote: z.string(),
+  reason: z.string().max(500),
+});
+
+const AUTOQUOTE_PROMPT_TEMPLATE = `You select supporting evidence for a CLAIM from a SOURCE DOCUMENT.
+
+CLAIM: "{CLAIM}"
+
+SOURCE:
+---
+{SOURCE}
+---
+
+Task: find the 1–3 sentence verbatim quote from SOURCE that most directly supports CLAIM. The quote MUST appear verbatim in the SOURCE — do not paraphrase, summarize, or invent. If no passage in SOURCE genuinely supports the claim, return { found: false, reason: "..." }.
+
+Return JSON: { found, quote (verbatim string from source, or empty), reason }.`;
+
+export async function autoSelectQuote(
+  claim: string,
+  dossierContent: string,
+): Promise<{ quote: string; reason: string } | null> {
+  const truncated = dossierContent.slice(0, MAX_SOURCE_CHARS);
+  const prompt = AUTOQUOTE_PROMPT_TEMPLATE.replace("{CLAIM}", claim).replace(
+    "{SOURCE}",
+    truncated,
+  );
+  try {
+    const { object } = await generateObject({
+      model: getLanguageModel(VERIFIER_MODEL),
+      schema: AutoQuoteSchema,
+      prompt,
+      temperature: 0.0,
+    });
+    if (!object.found) return null;
+    const match = findQuoteInContent(object.quote, dossierContent);
+    if (!match.found) return null;
+    return { quote: object.quote, reason: object.reason };
+  } catch (e: any) {
+    const transient = classifyError(e);
+    if (transient) throw transient;
+    return null;
+  }
 }

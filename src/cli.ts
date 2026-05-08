@@ -21,7 +21,7 @@ const program = new Command()
     "Verified-claim KB CLI — Fetch Before Claim (FBC) pattern. " +
       "Submit claims with sources, get NLI verification, build a queryable provenance graph.",
   )
-  .version("0.1.0")
+  .version("0.2.0")
   .option("--pretty", "Pretty-print JSON output");
 
 function emit(obj: unknown) {
@@ -72,6 +72,7 @@ program
   .option("--author <author>", "claude-skill | user-edit | etc", "claude-skill")
   .option("--dossier <slug>", "ATOMIC/QUOTATION: slug from prior `vouch fetch`")
   .option("--source-quote <quote>", "ATOMIC/QUOTATION: verbatim 1-3 sentence quote (must appear in the dossier)")
+  .option("--auto-quote", "ATOMIC only: vouch picks the best supporting passage from the dossier instead of requiring --source-quote")
   .option(
     "--sources <json>",
     'SYNTHESIS multi-source JSON: \'[{"dossier_slug":"...","quote":"..."}, ...]\' (≥2 entries; dossiers must be pre-fetched)',
@@ -107,6 +108,7 @@ program
         author: opts.author,
         dossier_slug: opts.dossier,
         source_quote: opts.sourceQuote,
+        auto_quote: opts.autoQuote,
         sources,
         depends_on_ids: dependsOn,
         soft_score: opts.softScore,

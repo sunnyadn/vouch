@@ -12,7 +12,13 @@
  */
 import * as store from "./store.ts";
 import { embedOne } from "./embedder.ts";
-import { TransientVerifierError, verifyClaim } from "./verifier.ts";
+import {
+  TransientVerifierError,
+  verifyClaim,
+  verifyInferenceClaim,
+  verifyInterpretationClaim,
+  autoSelectQuote,
+} from "./verifier.ts";
 import { findQuoteInContent } from "./quote-match.ts";
 import type { ClaimType, SubmitClaimRequest } from "./types.ts";
 
@@ -53,24 +59,40 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
       "missing-dossier",
     );
   }
-  if (!req.source_quote) {
-    return errOut(
-      `${req.claim_type} requires --source-quote (the verbatim 1–3 sentences supporting the claim).`,
-      "missing-source",
-    );
-  }
 
   const dossier = store.getDossier(req.dossier_slug);
   if (!dossier) {
     return errOut(`dossier not found: ${req.dossier_slug}`, "missing-dossier");
   }
 
-  const match = findQuoteInContent(req.source_quote, dossier.content || "");
+  let sourceQuote = req.source_quote;
+  let autoSelected = false;
+
+  if (!sourceQuote && req.auto_quote) {
+    const auto = await autoSelectQuote(req.text, dossier.content || "");
+    if (!auto) {
+      return errOut(
+        `auto-quote: no supporting passage found in dossier "${req.dossier_slug}".`,
+        "quote-not-in-dossier",
+      );
+    }
+    sourceQuote = auto.quote;
+    autoSelected = true;
+  }
+
+  if (!sourceQuote) {
+    return errOut(
+      `${req.claim_type} requires --source-quote (the verbatim 1–3 sentences supporting the claim).`,
+      "missing-source",
+    );
+  }
+
+  const match = findQuoteInContent(sourceQuote, dossier.content || "");
   if (!match.found) {
     return errOut(
       `quote not found in dossier "${req.dossier_slug}". The submitted quote must appear in the dossier content vouch fetched. Re-check the source page or fetch a different one.`,
       "quote-not-in-dossier",
-      { quote_preview: req.source_quote.slice(0, 200), dossier_chars: (dossier.content || "").length },
+      { quote_preview: sourceQuote.slice(0, 200), dossier_chars: (dossier.content || "").length },
     );
   }
 
@@ -79,7 +101,7 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
     author: req.author,
     claim_type: req.claim_type,
     attribution: req.attribution,
-    source_quote: req.source_quote,
+    source_quote: sourceQuote,
     source_offset_start: match.start,
     source_offset_end: match.end,
   });
@@ -88,6 +110,7 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
     dossier_slug: req.dossier_slug,
     source_url: dossier.source_url,
     quote_match: match.matchType,
+    ...(autoSelected ? { metadata: { auto_selected_quote: true } } : {}),
   };
 }
 
@@ -158,6 +181,14 @@ async function submitDerived(req: SubmitClaimRequest, ct: "INFERENCE" | "INTERPR
   if (!req.depends_on_ids?.length) {
     return errOut(`${ct} requires --depends-on <ids> (≥1 upstream claim).`, "missing-deps");
   }
+
+  if (ct === "INTERPRETATION" && req.depends_on_ids.length !== 1) {
+    return errOut(
+      `INTERPRETATION requires exactly one upstream claim, got ${req.depends_on_ids.length}`,
+      "bad-deps",
+    );
+  }
+
   const missing = req.depends_on_ids.filter((id) => !store.getClaim(id));
   if (missing.length) {
     return errOut(
@@ -165,12 +196,38 @@ async function submitDerived(req: SubmitClaimRequest, ct: "INFERENCE" | "INTERPR
       "missing-deps-claims",
     );
   }
+
   const claimEmb = await embedClaim(req.text);
+
+  if (ct === "INFERENCE") {
+    const verdict = await verifyInferenceClaim(req.text, req.depends_on_ids);
+    const cid = store.recordClaim({
+      dossier_slug: "",
+      claim_text: req.text,
+      score: verdict.score,
+      status: verdict.status,
+      source_passage: verdict.source_passage,
+      claim_type: ct,
+      topic: req.topic ?? null,
+      author: req.author ?? null,
+      attribution: req.attribution ?? null,
+      soft_score: req.soft_score ?? null,
+      depends_on_ids: req.depends_on_ids,
+      dependency_type: "inference",
+      embedding: claimEmb,
+      verification: "nli-entailment",
+    });
+    return { claim_id: cid, status: verdict.status, claim_type: ct, source_passage: verdict.source_passage, verification: "nli-entailment" };
+  }
+
+  // INTERPRETATION
+  const verdict = await verifyInterpretationClaim(req.text, req.depends_on_ids);
   const cid = store.recordClaim({
     dossier_slug: "",
     claim_text: req.text,
-    score: 1.0,
-    status: "supported",
+    score: verdict.score,
+    status: verdict.status,
+    source_passage: verdict.source_passage,
     claim_type: ct,
     topic: req.topic ?? null,
     author: req.author ?? null,
@@ -179,8 +236,9 @@ async function submitDerived(req: SubmitClaimRequest, ct: "INFERENCE" | "INTERPR
     depends_on_ids: req.depends_on_ids,
     dependency_type: "inference",
     embedding: claimEmb,
+    verification: "nli-reframing",
   });
-  return { claim_id: cid, status: "supported", claim_type: ct };
+  return { claim_id: cid, status: verdict.status, claim_type: ct, source_passage: verdict.source_passage, verification: "nli-reframing" };
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +250,8 @@ async function submitHypothesis(req: SubmitClaimRequest): Promise<any> {
   const cid = store.recordClaim({
     dossier_slug: "",
     claim_text: req.text,
-    score: 1.0,
-    status: "supported",
+    score: null,
+    status: "recorded",
     claim_type: "HYPOTHESIS",
     topic: req.topic ?? null,
     author: req.author ?? null,
@@ -202,8 +260,9 @@ async function submitHypothesis(req: SubmitClaimRequest): Promise<any> {
     depends_on_ids: req.depends_on_ids,
     dependency_type: "support",
     embedding: claimEmb,
+    verification: "none",
   });
-  return { claim_id: cid, status: "supported", claim_type: "HYPOTHESIS" };
+  return { claim_id: cid, status: "recorded", claim_type: "HYPOTHESIS", nli_score: null, verification: "none", soft_score: req.soft_score ?? null };
 }
 
 // ---------------------------------------------------------------------------
