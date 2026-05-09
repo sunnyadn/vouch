@@ -36,7 +36,12 @@ const ExtractSchema = z.object({
     .max(20),
 });
 
-const EXTRACT_PROMPT = `You are a fact-grounding gate. The assistant has just produced a draft response. Extract every assertion that REQUIRES vouch verification.
+function buildExtractPrompt(draft: string): string {
+  const projectsEnv = (process.env.VOUCH_GATE_WORKSPACE_PROJECTS || "").trim();
+  const projectsLine = projectsEnv
+    ? `\n      Known workspace projects for this installation (claims about their command surface, flags, file paths, test counts, build state, internal architecture, or runtime state are workspace, not external): ${projectsEnv}.`
+    : "";
+  return `You are a fact-grounding gate. The assistant has just produced a draft response. Extract every assertion that REQUIRES vouch verification.
 
 INCLUDE an assertion when ALL of these hold:
   - It states a SPECIFIC factual property (number, version, capability, comparison, pricing, attribution, perf, organizational fact) of a NAMED EXTERNAL ENTITY (third-party dataset, paper, product, library, model, company, person, benchmark)
@@ -44,10 +49,10 @@ INCLUDE an assertion when ALL of these hold:
   - It is NOT generic common knowledge ("Python is a programming language")
   - It is NOT workspace context. Workspace covers ALL of these — when in doubt, treat as workspace and skip:
       (a) The assistant's own actions, plans, recommendations, framing, or meta-commentary about the conversation itself.
-      (b) Properties of the USER'S OWN projects, where the assistant acts as maintainer / author / dogfooder. The user's projects include: vouch (this CLI), comprisk, crforest, js-toml, redacted-proj, QSanguosha, and the meta vault at ~/Projects/meta/sunny. Claims about these projects' command surface, flags, file paths, function names, build artifacts, test counts, commit hashes, internal architecture, or current runtime state are workspace — the user's own code is not external to the user.
+      (b) Properties of any project the assistant is acting as maintainer / author / dogfooder of — its command surface, flags, file paths, function names, build artifacts, test counts, commit hashes, internal architecture, or current runtime state. Code the user owns is not external to the user.${projectsLine}
       (c) Anything the assistant plausibly observed via a tool call earlier in the same session (Bash command output, file contents read, git log/diff/show output, test results, HTTP responses, database queries). The transcript itself is the source of those — vouch is not the right gate.
-      (d) Forward-looking, hypothetical, or proposed entities that the assistant frames as not-yet-existing ("I'll file SUN-X", "a proposed feature would ...", "the planned issue tracks ..."). Nothing external to verify against until the entity actually exists.
-      (e) Linear / Jira / issue-tracker IDs (SUN-XX, etc.) and their described scope when the assistant is filing, summarizing, or proposing them — these are workspace coordination, not external claims.
+      (d) Forward-looking, hypothetical, or proposed entities that the assistant frames as not-yet-existing ("I'll file ISSUE-X", "a proposed feature would ...", "the planned issue tracks ..."). Nothing external to verify against until the entity actually exists.
+      (e) Internal issue-tracker IDs (Linear / Jira / GitHub issue numbers) and their described scope when the assistant is filing, summarizing, or proposing them — these are workspace coordination, not external claims.
 
 For each, return { entity: short canonical name, assertion: 1-sentence paraphrase or verbatim of the claim }.
 
@@ -55,8 +60,9 @@ If nothing qualifies, return { pairs: [] }.
 
 Draft:
 <<<
-{DRAFT}
+${draft}
 >>>`;
+}
 
 export interface ExtractedPair {
   entity: string;
@@ -79,7 +85,7 @@ export async function extractPairs(
   draft: string,
   model: string,
 ): Promise<ExtractedPair[] | null> {
-  const prompt = EXTRACT_PROMPT.replace("{DRAFT}", draft.slice(-MAX_SOURCE_CHARS));
+  const prompt = buildExtractPrompt(draft.slice(-MAX_SOURCE_CHARS));
   try {
     const { object } = await generateObject({
       model: getLanguageModel(model),
