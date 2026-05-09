@@ -100,7 +100,22 @@ entry rather than replacing the block. Drop `--strict` for advisory mode
 
 ## Configure
 
-Auth + provider config via env (see `.env.example`):
+vouch loads env in this order, with later sources overriding earlier ones:
+
+1. `~/.vouch/.env` — the canonical per-user spot (stable across cwd; what
+   you want for everyday use, including agent invocations from arbitrary
+   directories).
+2. `<cwd>/.env` — useful as a per-project override during dev.
+3. Real shell environment variables.
+
+Quickstart — copy the example into place and edit:
+
+```bash
+mkdir -p ~/.vouch && cp .env.example ~/.vouch/.env
+$EDITOR ~/.vouch/.env
+```
+
+The variables (see `.env.example` for the full list):
 
 ```bash
 # Verifier — anything Vercel AI SDK supports. LiteLLM-style provider/model strings.
