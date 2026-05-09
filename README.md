@@ -27,11 +27,12 @@ trail, and are searchable by hybrid embedding + keyword.
 Requires [Bun](https://bun.sh) ≥ 1.3.
 
 ```bash
-git clone https://github.com/sunnyadn/vouch ~/Projects/vouch
-cd ~/Projects/vouch
+git clone https://github.com/sunnyadn/vouch
+cd vouch
 bun install
 bun run build              # produces dist/vouch (single binary, ~59MB)
-ln -sf $PWD/dist/vouch ~/.local/bin/vouch
+# Symlink the binary into a directory on your PATH, e.g.:
+ln -sf "$PWD/dist/vouch" ~/.local/bin/vouch
 vouch --version
 ```
 
@@ -99,6 +100,42 @@ vouch supersede 2 4 --reason "INFERENCE was overreach: 3 datasets ≠ 'competiti
 ```
 
 Default DB at `~/.vouch/store.db` (SQLite). Override with `VOUCH_DB_PATH`.
+
+## Claude Code integration (optional)
+
+`vouch gate` is a Stop-hook subcommand that scans the last assistant message
+for ungrounded factual claims about named external entities and prompts the
+agent to either ground them (via `vouch fetch` + `vouch claim`) or hedge
+explicitly. This is what turns vouch from a passive KB into an active
+confabulation gate during a Claude Code session.
+
+To enable, merge this block into your Claude Code settings (typically
+`~/.claude/settings.json` for user-level, or `.claude/settings.json` inside
+a project for project-level):
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vouch gate --transcript-stdin --strict",
+            "timeout": 30,
+            "statusMessage": "vouch gate"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If the file already has a `hooks.Stop` array, append the inner `hooks` entry
+to the existing one rather than replacing the whole block. The `vouch` binary
+must be on PATH (see Install). Drop `--strict` for advisory-only mode (gate
+warns but does not block the assistant turn).
 
 ## Claim types
 
