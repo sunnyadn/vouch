@@ -238,17 +238,23 @@ honest `--soft-score`.
 
 ## Architecture
 
-The invariant: vouch is a router, not a notebook. Facts enter the KB only
-through the input gate; claims only pass through the output check. The
-agent cannot bypass either.
+The invariant: vouch is a router, not a notebook. Two forced gates close
+the loop — drafts only ship through ⓪ the output gate (`vouch gate`), and
+facts only enter the KB through ① the input gate (`vouch fetch` or
+`vouch attest`). The agent cannot bypass either.
 
 ```mermaid
 flowchart TB
-    TITLE["<b>vouch — anti-fabrication facts router</b><br/>━━━━━━━━━━━━━━━━━━━━<br/>Core invariant: bidirectional forced gate<br/>Facts enter the KB only through ① input gate<br/>Claim references only pass through ② output check<br/>The agent cannot bypass either"]:::title
+    TITLE["<b>vouch — anti-fabrication facts router</b><br/>━━━━━━━━━━━━━━━━━━━━<br/>Two forced gates close the loop<br/>⓪ Output gate (vouch gate) — drafts only ship if grounded<br/>① Input gate (vouch fetch / attest) — facts enter the KB only via these<br/>The agent cannot bypass either"]:::title
 
     URL["🌐 Third-party URL<br/>arxiv · GitHub · HF · web pages"]:::src
     USR["👤 User's private domain<br/>dated statements · decisions · private docs"]:::src
-    AGENT["🤖 LLM agent<br/>(claim submitter)"]:::agt
+
+    DRAFT["📝 Assistant draft<br/>(end of turn)"]:::draft
+    GATE0["<b>🚪 ⓪ Output gate (vouch gate)</b><br/>━━━━━━━━━━━━<br/>Stop-hook scans draft for ungrounded<br/>named-entity factual claims<br/>━━━━━━━━━━━━<br/>blocks the turn until each is<br/>grounded with [verified: id] OR hedged"]:::gate
+    SHIP["🚢 Turn ships"]:::acc
+
+    AGENT["🤖 LLM agent<br/>(skill-driven Fetch-Before-Claim loop)"]:::agt
 
     INGATE["<b>⛔ ① Input gate — forced</b><br/>━━━━━━━━━━━━<br/>vouch fetch &lt;url&gt;<br/><i>vouch grabs the bytes itself; the agent never touches them</i><br/>vouch attest &lt;slug&gt;<br/><i>user self-declares, takes responsibility</i><br/>━━━━━━━━━━━━<br/>Facts enter the KB only via these two paths"]:::gate
 
@@ -259,7 +265,7 @@ flowchart TB
     REJ["❌ Rejected<br/>quote-not-in-dossier<br/>OR unsupported"]:::rej
     ACC["✅ Accepted<br/>verification: nli-quote · entailment · reframing"]:::acc
 
-    OUTPUT["🗣️ Citable claim_id<br/>vouch chain &lt;id&gt; walks the full evidence chain"]:::src
+    OUTPUT["🗣️ claim_id<br/>vouch chain &lt;id&gt; walks the full evidence chain"]:::src
 
     MAINT["<b>🔁 ④ Active maintenance (v0.4+)</b><br/>━━━━━━━━━━━━<br/>periodic refetch — detect source drift<br/>sleep-time inference — neighborhood INFERENCE candidates<br/>━━━━━━━━━━━━<br/>both feed back into ② verification + ③ store, closing the loop"]:::maint
 
@@ -270,6 +276,10 @@ flowchart TB
     USR --> INGATE
     INGATE --> STORE
 
+    DRAFT --> GATE0
+    GATE0 -- "all clean" --> SHIP
+    GATE0 -- "ungrounded → block" --> AGENT
+
     AGENT -- "submits claim<br/>+ quote / premises" --> QC
     STORE -.-> QC
     QC -- "✓" --> NLI
@@ -279,10 +289,12 @@ flowchart TB
     ACC --> STORE
     ACC --> OUTPUT
 
+    OUTPUT -- "tag draft with<br/>[verified: id]" --> DRAFT
+
     STORE <--> MAINT
     MAINT -. "re-verify / candidates" .-> QC
 
-    OUTPUT -.-> TAKEAWAY
+    SHIP -.-> TAKEAWAY
 
     classDef title fill:#1a237e,stroke:#000,stroke-width:3px,color:#fff
     classDef takeaway fill:#1a237e,stroke:#000,stroke-width:3px,color:#fff
@@ -294,6 +306,7 @@ flowchart TB
     classDef rej fill:#ffebee,stroke:#c62828,color:#000
     classDef acc fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
     classDef check fill:#fff8e1,stroke:#f57c00,stroke-width:2px,color:#000
+    classDef draft fill:#f3e5f5,stroke:#6a1b9a,color:#000
 ```
 
 Implementation — single Bun-compiled binary, no daemon, no HTTP:
