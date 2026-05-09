@@ -6,7 +6,7 @@ import { getLanguageModel } from "./providers.ts";
 import { embedBatch } from "./embedder.ts";
 import * as store from "./store.ts";
 import { findQuoteInContent } from "./quote-match.ts";
-import type { Claim, ClaimDependency, ClaimType, VerifyResult } from "./types.ts";
+import type { Claim, ClaimDependency, ClaimType, Dossier, VerifyResult } from "./types.ts";
 
 /** Thrown when the verifier failed for a system reason (auth expired, network
  *  unreachable, provider quota) — NOT for an evidence outcome. Caller must
@@ -78,6 +78,78 @@ Rules:
 - Reject "almost-true" claims that overstate, generalize, or paraphrase beyond what the source says.
 
 Return your verdict as JSON: { supported, score (0..1 confidence), reason (one sentence) }.`;
+
+// ---------------------------------------------------------------------------
+// Temporal-qualifier handling (SUN-57)
+//
+// Snapshot claims naturally carry a date qualifier ("X had Y stars as of
+// 2026-05-09"). The dossier's body usually doesn't repeat that date — it lives
+// in `capture_date` metadata. Without help, NLI sees the date in the claim,
+// can't find it in the source, and rejects.
+//
+// We handle two unambiguous snapshot patterns:
+//   - "as of YYYY-MM-DD"
+//   - "at T+Nh" / "at T-Nd" (relative offset)
+//
+// "on YYYY-MM-DD" is intentionally NOT handled — too ambiguous between
+// snapshot qualifier and load-bearing factual content (e.g. "released on
+// 2024-01-15"). Users wanting snapshot semantics should write "as of".
+//
+// For absolute-date qualifiers: if the date matches dossier.capture_date or
+// dossier.publication_date, strip the qualifier before NLI submission. If it
+// doesn't match, short-circuit to unsupported (the snapshot date is a load-
+// bearing fact and the dossier can't prove it).
+//
+// Stored claim_text always preserves the qualifier verbatim.
+// ---------------------------------------------------------------------------
+
+const TEMPORAL_AS_OF_RE = /\bas of\s+(\d{4}-\d{2}-\d{2})\b/gi;
+const TEMPORAL_RELATIVE_RE = /\bat\s+T[+-]?\d+\s*[hd]\b/gi;
+
+interface TemporalAnalysis {
+  qualifiers: { kind: "absolute" | "relative"; match: string; date?: string }[];
+  strippedClaim: string;
+  mismatchReason?: string;
+}
+
+export function analyzeTemporalQualifier(
+  claim: string,
+  dossier: Pick<Dossier, "capture_date" | "publication_date">,
+): TemporalAnalysis {
+  const qualifiers: TemporalAnalysis["qualifiers"] = [];
+  for (const m of claim.matchAll(TEMPORAL_AS_OF_RE)) {
+    qualifiers.push({ kind: "absolute", match: m[0], date: m[1] });
+  }
+  for (const m of claim.matchAll(TEMPORAL_RELATIVE_RE)) {
+    qualifiers.push({ kind: "relative", match: m[0] });
+  }
+
+  if (qualifiers.length === 0) {
+    return { qualifiers, strippedClaim: claim };
+  }
+
+  const dossierCapture = dossier.capture_date?.slice(0, 10) || null;
+  const dossierPub = dossier.publication_date?.slice(0, 10) || null;
+  const dossierDates: string[] = [dossierCapture, dossierPub].filter(Boolean) as string[];
+
+  let mismatchReason: string | undefined;
+  for (const q of qualifiers) {
+    if (q.kind === "absolute" && q.date && !dossierDates.includes(q.date)) {
+      const dossierDateStr = dossierDates.length ? dossierDates.join(" / ") : "(none)";
+      mismatchReason = `temporal qualifier "${q.match}" not satisfied: claim asserts ${q.date}, dossier date is ${dossierDateStr}`;
+      break;
+    }
+  }
+
+  const strippedClaim = claim
+    .replace(TEMPORAL_AS_OF_RE, "")
+    .replace(TEMPORAL_RELATIVE_RE, "")
+    .replace(/\s+([.,;:])/g, "$1")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+
+  return { qualifiers, strippedClaim, mismatchReason };
+}
 
 function chunkText(text: string): string[] {
   const out: string[] = [];
@@ -188,23 +260,40 @@ export async function verifyClaim(
   }
   const content = dossier.content || "";
 
-  let source: string;
-  if (opts.source_quote) {
-    source = opts.source_quote;
-  } else if (content.length < 50) {
-    return {
-      status: "insufficient",
+  // SUN-57: temporal qualifier handling. If the claim asserts an absolute
+  // snapshot date that doesn't match the dossier, short-circuit to
+  // unsupported. If it matches (or the qualifier is purely relative), strip
+  // the qualifier before NLI submission so the verifier doesn't reject the
+  // claim for asserting a date not present in the source body.
+  const temporal = analyzeTemporalQualifier(claim, dossier);
+  let result: VerifyResult;
+  if (temporal.mismatchReason) {
+    result = {
+      status: "unsupported",
       score: 0,
-      source_passage: content.slice(0, 500),
-      verifier: VERIFIER_MODEL,
-      claim_id: 0,
+      source_passage: temporal.mismatchReason,
+      verifier: `${VERIFIER_MODEL}-temporal`,
     };
-  } else if (content.length <= CHUNK_SIZE * 2) {
-    source = content;
   } else {
-    source = await retrieveRelevant(content, claim);
+    let source: string;
+    if (opts.source_quote) {
+      source = opts.source_quote;
+    } else if (content.length < 50) {
+      return {
+        status: "insufficient",
+        score: 0,
+        source_passage: content.slice(0, 500),
+        verifier: VERIFIER_MODEL,
+        claim_id: 0,
+      };
+    } else if (content.length <= CHUNK_SIZE * 2) {
+      source = content;
+    } else {
+      source = await retrieveRelevant(content, claim);
+    }
+    const claimForNli = temporal.qualifiers.length > 0 ? temporal.strippedClaim : claim;
+    result = await verifyClaimAgainstSource(claimForNli, source);
   }
-  const result = await verifyClaimAgainstSource(claim, source);
 
   // Attribution priority: explicit --attribution arg > dossier.author_attribution.
   // Do NOT auto-fill from dossier.title — title often defaults to the URL when
@@ -453,10 +542,33 @@ Task: find the 1–3 sentence verbatim quote from SOURCE that most directly supp
 
 Return JSON: { found, quote (verbatim string from source, or empty), reason }.`;
 
+/** Pull the first paragraph of the dossier as an entity-establishing prefix.
+ *  Most fetchers front-load the entity context (github metadata block, arxiv
+ *  title line, generic <title>-derived first line). Capping at PREFIX_MAX_CHARS
+ *  keeps the NLI prompt focused. */
+const PREFIX_MAX_CHARS = 600;
+
+export function extractEntityPrefix(content: string): string {
+  if (!content) return "";
+  const firstBlankIdx = content.indexOf("\n\n");
+  let block = firstBlankIdx === -1 ? content : content.slice(0, firstBlankIdx);
+  block = block.trim();
+  if (block.length <= PREFIX_MAX_CHARS) return block;
+  // First N lines that fit, to avoid mid-line chop.
+  const lines = block.split("\n");
+  let acc = "";
+  for (const line of lines) {
+    const next = acc ? `${acc}\n${line}` : line;
+    if (next.length > PREFIX_MAX_CHARS) break;
+    acc = next;
+  }
+  return acc;
+}
+
 export async function autoSelectQuote(
   claim: string,
   dossierContent: string,
-): Promise<{ quote: string; reason: string } | null> {
+): Promise<{ quote: string; prefix: string; reason: string } | null> {
   const truncated = dossierContent.slice(0, MAX_SOURCE_CHARS);
   const prompt = AUTOQUOTE_PROMPT_TEMPLATE.replace("{CLAIM}", claim).replace(
     "{SOURCE}",
@@ -472,7 +584,12 @@ export async function autoSelectQuote(
     if (!object.found) return null;
     const match = findQuoteInContent(object.quote, dossierContent);
     if (!match.found) return null;
-    return { quote: object.quote, reason: object.reason };
+    // SUN-58: entity-establishing prefix. Without it, NLI sees only the picked
+    // passage (e.g. `Stars: 66`) and can't verify that the claim's entity is
+    // the dossier's subject. The prefix is verbatim from the dossier — caller
+    // verifies it via findQuoteInContent before submitting to NLI.
+    const prefix = extractEntityPrefix(dossierContent);
+    return { quote: object.quote, prefix, reason: object.reason };
   } catch (e: any) {
     const transient = classifyError(e);
     if (transient) throw transient;

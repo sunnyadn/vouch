@@ -65,34 +65,80 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
     return errOut(`dossier not found: ${req.dossier_slug}`, "missing-dossier");
   }
 
-  let sourceQuote = req.source_quote;
+  const content = dossier.content || "";
+
+  let combinedQuote: string;
+  let offsetStart: number | null;
+  let offsetEnd: number | null;
+  let matchType: "exact" | "normalized" | "fuzzy" | "none";
   let autoSelected = false;
 
-  if (!sourceQuote && req.auto_quote) {
-    const auto = await autoSelectQuote(req.text, dossier.content || "");
+  if (req.source_quote) {
+    const match = findQuoteInContent(req.source_quote, content);
+    if (!match.found) {
+      return errOut(
+        `quote not found in dossier "${req.dossier_slug}". The submitted quote must appear in the dossier content vouch fetched. Re-check the source page or fetch a different one.`,
+        "quote-not-in-dossier",
+        { quote_preview: req.source_quote.slice(0, 200), dossier_chars: content.length },
+      );
+    }
+    combinedQuote = req.source_quote;
+    offsetStart = match.start;
+    offsetEnd = match.end;
+    matchType = match.matchType;
+  } else if (req.auto_quote) {
+    const auto = await autoSelectQuote(req.text, content);
     if (!auto) {
       return errOut(
         `auto-quote: no supporting passage found in dossier "${req.dossier_slug}".`,
         "quote-not-in-dossier",
       );
     }
-    sourceQuote = auto.quote;
-    autoSelected = true;
-  }
+    const passageMatch = findQuoteInContent(auto.quote, content);
+    if (!passageMatch.found) {
+      // Defensive — autoSelectQuote already verified, but recompute for offsets.
+      return errOut(
+        `auto-quote: passage not found in dossier "${req.dossier_slug}".`,
+        "quote-not-in-dossier",
+      );
+    }
 
-  if (!sourceQuote) {
+    // SUN-58: sandwich picked passage with entity-establishing prefix so NLI
+    // sees the dossier's subject, not just the bare data row. Verify the
+    // prefix is verbatim from the dossier; drop it if not.
+    let prefix = auto.prefix;
+    if (prefix) {
+      const prefixMatch = findQuoteInContent(prefix, content);
+      if (!prefixMatch.found) prefix = "";
+    }
+
+    if (prefix && prefix.includes(auto.quote)) {
+      // Picked passage is already inside the prefix (small dossier / GitHub
+      // metadata block). Use prefix alone — no need to duplicate.
+      const m = findQuoteInContent(prefix, content);
+      combinedQuote = prefix;
+      offsetStart = m.start;
+      offsetEnd = m.end;
+      matchType = m.matchType;
+    } else if (prefix) {
+      // Two non-contiguous pieces from the dossier — combined quote is not a
+      // single substring, so offsets can't represent it. The full text lives
+      // in source_quote; gate.ts falls back to that when offsets are null.
+      combinedQuote = `${prefix}\n\n${auto.quote}`;
+      offsetStart = null;
+      offsetEnd = null;
+      matchType = passageMatch.matchType;
+    } else {
+      combinedQuote = auto.quote;
+      offsetStart = passageMatch.start;
+      offsetEnd = passageMatch.end;
+      matchType = passageMatch.matchType;
+    }
+    autoSelected = true;
+  } else {
     return errOut(
       `${req.claim_type} requires --source-quote (the verbatim 1–3 sentences supporting the claim).`,
       "missing-source",
-    );
-  }
-
-  const match = findQuoteInContent(sourceQuote, dossier.content || "");
-  if (!match.found) {
-    return errOut(
-      `quote not found in dossier "${req.dossier_slug}". The submitted quote must appear in the dossier content vouch fetched. Re-check the source page or fetch a different one.`,
-      "quote-not-in-dossier",
-      { quote_preview: sourceQuote.slice(0, 200), dossier_chars: (dossier.content || "").length },
     );
   }
 
@@ -101,15 +147,15 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
     author: req.author,
     claim_type: req.claim_type,
     attribution: req.attribution,
-    source_quote: sourceQuote,
-    source_offset_start: match.start,
-    source_offset_end: match.end,
+    source_quote: combinedQuote,
+    source_offset_start: offsetStart,
+    source_offset_end: offsetEnd,
   });
   return {
     ...result,
     dossier_slug: req.dossier_slug,
     source_url: dossier.source_url,
-    quote_match: match.matchType,
+    quote_match: matchType,
     ...(autoSelected ? { metadata: { auto_selected_quote: true } } : {}),
   };
 }
