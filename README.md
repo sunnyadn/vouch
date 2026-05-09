@@ -238,6 +238,66 @@ honest `--soft-score`.
 
 ## Architecture
 
+The invariant: vouch is a router, not a notebook. Facts enter the KB only
+through the input gate; claims only pass through the output check. The
+agent cannot bypass either.
+
+```mermaid
+flowchart TB
+    TITLE["<b>vouch — anti-fabrication facts router</b><br/>━━━━━━━━━━━━━━━━━━━━<br/>Core invariant: bidirectional forced gate<br/>Facts enter the KB only through ① input gate<br/>Claim references only pass through ② output check<br/>The agent cannot bypass either"]:::title
+
+    URL["🌐 Third-party URL<br/>arxiv · GitHub · HF · web pages"]:::src
+    USR["👤 User's private domain<br/>dated statements · decisions · private docs"]:::src
+    AGENT["🤖 LLM agent<br/>(claim submitter)"]:::agt
+
+    INGATE["<b>⛔ ① Input gate — forced</b><br/>━━━━━━━━━━━━<br/>vouch fetch &lt;url&gt;<br/><i>vouch grabs the bytes itself; the agent never touches them</i><br/>vouch attest &lt;slug&gt;<br/><i>user self-declares, takes responsibility</i><br/>━━━━━━━━━━━━<br/>Facts enter the KB only via these two paths"]:::gate
+
+    STORE[("<b>📚 ③ KB store</b><br/>~/.vouch/store.db<br/>━━━━━━━━━━━━<br/>dossiers · claims<br/>dependency DAG · supersede chain<br/>verification field tags the mode")]:::store
+
+    QC{"<b>② Check 1: quote-in-dossier</b><br/>quote must appear in source<br/>(normalized exact match)"}:::check
+    NLI{"<b>② Check 2: NLI judge</b><br/>ATOMIC: quote ⊨ claim<br/>INFERENCE: premises ⊨ conclusion<br/>INTERPRETATION: premise ↔ paraphrase"}:::check
+    REJ["❌ Rejected<br/>quote-not-in-dossier<br/>OR unsupported"]:::rej
+    ACC["✅ Accepted<br/>verification: nli-quote · entailment · reframing"]:::acc
+
+    OUTPUT["🗣️ Citable claim_id<br/>vouch chain &lt;id&gt; walks the full evidence chain"]:::src
+
+    MAINT["<b>🔁 ④ Active maintenance (v0.4+)</b><br/>━━━━━━━━━━━━<br/>periodic refetch — detect source drift<br/>sleep-time inference — neighborhood INFERENCE candidates<br/>━━━━━━━━━━━━<br/>both feed back into ② verification + ③ store, closing the loop"]:::maint
+
+    TAKEAWAY["<b>Don't rely on prompt self-discipline — rely on pipeline closure</b><br/>vouch is not the agent's notebook.<br/>It is the facts router the agent cannot bypass."]:::takeaway
+
+    TITLE -.-> URL
+    URL --> INGATE
+    USR --> INGATE
+    INGATE --> STORE
+
+    AGENT -- "submits claim<br/>+ quote / premises" --> QC
+    STORE -.-> QC
+    QC -- "✓" --> NLI
+    QC -- "✗" --> REJ
+    NLI -- "✓ supported" --> ACC
+    NLI -- "✗ unsupported" --> REJ
+    ACC --> STORE
+    ACC --> OUTPUT
+
+    STORE <--> MAINT
+    MAINT -. "re-verify / candidates" .-> QC
+
+    OUTPUT -.-> TAKEAWAY
+
+    classDef title fill:#1a237e,stroke:#000,stroke-width:3px,color:#fff
+    classDef takeaway fill:#1a237e,stroke:#000,stroke-width:3px,color:#fff
+    classDef gate fill:#fff3e0,stroke:#e65100,stroke-width:4px,color:#000
+    classDef store fill:#e3f2fd,stroke:#0d47a1,stroke-width:3px,color:#000
+    classDef maint fill:#fce4ec,stroke:#ad1457,stroke-width:2px,color:#000
+    classDef src fill:#f5f5f5,stroke:#616161,color:#000
+    classDef agt fill:#e8eaf6,stroke:#3949ab,stroke-width:2px,color:#000
+    classDef rej fill:#ffebee,stroke:#c62828,color:#000
+    classDef acc fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px,color:#000
+    classDef check fill:#fff8e1,stroke:#f57c00,stroke-width:2px,color:#000
+```
+
+Implementation — single Bun-compiled binary, no daemon, no HTTP:
+
 ```
 CLI (vouch)
  ├─ bun:sqlite  →  ~/.vouch/store.db  (claims + dossiers + dependency DAG)
@@ -247,8 +307,8 @@ CLI (vouch)
  └─ commander    →  argparse + JSON output
 ```
 
-No daemon. No HTTP server. Each invocation opens SQLite, calls the
-configured provider, returns JSON. Cold start ~0.5s.
+Each invocation opens SQLite, calls the configured provider, returns JSON.
+Cold start ~0.5s.
 
 ## The "Fetch Before Claim" pattern
 
