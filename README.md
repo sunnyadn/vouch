@@ -98,6 +98,22 @@ If the file already has a `hooks.Stop` array, append the inner `hooks`
 entry rather than replacing the block. Drop `--strict` for advisory mode
 (gate warns but does not block the turn).
 
+### 4. Optional fetcher CLIs
+
+vouch's `vouch fetch` ships with a built-in generic fetcher that handles
+most static URLs. Three external CLIs, when present on `PATH`, broaden
+coverage with higher fidelity. All are auto-detected — vouch falls back
+to the generic fetcher when any is missing, so none is required.
+
+| CLI | Enables | Install hint |
+|---|---|---|
+| `gh` | GitHub repos / READMEs / issues fetcher | GitHub CLI from your package manager or its homepage |
+| `markitdown` | cleaner HTML→Markdown (otherwise an in-process strip is used) | `pip install markitdown` (or pipx) |
+| `opencli` | JS-rendered page fetcher (needs the Chrome browser-bridge extension too) | see the opencli project repo |
+
+`vouch doctor` reports which of these are detected and prints an install
+hint for the absent ones, so you can choose what to add post-install.
+
 ## Configure
 
 vouch loads env in this order, with later sources overriding earlier ones:

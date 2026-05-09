@@ -91,6 +91,38 @@ function checkProviderCredential(
   };
 }
 
+interface OptionalCli {
+  bin: string;
+  versionArgs: string[];
+  enables: string;
+  fixHint: string;
+}
+
+function checkOptionalCli(cli: OptionalCli): Check {
+  const name = `cli_${cli.bin}`;
+  try {
+    const proc = Bun.spawnSync([cli.bin, ...cli.versionArgs], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (proc.exitCode === 0) {
+      return {
+        name,
+        status: "ok",
+        detail: `${cli.bin} on PATH (enables: ${cli.enables})`,
+      };
+    }
+  } catch {
+    // spawn threw — bin not on PATH
+  }
+  return {
+    name,
+    status: "warn",
+    detail: `${cli.bin} not on PATH — ${cli.enables} unavailable; vouch falls back to its built-in generic fetcher`,
+    fix: cli.fixHint,
+  };
+}
+
 export function runDoctor(): DoctorReport {
   const checks: Check[] = [];
 
@@ -198,6 +230,34 @@ export function runDoctor(): DoctorReport {
       });
     }
   }
+
+  // 5. Optional fetcher CLIs — graceful-degraded. vouch works without them
+  //    (falls back to its built-in generic fetcher); presence broadens the
+  //    set of URLs that fetch with higher fidelity.
+  checks.push(
+    checkOptionalCli({
+      bin: "gh",
+      versionArgs: ["--version"],
+      enables: "GitHub repo / README / issues fetcher",
+      fixHint: "Install the GitHub CLI from your package manager or https://cli.github.com",
+    }),
+  );
+  checks.push(
+    checkOptionalCli({
+      bin: "markitdown",
+      versionArgs: ["--help"],
+      enables: "cleaner HTML→Markdown conversion (otherwise an in-process strip is used)",
+      fixHint: "Install via pip / pipx (Microsoft's markitdown package)",
+    }),
+  );
+  checks.push(
+    checkOptionalCli({
+      bin: "opencli",
+      versionArgs: ["--version"],
+      enables: "JS-rendered page fetcher — also requires the Chrome browser-bridge extension",
+      fixHint: "See https://github.com/jackwener/opencli for the CLI binary + Chrome extension setup",
+    }),
+  );
 
   const ok = !checks.some((c) => c.status === "fail");
   return { ok, checks };
