@@ -27,7 +27,7 @@ trail, and are searchable by hybrid embedding + keyword.
 Requires [Bun](https://bun.sh) ≥ 1.3.
 
 ```bash
-git clone https://github.com/<you>/vouch ~/Projects/vouch
+git clone https://github.com/sunnyadn/vouch ~/Projects/vouch
 cd ~/Projects/vouch
 bun install
 bun run build              # produces dist/vouch (single binary, ~59MB)
@@ -49,7 +49,8 @@ VOUCH_VERIFIER_MODEL=vertex_ai/gemini-3.1-pro-preview
 VOUCH_EMBEDDER_MODEL=vertex_ai/text-embedding-005
 # VOUCH_EMBEDDER_MODEL=openai/text-embedding-3-small
 
-# Vertex (default) — auth via `gcloud auth application-default login`
+# Vertex (default) — auth via service-account JSON key
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global
 ```
