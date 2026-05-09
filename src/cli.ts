@@ -14,6 +14,7 @@ import { embedOne } from "./embedder.ts";
 import { fetchAndStore } from "./fetch.ts";
 import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
+import { DEFAULT_GATE_MODEL, readStdinJson, runGateCli } from "./gate.ts";
 import type { ClaimType } from "./types.ts";
 
 const program = new Command()
@@ -293,6 +294,49 @@ program
   .action(async (query: string, opts: any) => {
     const qEmb = await embedOne(query);
     emit(store.searchHybrid(qEmb, opts.topK));
+  });
+
+// ---------- gate ----------
+program
+  .command("gate")
+  .description(
+    "Stop-hook gate: scan the last assistant message in a transcript for ungrounded " +
+      "named-entity factual claims and block (exit 2) if any aren't entailed by a " +
+      "supported vouch claim. Designed for Claude Code Stop hook integration.",
+  )
+  .option("--transcript-stdin", "Read Stop-hook payload JSON from stdin and derive transcript_path from it")
+  .option("--transcript-path <path>", "Read the transcript directly from this path (overrides stdin)")
+  .option("--draft <text>", "Use this text as the draft instead of reading a transcript")
+  .option("--strict", "exit 2 on ungrounded claims (default)")
+  .option("--advisory", "exit 0 + stderr warning only; never block")
+  .option("--bypass-env <name>", "env var that disables the gate when set to '1'", "VOUCH_GATE_BYPASS")
+  .option("--model <id>", "extractor model (LiteLLM-style)", DEFAULT_GATE_MODEL)
+  .option("--top-k <n>", "candidate claims fetched per entity", (v) => parseInt(v, 10), 5)
+  .action(async (opts: any) => {
+    let transcriptPath: string | undefined = opts.transcriptPath;
+    let hookPayload: any | undefined;
+    if (!transcriptPath && opts.transcriptStdin) {
+      hookPayload = readStdinJson();
+    }
+    const strict = !opts.advisory;
+    const result = await runGateCli({
+      transcriptPath,
+      hookPayload,
+      draft: opts.draft,
+      model: opts.model,
+      topK: opts.topK,
+      strict,
+      bypassEnv: opts.bypassEnv,
+    });
+    if (result.message) process.stderr.write(result.message);
+    emit({
+      blocked: result.verdict.blocked,
+      pairs: result.verdict.pairs,
+      ...(result.verdict.classifier_error
+        ? { classifier_error: result.verdict.classifier_error }
+        : {}),
+    });
+    process.exit(result.exitCode);
   });
 
 // ---------- health ----------
