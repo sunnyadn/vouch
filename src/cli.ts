@@ -15,6 +15,7 @@ import { fetchAndStore } from "./fetch.ts";
 import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
 import { DEFAULT_GATE_MODEL, readStdinJson, runGateCli } from "./gate.ts";
+import { runDoctor } from "./doctor.ts";
 import type { ClaimType } from "./types.ts";
 
 const program = new Command()
@@ -339,26 +340,17 @@ program
     process.exit(result.exitCode);
   });
 
-// ---------- health ----------
+// ---------- doctor ----------
 program
-  .command("health")
-  .description("Verify config + DB + provider auth")
+  .command("doctor")
+  .description(
+    "Diagnose config, env vars, DB connectivity, and Claude Code Stop-hook installation. " +
+      "Pure local checks — no API calls. Reports OK / WARN / FAIL per check with fix hints.",
+  )
   .action(async () => {
-    const out: any = {
-      ok: true,
-      db_path: process.env.VOUCH_DB_PATH || "~/.vouch/store.db",
-      verifier_model: process.env.VOUCH_VERIFIER_MODEL || "vertex_ai/gemini-3.1-pro-preview",
-      embedder_model: process.env.VOUCH_EMBEDDER_MODEL || "vertex_ai/text-embedding-005",
-    };
-    try {
-      store.getDb().prepare("SELECT 1").get();
-      out.db_ok = true;
-    } catch (e: any) {
-      out.db_ok = false;
-      out.db_error = e.message;
-      out.ok = false;
-    }
-    emit(out);
+    const report = runDoctor();
+    emit(report);
+    if (!report.ok) process.exit(1);
   });
 
 await program.parseAsync(process.argv);

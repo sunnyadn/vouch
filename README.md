@@ -59,6 +59,11 @@ GOOGLE_CLOUD_LOCATION=global
 Defaults assume Vertex Gemini + Vertex `text-embedding-005`. Switch providers
 without code changes.
 
+After setting env vars, run `vouch doctor` to verify provider credentials,
+DB connectivity, and (optionally) the Claude Code Stop-hook installation —
+all pure-local checks, no API calls. Exits 1 on any failure with actionable
+fix hints, so it's safe to drop into CI / setup scripts.
+
 ## Quick start
 
 vouch is a **two-phase tool**: first fetch a source (vouch does the fetch),
