@@ -46,13 +46,15 @@ function buildExtractPrompt(draft: string): string {
 INCLUDE an assertion when ALL of these hold:
   - It states a SPECIFIC factual property (number, version, capability, comparison, pricing, attribution, perf, organizational fact) of a NAMED EXTERNAL ENTITY (third-party dataset, paper, product, library, model, company, person, benchmark)
   - It is NOT hedged near the claim with "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "I'm going to verify now", "凭印象", or equivalent caveat
-  - It is NOT generic common knowledge ("Python is a programming language")
+  - It is NOT generic common knowledge or domain-textbook background. Generic common knowledge includes: language features, OS basics, well-known algorithm / methodology / statistical-test names with method-of-X descriptions ("X is a method for Y" / "X is a model used for Y" / "X is a statistical test for Y" / "X decomposes Y into Z"), classic papers' broad categories, mathematical primitives. The bar is "would a textbook in the relevant field state this without citation?" — if yes, skip. (Examples that should skip: "Fine-Gray is a statistical model for competing risks", "Fourier transform decomposes a signal into frequencies", "Cox regression models hazard ratios", "Gray test compares cumulative incidence functions".)
   - It is NOT workspace context. Workspace covers ALL of these — when in doubt, treat as workspace and skip:
       (a) The assistant's own actions, plans, recommendations, framing, or meta-commentary about the conversation itself.
-      (b) Properties of any project the assistant is acting as maintainer / author / dogfooder of — its command surface, flags, file paths, function names, build artifacts, test counts, commit hashes, internal architecture, or current runtime state. Code the user owns is not external to the user.${projectsLine}
+      (b) Properties of any project the assistant is acting as maintainer / author / dogfooder of — its command surface, flags, file paths, function names, build artifacts, test counts, commit hashes, internal architecture, current runtime state, OR FEATURE-SUPPORT / ROADMAP claims about that project ("X is supported in our toolkit", "we have built-in support for Y", "Z is on the roadmap", "our library covers W", "feature V is missing in our package"). Even when X / Y / Z is itself a third-party methodology or external entity, a claim about whether the user's project supports / will support / lacks it is workspace, not external.${projectsLine}
       (c) Anything the assistant plausibly observed via a tool call earlier in the same session (Bash command output, file contents read, git log/diff/show output, test results, HTTP responses, database queries). The transcript itself is the source of those — vouch is not the right gate.
       (d) Forward-looking, hypothetical, or proposed entities that the assistant frames as not-yet-existing ("I'll file ISSUE-X", "a proposed feature would ...", "the planned issue tracks ..."). Nothing external to verify against until the entity actually exists.
       (e) Internal issue-tracker IDs (Linear / Jira / GitHub issue numbers) and their described scope when the assistant is filing, summarizing, or proposing them — these are workspace coordination, not external claims.
+
+ALSO SKIP entities annotated as already-grounded by the vouch KB. If a named entity is annotated within a few words by "(claim N)", "(vouch claim N)", "(claim_id: N)", "(claim_ids: A,B,C)", or "supported (NLI)" / "(supported NLI)", the assistant has already grounded that entity through the vouch KB — DO NOT extract a pair for it. The annotation IS the verification handle; downstream DB-lookup by entity name is redundant and produces false positives because the lookup-key is the entity, not the claim_id. Treat such annotations the same as "(unverified)" hedge tokens for the purpose of suppression: the entity's properties have an explicit grounding signal, so skip.
 
 For each, return { entity: short canonical name, assertion: 1-sentence paraphrase or verbatim of the claim }.
 
@@ -192,6 +194,22 @@ export async function runGate(opts: {
   return { blocked: ungrounded.length > 0, pairs: checked };
 }
 
+/**
+ * Read the draft text the assistant just emitted to the user, from the most
+ * recent main-thread `type: "assistant"` event in a Claude Code transcript.
+ *
+ * Strict semantics (SUN-62):
+ *   - Only direct `text` content blocks of the most recent assistant event
+ *     count. Tool-use input strings (filtered by `b.type === "text"`) and
+ *     tool-result content (which lives in `type: "user"` events) are
+ *     excluded by construction.
+ *   - If that most recent assistant event has zero text content (the turn
+ *     was purely tool-use), return empty — DO NOT walk back to an earlier
+ *     assistant turn. Earlier-turn text is no longer the user-visible draft.
+ *   - Sidechain (subagent) assistant events are skipped.
+ *
+ * `VOUCH_GATE_DEBUG=1` prints the extracted draft to stderr.
+ */
 export function lastAssistantText(transcriptPath: string): string {
   const raw = readFileSync(transcriptPath, "utf8").trim();
   if (!raw) return "";
@@ -204,16 +222,30 @@ export function lastAssistantText(transcriptPath: string): string {
       continue;
     }
     if (ev?.type !== "assistant") continue;
+    if (ev?.isSidechain) continue;
     const c = ev?.message?.content;
-    if (typeof c === "string") return c;
-    if (Array.isArray(c)) {
-      const text = c
+    let text = "";
+    if (typeof c === "string") {
+      text = c;
+    } else if (Array.isArray(c)) {
+      text = c
         .filter((b: any) => b?.type === "text")
-        .map((b: any) => b.text ?? "")
-        .join("\n")
-        .trim();
-      if (text) return text;
+        .map((b: any) => b?.text ?? "")
+        .join("\n");
     }
+    text = text.trim();
+    if (process.env.VOUCH_GATE_DEBUG === "1") {
+      const preview = text.length > 500 ? text.slice(0, 500) + "…" : text;
+      process.stderr.write(
+        `[vouch-gate-debug] last assistant text (${text.length} chars): ${JSON.stringify(preview)}\n`,
+      );
+    }
+    return text;
+  }
+  if (process.env.VOUCH_GATE_DEBUG === "1") {
+    process.stderr.write(
+      `[vouch-gate-debug] no assistant event found in transcript\n`,
+    );
   }
   return "";
 }

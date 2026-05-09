@@ -373,4 +373,96 @@ describe("lastAssistantText", () => {
     );
     expect(gate.lastAssistantText(path)).toBe("");
   });
+
+  // SUN-62: only consider the most recent assistant turn's direct text.
+  // Tool-result content from prior user turns must not leak into the draft;
+  // a tool-only most-recent assistant turn must return empty (no walk-back).
+
+  it("excludes tool_result content from prior user turns", () => {
+    const path = join(tmp, "t5.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              {
+                type: "tool_use",
+                id: "tu_1",
+                name: "mcp__linear-server__save_issue",
+                input: { description: "Patronus Lynx is an 8B-param model with 87.7% on HaluBench." },
+              },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "user",
+          message: {
+            content: [
+              {
+                tool_use_id: "tu_1",
+                type: "tool_result",
+                content: '{"id":"SUN-XX","description":"Patronus Lynx is an 8B-param model..."}',
+              },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "Hello" }] },
+        }),
+      ].join("\n"),
+    );
+    expect(gate.lastAssistantText(path)).toBe("Hello");
+  });
+
+  it("most-recent assistant turn is tool-only → returns empty (no walk-back)", () => {
+    const path = join(tmp, "t6.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "text", text: "FEVER has 185,445 claims." },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "user",
+          message: { content: [{ tool_use_id: "tu_x", type: "tool_result", content: "ok" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "tool_use", id: "tu_2", name: "Bash", input: { command: "ls" } },
+            ],
+          },
+        }),
+      ].join("\n"),
+    );
+    expect(gate.lastAssistantText(path)).toBe("");
+  });
+
+  it("skips sidechain assistant events", () => {
+    const path = join(tmp, "t7.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "text", text: "main thread answer" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: true,
+          message: { content: [{ type: "text", text: "subagent chatter" }] },
+        }),
+      ].join("\n"),
+    );
+    expect(gate.lastAssistantText(path)).toBe("main thread answer");
+  });
 });
