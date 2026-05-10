@@ -33,7 +33,12 @@ const gate = await import("../src/gate.ts");
 afterEach(() => {
   const db = store.getDb();
   db.exec("DELETE FROM claim_dependencies; DELETE FROM claims; DELETE FROM dossiers;");
-  generateObjectMock.mockClear();
+  // mockReset clears queued mockImplementationOnce as well as call history,
+  // preventing leaks across tests that don't end up consuming their queued mock.
+  generateObjectMock.mockReset();
+  generateObjectMock.mockImplementation(() =>
+    Promise.resolve({ object: { pairs: [] } } as any),
+  );
   delete process.env.VOUCH_GATE_BYPASS;
 });
 
@@ -467,6 +472,7 @@ describe("runGateCli", () => {
         JSON.stringify({ type: "user", message: { content: "hi" } }),
         JSON.stringify({
           type: "assistant",
+          timestamp: new Date().toISOString(),
           message: { content: [{ type: "text", text: "FEVER has 185,445 claims." }] },
         }),
       ].join("\n"),
@@ -653,5 +659,221 @@ describe("lastAssistantText", () => {
       ].join("\n"),
     );
     expect(gate.lastAssistantText(path)).toBe("main thread answer");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readLatestAssistantTurn — freshness guard against transcript-flush race
+// ---------------------------------------------------------------------------
+
+describe("readLatestAssistantTurn", () => {
+  it("returns immediately as fresh when latest event has a recent timestamp", async () => {
+    const path = join(tmp, "fresh1.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: nowIso,
+        message: { content: [{ type: "text", text: "hi" }] },
+      }) + "\n",
+    );
+    const start = Date.now();
+    const turn = await gate.readLatestAssistantTurn(path, {
+      intervalMs: 20,
+      maxWaitMs: 500,
+      freshThresholdMs: 10000,
+    });
+    expect(turn.text).toBe("hi");
+    expect(turn.isFresh).toBe(true);
+    expect(Date.now() - start).toBeLessThan(100);
+  });
+
+  it("waits, then sees a freshly-appended turn (race fix)", async () => {
+    const path = join(tmp, "fresh2.jsonl");
+    // Simulate the staleness scenario: file currently has only an OLD
+    // turn whose timestamp is too old to be the just-finished turn.
+    const oldIso = new Date(Date.now() - 60000).toISOString(); // 60s ago
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: oldIso,
+        message: { content: [{ type: "text", text: "OLD turn" }] },
+      }) + "\n",
+    );
+
+    // 100ms later, simulate the transcript flush of the just-finished turn.
+    setTimeout(() => {
+      const fs = require("node:fs");
+      fs.appendFileSync(
+        path,
+        JSON.stringify({
+          type: "assistant",
+          timestamp: new Date().toISOString(),
+          message: { content: [{ type: "text", text: "NEW TURN" }] },
+        }) + "\n",
+      );
+    }, 100);
+
+    const turn = await gate.readLatestAssistantTurn(path, {
+      intervalMs: 30,
+      maxWaitMs: 800,
+      freshThresholdMs: 10000,
+    });
+    expect(turn.text).toBe("NEW TURN");
+    expect(turn.isFresh).toBe(true);
+  });
+
+  it("marks stale when latest event stays too old past maxWaitMs", async () => {
+    const path = join(tmp, "fresh3.jsonl");
+    const oldIso = new Date(Date.now() - 60000).toISOString();
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: oldIso,
+        message: { content: [{ type: "text", text: "stale Claude claim" }] },
+      }) + "\n",
+    );
+    const start = Date.now();
+    const turn = await gate.readLatestAssistantTurn(path, {
+      intervalMs: 30,
+      maxWaitMs: 200,
+      freshThresholdMs: 10000,
+    });
+    expect(turn.isFresh).toBe(false);
+    expect(turn.text).toBe("stale Claude claim");
+    expect(Date.now() - start).toBeGreaterThanOrEqual(200);
+  });
+
+  it("returns silently with empty + stale when file has no assistant events", async () => {
+    const path = join(tmp, "fresh4.jsonl");
+    writeFileSync(path, '{"type":"user","message":{"content":"hi"}}\n');
+    const turn = await gate.readLatestAssistantTurn(path, {
+      intervalMs: 20,
+      maxWaitMs: 100,
+      freshThresholdMs: 10000,
+    });
+    expect(turn.isFresh).toBe(false);
+    expect(turn.text).toBe("");
+  });
+
+  it("skips sidechain events when finding latest", async () => {
+    const path = join(tmp, "fresh5.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: "assistant",
+          timestamp: nowIso,
+          message: { content: [{ type: "text", text: "main" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: true,
+          timestamp: nowIso,
+          message: { content: [{ type: "text", text: "subagent" }] },
+        }),
+      ].join("\n"),
+    );
+    const turn = await gate.readLatestAssistantTurn(path, {
+      intervalMs: 20,
+      maxWaitMs: 200,
+      freshThresholdMs: 10000,
+    });
+    expect(turn.text).toBe("main");
+    expect(turn.isFresh).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGateCli — race-fix integration
+// ---------------------------------------------------------------------------
+
+describe("runGateCli race-fix integration", () => {
+  it("stale transcript → fail-open (exit 0, not blocked, never calls extractor)", async () => {
+    const path = join(tmp, "race1.jsonl");
+    // Latest assistant event is too old to be the just-finished turn:
+    // staleness signal that should trigger fail-open.
+    const oldIso = new Date(Date.now() - 60000).toISOString();
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: oldIso,
+        message: {
+          content: [{ type: "text", text: "Claude has 999 features." }],
+        },
+      }) + "\n",
+    );
+
+    // If the extractor were called, it would fire ASSERT → block.
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "Claude",
+              stance: "ASSERT",
+              proposition: "Claude has 999 features.",
+            },
+          ],
+        },
+      } as any),
+    );
+
+    const r = await gate.runGateCli({
+      transcriptPath: path,
+      model: "vertex_ai/test",
+      strict: true,
+      bypassEnv: "VOUCH_GATE_BYPASS",
+      // Tight timing so the test stays fast
+    } as any);
+
+    expect(r.exitCode).toBe(0);
+    expect(r.verdict.blocked).toBe(false);
+    // Extractor must NOT be called for stale transcripts
+    expect(generateObjectMock).toHaveBeenCalledTimes(0);
+  });
+
+  it("fresh transcript with ungrounded ASSERT → blocked (existing behavior preserved)", async () => {
+    const path = join(tmp, "race2.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "assistant",
+        timestamp: nowIso,
+        message: {
+          content: [{ type: "text", text: "FEVER has 185,445 claims." }],
+        },
+      }) + "\n",
+    );
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "FEVER",
+              stance: "ASSERT",
+              proposition: "FEVER has 185,445 claims.",
+            },
+          ],
+        },
+      } as any),
+    );
+
+    const r = await gate.runGateCli({
+      transcriptPath: path,
+      model: "vertex_ai/test",
+      strict: true,
+      bypassEnv: "VOUCH_GATE_BYPASS",
+    } as any);
+
+    expect(r.exitCode).toBe(2);
+    expect(r.verdict.blocked).toBe(true);
   });
 });

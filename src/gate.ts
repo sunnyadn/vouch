@@ -304,6 +304,107 @@ export function lastAssistantText(transcriptPath: string): string {
   return "";
 }
 
+/**
+ * Read the most-recent assistant text from the transcript, with a freshness
+ * guard against transcript-flush race conditions.
+ *
+ * Race fix: Claude Code's Stop hook can fire before the just-finished
+ * assistant turn is appended to the transcript JSONL. If the gate reads at
+ * that moment, the "latest" assistant event in the file is actually the
+ * PREVIOUS turn — any factual claim there gets re-flagged even though the
+ * user-visible draft no longer contains it.
+ *
+ * Strategy: poll until the latest assistant event in the transcript has a
+ * timestamp within `freshThresholdMs` of now. If after `maxWaitMs` no fresh
+ * event has appeared, mark the read as stale. Caller (runGateCli) uses the
+ * stale flag to fail-open rather than block on phantom claims.
+ *
+ * Defaults: poll every 50ms up to 1500ms; 10s freshness threshold (Stop
+ * hook always fires right after an assistant turn ends, so the latest
+ * event MUST be very recent — if it isn't, the transcript hasn't caught up).
+ */
+export interface AssistantTurnRead {
+  text: string;
+  timestamp: string | null;
+  isFresh: boolean;
+}
+
+function readLastAssistantEvent(
+  transcriptPath: string,
+): { text: string; timestamp: string | null } {
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, "utf8").trim();
+  } catch {
+    return { text: "", timestamp: null };
+  }
+  if (!raw) return { text: "", timestamp: null };
+  const lines = raw.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let ev: any;
+    try {
+      ev = JSON.parse(lines[i]!);
+    } catch {
+      continue;
+    }
+    if (ev?.type !== "assistant") continue;
+    if (ev?.isSidechain) continue;
+    const c = ev?.message?.content;
+    let text = "";
+    if (typeof c === "string") {
+      text = c;
+    } else if (Array.isArray(c)) {
+      text = c
+        .filter((b: any) => b?.type === "text")
+        .map((b: any) => b?.text ?? "")
+        .join("\n");
+    }
+    return { text: text.trim(), timestamp: typeof ev.timestamp === "string" ? ev.timestamp : null };
+  }
+  return { text: "", timestamp: null };
+}
+
+export async function readLatestAssistantTurn(
+  transcriptPath: string,
+  opts: { maxWaitMs?: number; intervalMs?: number; freshThresholdMs?: number } = {},
+): Promise<AssistantTurnRead> {
+  const maxWaitMs = opts.maxWaitMs ?? 1500;
+  const intervalMs = opts.intervalMs ?? 50;
+  const freshThresholdMs = opts.freshThresholdMs ?? 10000;
+  const start = Date.now();
+  let last: { text: string; timestamp: string | null } = { text: "", timestamp: null };
+
+  while (true) {
+    last = readLastAssistantEvent(transcriptPath);
+    if (last.timestamp) {
+      const ts = Date.parse(last.timestamp);
+      if (!Number.isNaN(ts)) {
+        const age = Date.now() - ts;
+        if (age >= 0 && age < freshThresholdMs) {
+          if (process.env.VOUCH_GATE_DEBUG === "1") {
+            process.stderr.write(
+              `[vouch-gate-debug] latest assistant event is ${age}ms old; fresh\n`,
+            );
+          }
+          return { ...last, isFresh: true };
+        }
+      }
+    }
+    if (Date.now() - start >= maxWaitMs) break;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+
+  if (process.env.VOUCH_GATE_DEBUG === "1") {
+    const age = last.timestamp
+      ? `${Date.now() - Date.parse(last.timestamp)}ms`
+      : "unknown";
+    process.stderr.write(
+      `[vouch-gate-debug] no fresh assistant event after ${maxWaitMs}ms (latest age: ${age}); marking stale → fail-open\n`,
+    );
+  }
+  return { ...last, isFresh: false };
+}
+
 export function readStdinJson(): any {
   try {
     return JSON.parse(readFileSync(0, "utf8"));
@@ -351,7 +452,14 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
       return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
     }
     try {
-      draft = lastAssistantText(transcriptPath);
+      const turn = await readLatestAssistantTurn(transcriptPath);
+      if (!turn.isFresh) {
+        // Transcript-flush race: the just-finished turn is not yet in the
+        // file (or no recent turn exists). Fail-open rather than block on
+        // potentially-stale prior-turn content.
+        return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
+      }
+      draft = turn.text;
     } catch {
       return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
     }
