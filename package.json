@@ -2,6 +2,7 @@
   "name": "vouch",
   "version": "0.3.0",
   "description": "Verified-claim KB CLI — Fetch Before Claim (FBC) pattern.",
+  "license": "MIT",
   "type": "module",
   "module": "src/cli.ts",
   "bin": {
