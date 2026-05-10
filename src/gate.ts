@@ -68,39 +68,37 @@ function buildExtractPrompt(draft: string): string {
   const projectsLine = projectsEnv
     ? `\n      Known workspace projects for this installation (claims about their command surface, flags, file paths, test counts, build state, internal architecture, or runtime state are workspace, not external): ${projectsEnv}.`
     : "";
-  return `You are a fact-grounding gate. The assistant has just produced a draft response. Your job is to extract every PROPOSITION the draft makes about a NAMED EXTERNAL ENTITY and label its STANCE.
+  return `You are a fact-grounding gate. Extract every PROPOSITION the draft makes about a NAMED EXTERNAL ENTITY and label its STANCE. The unit is "proposition with stance" — a draft can mention an entity name without asserting any fact about it; those cases get a non-ASSERT stance, not silently dropped and not over-extracted.
 
-The unit of analysis is "proposition with stance", NOT "entity reference". A draft can mention an entity name without making any factual assertion about it — those cases must be labelled accordingly, not treated as ASSERT.
+A NAMED EXTERNAL ENTITY is a third-party dataset, paper, product, library, model, company, person, or benchmark whose properties live OUTSIDE the assistant's workspace.
 
-A NAMED EXTERNAL ENTITY is a third-party dataset, paper, product, library, model, company, person, or benchmark whose properties live outside the assistant's workspace.
-
-For each proposition, return:
-  - proposition: 1-sentence verbatim or close paraphrase of what the draft says
-  - entity: short canonical name of the entity the proposition is about
-  - stance: exactly one of:
-      ASSERT    — declarative factual claim ("X has 100 features", "X beats Y on Z by 3 points")
-      HEDGE     — assertion paired with an explicit caveat in the same sentence/clause: "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "凭印象", or equivalent
-      SPECULATE — hypothetical, conditional, or modal ("X might do Y", "if X then Y", "X would probably ...")
-      NEGATE    — explicit denial ("X does not support Y", "X is not a Z")
-      COMPARE   — entity is the comparison topic, no factual outcome asserted ("we evaluated against X", "comparing X vs Y vs Z")
-      META      — reflective reference to a prior claim ("earlier I said X is Y", "the claim about X above")
-      RETRACT   — explicit cancellation of a prior claim ("retracting earlier claim about X", "ignore my earlier point about X")
-      REFER     — name used as a label only, no proposition attached ("see also X", "thanks to X")
+For each proposition, return { proposition, entity, stance }:
+  - proposition: 1-sentence verbatim or close paraphrase
+  - entity: short canonical name
+  - stance — exactly one of:
+      ASSERT    — declarative factual claim ("X has 100 features", "X beats Y by 3")
+      HEDGE     — assertion + caveat in the same sentence/clause: "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "凭印象", or equivalent
+      SPECULATE — hypothetical / conditional / modal ("X might do Y", "if X then Y")
+      NEGATE    — explicit denial ("X does not support Y")
+      COMPARE   — entity is the comparison topic without an asserted outcome ("we evaluated against X", "X vs Y")
+      META      — reflective reference to a prior claim ("earlier I said X is Y")
+      RETRACT   — explicit cancellation ("retracting earlier claim about X")
+      REFER     — name as label only ("see also X")
 
 DECISION RULES:
-  - If a hedge token appears in the same sentence or clause as the assertion about the entity, the stance is HEDGE — even if the surface form looks declarative. Hedge wins over ASSERT.
-  - For "X vs Y" patterns: if the sentence names what is being compared without asserting the outcome, both X and Y are COMPARE. If the sentence asserts an outcome ("X beat Y by 3 points"), that is ASSERT about X.
-  - A retraction sentence re-mentions the entity by necessity. The stance is RETRACT, never ASSERT, regardless of how the entity is described inside the retraction.
-  - Annotations like "(claim N)", "(vouch claim N)", "(claim_id: N)", "(claim_ids: A,B,C)", "(supported NLI)" are explicit grounding handles — treat the same as a hedge token: stance becomes META (the assertion is bookkept against a verified claim_id, not a fresh assertion to ground).
+  - Hedge tokens in the same sentence/clause → stance is HEDGE, even if surface looks declarative. Hedge wins over ASSERT.
+  - "X vs Y" without an outcome → both X and Y are COMPARE; with an outcome ("X beat Y") → ASSERT.
+  - Retraction sentences re-mention the entity by necessity → stance is RETRACT, never ASSERT.
+  - Annotations like "(claim N)", "(claim_id: N)", "(supported NLI)" → stance is META (already-grounded handle).
 
 EXCLUDE entirely (do NOT return any triple):
-  - Generic common knowledge / textbook background. The bar is "would a textbook in the relevant field state this without citation?" — if yes, skip. Examples that must skip: "Fine-Gray is a statistical model for competing risks", "Fourier transform decomposes a signal into frequencies", "Cox regression models hazard ratios", "Gray test compares cumulative incidence functions". Method-of-X descriptions ("X is a method for Y", "X is a model used for Y", "X is a statistical test for Y") are textbook background.
-  - Workspace context — when in doubt, treat as workspace and skip:
-      (a) The assistant's own actions, plans, recommendations, framing, or meta-commentary about the conversation itself.
-      (b) Properties of any project the assistant is acting as maintainer / author / dogfooder of — its command surface, flags, file paths, function names, build artifacts, test counts, commit hashes, internal architecture, current runtime state, OR FEATURE-SUPPORT / ROADMAP claims about that project ("X is supported in our toolkit", "we have built-in support for Y", "Z is on the roadmap", "our library covers W", "feature V is missing in our package"). Even when X / Y / Z is itself a third-party methodology or external entity, a claim about whether the user's project supports / will support / lacks it is workspace, not external.${projectsLine}
-      (c) Anything the assistant plausibly observed via a tool call earlier in the same session (Bash command output, file contents read, git log/diff/show output, test results, HTTP responses, database queries). The transcript itself is the source of those — vouch is not the right gate.
-      (d) Forward-looking, hypothetical, or proposed entities that the assistant frames as not-yet-existing ("I'll file ISSUE-X", "a proposed feature would ...", "the planned issue tracks ...").
-      (e) Internal issue-tracker IDs (Linear / Jira / GitHub issue numbers) and their described scope when the assistant is filing, summarizing, or proposing them — workspace coordination, not external claims.
+  - Textbook background. Bar: "would a textbook in the relevant field state this without citation?" — if yes, skip. Method-of-X descriptions ("X is a method/model/test for Y", "X decomposes Y into Z") and well-known algorithm / statistical-test / mathematical-primitive names are textbook.
+  - WORKSPACE — when in doubt, treat as workspace and skip:
+      (a) The assistant's own actions, plans, recommendations, framing, or meta-commentary about the conversation.
+      (b) Anything internal to a project the assistant maintains / authors / dogfoods — its command surface, flags, file paths, test counts, build state, runtime state, internal architecture, feature-support / roadmap claims, AND its own prompts / taxonomies / test fixtures (e.g., named fixtures like X1, X4, X5, C1) / source code / gate or extractor outputs. Even when X is itself a third-party methodology, claims about whether the project supports / lacks / will support it are workspace.${projectsLine}
+      (c) Anything observed via a tool call earlier in this session (Bash output, file contents, git log/diff, test results, HTTP responses).
+      (d) Forward-looking or proposed entities framed as not-yet-existing ("I'll file ISSUE-X", "a planned feature would ...").
+      (e) Internal issue-tracker IDs (Linear / Jira / GitHub) and their described scope when filing / summarizing / proposing them.
 
 If nothing qualifies, return { pairs: [] }.
 
