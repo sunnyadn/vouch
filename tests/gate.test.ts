@@ -81,8 +81,8 @@ describe("runGate fixtures", () => {
       Promise.resolve({
         object: {
           pairs: [
-            { entity: "FEVER", assertion: "FEVER has 185,445 claims." },
-            { entity: "MiniCheck-7B", assertion: "MiniCheck-7B beats GPT-4o on FACTBENCH." },
+            { entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." },
+            { entity: "MiniCheck-7B", stance: "ASSERT", proposition: "MiniCheck-7B beats GPT-4o on FACTBENCH." },
           ],
         },
       } as any),
@@ -94,6 +94,7 @@ describe("runGate fixtures", () => {
     expect(v.blocked).toBe(true);
     expect(v.pairs.length).toBe(2);
     expect(v.pairs.every((p) => !p.grounded)).toBe(true);
+    expect(v.pairs.every((p) => p.stance === "ASSERT")).toBe(true);
   });
 });
 
@@ -121,7 +122,7 @@ describe("runGate grounding", () => {
 
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({
-        object: { pairs: [{ entity: "FEVER", assertion: "FEVER has 185,445 claims." }] },
+        object: { pairs: [{ entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." }] },
       } as any),
     );
     generateObjectMock.mockImplementationOnce(() =>
@@ -156,7 +157,7 @@ describe("runGate grounding", () => {
 
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({
-        object: { pairs: [{ entity: "FEVER", assertion: "FEVER has 185,445 claims." }] },
+        object: { pairs: [{ entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." }] },
       } as any),
     );
 
@@ -194,7 +195,7 @@ describe("runGate grounding", () => {
 
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({
-        object: { pairs: [{ entity: "FEVER", assertion: "FEVER has 185,445 claims." }] },
+        object: { pairs: [{ entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." }] },
       } as any),
     );
     // Even if the verifier WOULD say supported, the gate should never call it
@@ -207,6 +208,193 @@ describe("runGate grounding", () => {
     });
     expect(v.blocked).toBe(true);
     expect(v.pairs[0]!.grounded).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Stance dispatch — issue #1: gate fires only on ASSERT
+// ---------------------------------------------------------------------------
+
+describe("runGate stance dispatch", () => {
+  it("HEDGE proposition → not blocked, no KB lookup", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "HEDGE", proposition: "FEVER has 185,445 claims." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "FEVER has 185,445 claims (unverified, from training memory).",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.stance).toBe("HEDGE");
+    // Only the extractor call — no embedder/verifier dispatch for non-ASSERT
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("SPECULATE / hypothetical → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "SPECULATE", proposition: "FEVER might have around 200k claims." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "If FEVER is comparable to similar datasets, it might have around 200k claims.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.stance).toBe("SPECULATE");
+  });
+
+  it("RETRACT re-mentions entity → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "RETRACT", proposition: "Retracting earlier claim about FEVER's size." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "Retracting my earlier claim about FEVER's size — I shouldn't have stated it.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.stance).toBe("RETRACT");
+  });
+
+  it("COMPARE: entity is comparison topic → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "COMPARE", proposition: "FEVER is one of the datasets being evaluated." },
+            { entity: "HaluBench", stance: "COMPARE", proposition: "HaluBench is one of the datasets being evaluated." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "We evaluate vouch against FEVER vs HaluBench.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.every((p) => p.grounded)).toBe(true);
+  });
+
+  it("NEGATE: explicit denial → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "NEGATE", proposition: "FEVER does not have 999,999 claims." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "FEVER does not have 999,999 claims.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+  });
+
+  it("META: reflective reference to prior claim → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "META", proposition: "Earlier I said FEVER has 185,445 claims." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "Earlier I said FEVER has 185,445 claims (claim_id: 42).",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+  });
+
+  it("REFER: name as label only → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "REFER", proposition: "See also: FEVER." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "See also: FEVER.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+  });
+
+  it("acceptance: transcript with only HEDGE + RETRACT → gate fires zero times", async () => {
+    // Hedge spiral / retraction transcript — extractor labels stance correctly,
+    // gate must not block. Issue #1 acceptance criterion.
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "HEDGE", proposition: "FEVER has roughly 185k claims." },
+            { entity: "FEVER", stance: "RETRACT", proposition: "Retracting earlier claim about FEVER." },
+            { entity: "MiniCheck-7B", stance: "HEDGE", proposition: "MiniCheck-7B is around 7B params." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft:
+        "FEVER has roughly 185k claims (unverified). Retracting earlier claim about FEVER. " +
+        "MiniCheck-7B is around 7B params (from training memory).",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(3);
+    expect(v.pairs.every((p) => p.grounded)).toBe(true);
+    // Stance values preserved in audit output
+    expect(v.pairs.map((p) => p.stance).sort()).toEqual(["HEDGE", "HEDGE", "RETRACT"]);
+  });
+
+  it("mixed: ASSERT (ungrounded) + HEDGE → blocked only on ASSERT", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." },
+            { entity: "MiniCheck-7B", stance: "HEDGE", proposition: "MiniCheck-7B is 7B params." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "FEVER has 185,445 claims. MiniCheck-7B is 7B params (unverified).",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(true);
+    const ungrounded = v.pairs.filter((p) => !p.grounded);
+    expect(ungrounded.length).toBe(1);
+    expect(ungrounded[0]!.stance).toBe("ASSERT");
+    expect(ungrounded[0]!.entity).toBe("FEVER");
   });
 });
 
@@ -230,7 +418,7 @@ describe("runGateCli", () => {
   it("strict + ungrounded → exit 2 + block message", async () => {
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({
-        object: { pairs: [{ entity: "X", assertion: "X has 100 features." }] },
+        object: { pairs: [{ entity: "X", stance: "ASSERT", proposition: "X has 100 features." }] },
       } as any),
     );
     const r = await gate.runGateCli({
@@ -247,7 +435,7 @@ describe("runGateCli", () => {
   it("advisory + ungrounded → exit 0 with advisory message", async () => {
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({
-        object: { pairs: [{ entity: "X", assertion: "X has 100 features." }] },
+        object: { pairs: [{ entity: "X", stance: "ASSERT", proposition: "X has 100 features." }] },
       } as any),
     );
     const r = await gate.runGateCli({
@@ -285,7 +473,7 @@ describe("runGateCli", () => {
     );
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({
-        object: { pairs: [{ entity: "FEVER", assertion: "FEVER has 185,445 claims." }] },
+        object: { pairs: [{ entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." }] },
       } as any),
     );
     const r = await gate.runGateCli({
@@ -296,6 +484,7 @@ describe("runGateCli", () => {
     });
     expect(r.exitCode).toBe(2);
     expect(r.verdict.pairs[0]!.entity).toBe("FEVER");
+    expect(r.verdict.pairs[0]!.stance).toBe("ASSERT");
   });
 
   it("classifier failure → fail-open exit 0", async () => {

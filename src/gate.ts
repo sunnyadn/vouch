@@ -2,15 +2,27 @@
  *
  * Pipeline:
  *   1. Read the last assistant text from a Claude Code transcript.
- *   2. Use a fast LLM to extract {entity, assertion} pairs that are factual
- *      claims about specific named external entities AND lack an explicit
- *      "(unverified)" hedge nearby.
- *   3. For each pair: hybrid-search vouch's claim KB; for each supported
- *      candidate run NLI (assertion vs claim_text + dossier source quote).
- *      Grounded if ANY supported claim entails the assertion.
- *   4. Block (exit 2) if any pair is ungrounded; otherwise pass.
+ *   2. Use a fast LLM to extract {proposition, stance, entity} triples — every
+ *      proposition the draft makes about a NAMED EXTERNAL ENTITY, labelled
+ *      with its stance (ASSERT, HEDGE, SPECULATE, NEGATE, COMPARE, META,
+ *      RETRACT, REFER). Workspace context and common knowledge are excluded
+ *      at extraction.
+ *   3. For each ASSERT triple: hybrid-search vouch's claim KB; for each
+ *      supported candidate run NLI (proposition vs claim_text + dossier
+ *      source quote). Grounded if ANY supported claim entails the proposition.
+ *      Non-ASSERT triples short-circuit as grounded — there is no fact to
+ *      verify against a source.
+ *   4. Block (exit 2) if any ASSERT triple is ungrounded; otherwise pass.
  *
  * Fail-open: classifier/network/transient errors → exit 0, never block.
+ *
+ * Why proposition+stance, not entity+assertion (issue #1):
+ *   The earlier extractor unit was "named-entity reference + inferred
+ *   assertion". Hedge-spirals, hypotheticals, retractions, and comparison
+ *   topics all leaked through because the entity name was always present in
+ *   the prose. Forcing the extractor to commit to an explicit stance per
+ *   proposition makes "this is not an assertion" a first-class output rather
+ *   than an implicit prompt-side filter.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { generateObject } from "ai";
@@ -25,12 +37,27 @@ import * as store from "./store.ts";
 export const DEFAULT_GATE_MODEL =
   process.env.VOUCH_GATE_MODEL || "vertex_ai/gemini-3.1-flash-lite";
 
+export const STANCES = [
+  "ASSERT",
+  "HEDGE",
+  "SPECULATE",
+  "NEGATE",
+  "COMPARE",
+  "META",
+  "RETRACT",
+  "REFER",
+] as const;
+export type Stance = (typeof STANCES)[number];
+
+const StanceEnum = z.enum(STANCES);
+
 const ExtractSchema = z.object({
   pairs: z
     .array(
       z.object({
+        proposition: z.string(),
+        stance: StanceEnum,
         entity: z.string(),
-        assertion: z.string(),
       }),
     )
     .max(20),
@@ -41,22 +68,39 @@ function buildExtractPrompt(draft: string): string {
   const projectsLine = projectsEnv
     ? `\n      Known workspace projects for this installation (claims about their command surface, flags, file paths, test counts, build state, internal architecture, or runtime state are workspace, not external): ${projectsEnv}.`
     : "";
-  return `You are a fact-grounding gate. The assistant has just produced a draft response. Extract every assertion that REQUIRES vouch verification.
+  return `You are a fact-grounding gate. The assistant has just produced a draft response. Your job is to extract every PROPOSITION the draft makes about a NAMED EXTERNAL ENTITY and label its STANCE.
 
-INCLUDE an assertion when ALL of these hold:
-  - It states a SPECIFIC factual property (number, version, capability, comparison, pricing, attribution, perf, organizational fact) of a NAMED EXTERNAL ENTITY (third-party dataset, paper, product, library, model, company, person, benchmark)
-  - It is NOT hedged near the claim with "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "I'm going to verify now", "凭印象", or equivalent caveat
-  - It is NOT generic common knowledge or domain-textbook background. Generic common knowledge includes: language features, OS basics, well-known algorithm / methodology / statistical-test names with method-of-X descriptions ("X is a method for Y" / "X is a model used for Y" / "X is a statistical test for Y" / "X decomposes Y into Z"), classic papers' broad categories, mathematical primitives. The bar is "would a textbook in the relevant field state this without citation?" — if yes, skip. (Examples that should skip: "Fine-Gray is a statistical model for competing risks", "Fourier transform decomposes a signal into frequencies", "Cox regression models hazard ratios", "Gray test compares cumulative incidence functions".)
-  - It is NOT workspace context. Workspace covers ALL of these — when in doubt, treat as workspace and skip:
+The unit of analysis is "proposition with stance", NOT "entity reference". A draft can mention an entity name without making any factual assertion about it — those cases must be labelled accordingly, not treated as ASSERT.
+
+A NAMED EXTERNAL ENTITY is a third-party dataset, paper, product, library, model, company, person, or benchmark whose properties live outside the assistant's workspace.
+
+For each proposition, return:
+  - proposition: 1-sentence verbatim or close paraphrase of what the draft says
+  - entity: short canonical name of the entity the proposition is about
+  - stance: exactly one of:
+      ASSERT    — declarative factual claim ("X has 100 features", "X beats Y on Z by 3 points")
+      HEDGE     — assertion paired with an explicit caveat in the same sentence/clause: "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "凭印象", or equivalent
+      SPECULATE — hypothetical, conditional, or modal ("X might do Y", "if X then Y", "X would probably ...")
+      NEGATE    — explicit denial ("X does not support Y", "X is not a Z")
+      COMPARE   — entity is the comparison topic, no factual outcome asserted ("we evaluated against X", "comparing X vs Y vs Z")
+      META      — reflective reference to a prior claim ("earlier I said X is Y", "the claim about X above")
+      RETRACT   — explicit cancellation of a prior claim ("retracting earlier claim about X", "ignore my earlier point about X")
+      REFER     — name used as a label only, no proposition attached ("see also X", "thanks to X")
+
+DECISION RULES:
+  - If a hedge token appears in the same sentence or clause as the assertion about the entity, the stance is HEDGE — even if the surface form looks declarative. Hedge wins over ASSERT.
+  - For "X vs Y" patterns: if the sentence names what is being compared without asserting the outcome, both X and Y are COMPARE. If the sentence asserts an outcome ("X beat Y by 3 points"), that is ASSERT about X.
+  - A retraction sentence re-mentions the entity by necessity. The stance is RETRACT, never ASSERT, regardless of how the entity is described inside the retraction.
+  - Annotations like "(claim N)", "(vouch claim N)", "(claim_id: N)", "(claim_ids: A,B,C)", "(supported NLI)" are explicit grounding handles — treat the same as a hedge token: stance becomes META (the assertion is bookkept against a verified claim_id, not a fresh assertion to ground).
+
+EXCLUDE entirely (do NOT return any triple):
+  - Generic common knowledge / textbook background. The bar is "would a textbook in the relevant field state this without citation?" — if yes, skip. Examples that must skip: "Fine-Gray is a statistical model for competing risks", "Fourier transform decomposes a signal into frequencies", "Cox regression models hazard ratios", "Gray test compares cumulative incidence functions". Method-of-X descriptions ("X is a method for Y", "X is a model used for Y", "X is a statistical test for Y") are textbook background.
+  - Workspace context — when in doubt, treat as workspace and skip:
       (a) The assistant's own actions, plans, recommendations, framing, or meta-commentary about the conversation itself.
       (b) Properties of any project the assistant is acting as maintainer / author / dogfooder of — its command surface, flags, file paths, function names, build artifacts, test counts, commit hashes, internal architecture, current runtime state, OR FEATURE-SUPPORT / ROADMAP claims about that project ("X is supported in our toolkit", "we have built-in support for Y", "Z is on the roadmap", "our library covers W", "feature V is missing in our package"). Even when X / Y / Z is itself a third-party methodology or external entity, a claim about whether the user's project supports / will support / lacks it is workspace, not external.${projectsLine}
       (c) Anything the assistant plausibly observed via a tool call earlier in the same session (Bash command output, file contents read, git log/diff/show output, test results, HTTP responses, database queries). The transcript itself is the source of those — vouch is not the right gate.
-      (d) Forward-looking, hypothetical, or proposed entities that the assistant frames as not-yet-existing ("I'll file ISSUE-X", "a proposed feature would ...", "the planned issue tracks ..."). Nothing external to verify against until the entity actually exists.
-      (e) Internal issue-tracker IDs (Linear / Jira / GitHub issue numbers) and their described scope when the assistant is filing, summarizing, or proposing them — these are workspace coordination, not external claims.
-
-ALSO SKIP entities annotated as already-grounded by the vouch KB. If a named entity is annotated within a few words by "(claim N)", "(vouch claim N)", "(claim_id: N)", "(claim_ids: A,B,C)", or "supported (NLI)" / "(supported NLI)", the assistant has already grounded that entity through the vouch KB — DO NOT extract a pair for it. The annotation IS the verification handle; downstream DB-lookup by entity name is redundant and produces false positives because the lookup-key is the entity, not the claim_id. Treat such annotations the same as "(unverified)" hedge tokens for the purpose of suppression: the entity's properties have an explicit grounding signal, so skip.
-
-For each, return { entity: short canonical name, assertion: 1-sentence paraphrase or verbatim of the claim }.
+      (d) Forward-looking, hypothetical, or proposed entities that the assistant frames as not-yet-existing ("I'll file ISSUE-X", "a proposed feature would ...", "the planned issue tracks ...").
+      (e) Internal issue-tracker IDs (Linear / Jira / GitHub issue numbers) and their described scope when the assistant is filing, summarizing, or proposing them — workspace coordination, not external claims.
 
 If nothing qualifies, return { pairs: [] }.
 
@@ -67,8 +111,9 @@ ${draft}
 }
 
 export interface ExtractedPair {
+  proposition: string;
+  stance: Stance;
   entity: string;
-  assertion: string;
 }
 
 export interface GroundedPair extends ExtractedPair {
@@ -142,7 +187,7 @@ export async function checkGrounding(
     }
 
     const source = quote ? `${claim.claim_text}\n\n${quote}` : claim.claim_text;
-    const verdict = await verifyClaimAgainstSource(pair.assertion, source);
+    const verdict = await verifyClaimAgainstSource(pair.proposition, source);
     if (verdict.status === "supported") {
       return {
         ...pair,
@@ -158,7 +203,7 @@ export async function checkGrounding(
     grounded: false,
     matched_claim_id: null,
     reason: hits.length
-      ? `${hits.length} candidate(s) found but none entailed the assertion`
+      ? `${hits.length} candidate(s) found but none entailed the proposition`
       : "no candidate claim in KB",
   };
 }
@@ -177,6 +222,15 @@ export async function runGate(opts: {
   }
   const checked: GroundedPair[] = [];
   for (const p of extracted) {
+    if (p.stance !== "ASSERT") {
+      checked.push({
+        ...p,
+        grounded: true,
+        matched_claim_id: null,
+        reason: `stance=${p.stance} — no fact to ground`,
+      });
+      continue;
+    }
     try {
       checked.push(await checkGrounding(p, opts.topK));
     } catch (e) {
@@ -320,7 +374,7 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
 function formatBlockMessage(verdict: GateVerdict, advisory: boolean): string {
   const ungrounded = verdict.pairs.filter((p) => !p.grounded);
   const lines = ungrounded.map(
-    (p) => `  • ${p.entity}: "${p.assertion.slice(0, 200)}" (${p.reason})`,
+    (p) => `  • ${p.entity}: "${p.proposition.slice(0, 200)}" (${p.reason})`,
   );
   const header = advisory
     ? `[vouch-gate advisory] Ungrounded named-entity claim(s) in draft:`
