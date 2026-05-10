@@ -1,0 +1,34 @@
+{
+  "results": [
+    {
+      "input": "alce_dryrun_without_vouch.json",
+      "n_samples": 100,
+      "citation_recall": 80.68535825545172,
+      "citation_precision": 64.37054631828978,
+      "citation_f1": 71.61046778554304,
+      "n_sentences_with_cites": 321,
+      "n_sentences_supported": 259,
+      "n_individual_cites": 421,
+      "n_individual_supported": 271,
+      "claim_nli": 27.0,
+      "n_claims_total": 300,
+      "n_claims_entailed": 81,
+      "n_answers_with_claims": 100
+    },
+    {
+      "input": "alce_dryrun_with_vouch.json",
+      "n_samples": 100,
+      "citation_recall": 87.00787401574803,
+      "citation_precision": 83.3922261484099,
+      "citation_f1": 85.16169062839323,
+      "n_sentences_with_cites": 254,
+      "n_sentences_supported": 221,
+      "n_individual_cites": 283,
+      "n_individual_supported": 236,
+      "claim_nli": 22.333333333333332,
+      "n_claims_total": 300,
+      "n_claims_entailed": 67,
+      "n_answers_with_claims": 100
+    }
+  ]
+}
