@@ -1,7 +1,7 @@
 /** Gate logic tests — mocks LLM + embedder, uses real SQLite store. */
 import { afterEach, beforeAll, describe, expect, it, mock } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 const tmp = mkdtempSync(join(tmpdir(), "vouch-gate-test-"));
@@ -933,7 +933,74 @@ describe("runGateCli race-fix integration", () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseSessionSources — transcript tool_result extraction (issue #21)
+// safeFileReadCommand — Bash single-file-read recognition (issue #22)
+// ---------------------------------------------------------------------------
+
+describe("safeFileReadCommand", () => {
+  it("accepts plain cat / head / tail of a single file", () => {
+    expect(gate.safeFileReadCommand("cat /repo/notes.md")).toBe("/repo/notes.md");
+    expect(gate.safeFileReadCommand("cat ./relative/path.yaml")).toBe("./relative/path.yaml");
+    expect(gate.safeFileReadCommand("  cat   spaced.txt  ")).toBe("spaced.txt");
+    expect(gate.safeFileReadCommand("head -n 20 src/gate.ts")).toBe("src/gate.ts");
+    expect(gate.safeFileReadCommand("head -n20 src/gate.ts")).toBe("src/gate.ts");
+    expect(gate.safeFileReadCommand("head -20 file")).toBe("file");
+    expect(gate.safeFileReadCommand("head -c 500 file")).toBe("file");
+    expect(gate.safeFileReadCommand("tail file")).toBe("file");
+    expect(gate.safeFileReadCommand("tail -n +5 CHANGELOG.md")).toBe("CHANGELOG.md");
+    expect(gate.safeFileReadCommand("/bin/cat /etc/hosts")).toBe("/etc/hosts");
+    expect(gate.safeFileReadCommand('cat "spaced name.md"')).toBe("spaced name.md");
+    expect(gate.safeFileReadCommand("cat 'quoted.txt'")).toBe("quoted.txt");
+    expect(gate.safeFileReadCommand("cat -- -dashfile")).toBe("-dashfile");
+  });
+
+  it("accepts a `< file` input redirect with no positional arg", () => {
+    expect(gate.safeFileReadCommand("cat < notes.md")).toBe("notes.md");
+    expect(gate.safeFileReadCommand("cat<notes.md")).toBe("notes.md");
+    expect(gate.safeFileReadCommand("head -n 5 < file.txt")).toBe("file.txt");
+  });
+
+  it("expands a leading ~", () => {
+    expect(gate.safeFileReadCommand("cat ~/.vouch/.env")).toBe(join(homedir(), ".vouch/.env"));
+    expect(gate.safeFileReadCommand("cat ~")).toBe(homedir());
+  });
+
+  it("rejects pipes, substitutions, globs, multi-file, redirects, and non-read commands", () => {
+    for (const c of [
+      "cat a.md | grep foo",
+      "cat $(ls)",
+      "cat `ls`",
+      "cat *.md",
+      "cat a.md b.md",
+      "cat a.md && echo done",
+      "cat a.md; cat b.md",
+      "cat a.md > out.txt",
+      "cat a.md >> out.txt",
+      "cat file 2>/dev/null",
+      "cat $HOME/.env",
+      "cat {a,b}.md",
+      "grep -r foo .",
+      "find . -name '*.md' -exec cat {} ;",
+      "python foo.py",
+      "jq . data.json",
+      "ls -la",
+      "cat -n file", // -n transforms output (line numbers)
+      "cat -A file",
+      "tail -f log", // follow, not a one-shot read
+      "cat -", // stdin
+      "cat /dev/stdin",
+      "cat /dev/fd/0",
+      "cat < a < b",
+      "cat a.md < b.md", // redirect + positional → ambiguous
+      "",
+      "cat", // no file (reads stdin)
+    ]) {
+      expect(gate.safeFileReadCommand(c)).toBeNull();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSessionSources — transcript tool_result extraction (issues #21, #22)
 // ---------------------------------------------------------------------------
 
 describe("parseSessionSources", () => {
@@ -1023,6 +1090,36 @@ describe("parseSessionSources", () => {
     expect(gate.parseSessionSources(join(tmp, "no-such-file.jsonl"))).toEqual([]);
   });
 
+  it("picks up Bash single-file reads (cat/head); ignores pipes/multi-file/other commands; no cat -n stripping", () => {
+    const path = join(tmp, "ps5.jsonl");
+    writeFileSync(
+      path,
+      [
+        // cat F → picked up verbatim (the `␣␣1\t…` text below must NOT be stripped — that's Read-tool-only)
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_cat", name: "Bash", input: { command: "cat /repo/META.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_cat", content: "Foo benchmark has 42 tasks.\n     1\tnot a line-number prefix" }] } }),
+        // head -n N F → picked up
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_head", name: "Bash", input: { command: "head -n 5 ./config.yaml" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_head", content: "model: test" }] } }),
+        // pipe → not a session source
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_pipe", name: "Bash", input: { command: "cat /repo/big.md | grep Foo" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_pipe", content: "Foo benchmark line" }] } }),
+        // multi-file → not a session source
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_multi", name: "Bash", input: { command: "cat a.md b.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_multi", content: "merged content" }] } }),
+        // git log → not a session source
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_git", name: "Bash", input: { command: "git log --oneline -5" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_git", content: "abc123 commit" }] } }),
+      ].join("\n"),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(2);
+    expect(got.every((s) => s.tool === "Bash")).toBe(true);
+    const byUri = Object.fromEntries(got.map((s) => [s.uri, s]));
+    expect(byUri["/repo/META.md"]!.content).toBe("Foo benchmark has 42 tasks.\n     1\tnot a line-number prefix");
+    expect(byUri["./config.yaml"]!.content).toBe("model: test");
+  });
+
   it("dedups by (tool|uri), keeping the freshest content", () => {
     const path = join(tmp, "ps4.jsonl");
     writeFileSync(
@@ -1104,6 +1201,44 @@ describe("runGate session-evidence auto-grounding", () => {
     expect(dossier.scope).toBe("third-party");
     expect(dossier.source_type).toBe("session-webfetch");
     expect(dossier.source_url).toBe("https://example.org/bar");
+  });
+
+  it("ungrounded ASSERT entailed by a session Bash `cat` → auto-grounds, scope workspace, source_type session-bash", async () => {
+    const path = join(tmp, "ag-bash.jsonl");
+    writeFileSync(
+      path,
+      transcriptWithSource("Bash", "tu1", { command: "cat /repo/META.md" }, "Foo benchmark consists of 42 evaluation tasks across 6 domains."),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.9, reason: "stated" } } as any));
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 evaluation tasks.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.auto_grounded).toBe(true);
+    expect(v.pairs[0]!.session_sources_checked).toBe(1);
+    const claim = store.getClaim(v.pairs[0]!.matched_claim_id!)!;
+    expect(claim.verification).toBe("nli-session");
+    const dossier = store.getDossier(claim.dossier_slug)!;
+    expect(dossier.scope).toBe("workspace");
+    expect(dossier.source_type).toBe("session-bash");
+    expect(dossier.source_url).toBe("/repo/META.md");
+  });
+
+  it("entity appears only in piped Bash output → still blocked (a pipe is not a session source, no session NLI)", async () => {
+    const path = join(tmp, "ag-bash-pipe.jsonl");
+    writeFileSync(
+      path,
+      transcriptWithSource("Bash", "tu1", { command: "cat /repo/big.md | grep -i foo" }, "Foo benchmark has 42 evaluation tasks."),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] } } as any),
+    );
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 evaluation tasks.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.session_sources_checked).toBeUndefined(); // parseSessionSources returned [] → loop skipped
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+    expect(store.listDossiers().length).toBe(0);
   });
 
   it("session source mentions the entity but does not entail → still blocked, session_sources_checked recorded", async () => {

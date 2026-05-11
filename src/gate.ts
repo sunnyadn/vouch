@@ -25,20 +25,28 @@
  *   proposition makes "this is not an assertion" a first-class output rather
  *   than an implicit prompt-side filter.
  *
- * Session-evidence auto-grounding (issue #21):
+ * Session-evidence auto-grounding (issues #21, #22):
  *   When an ASSERT proposition isn't grounded by the KB, the gate — before
  *   blocking — scans the transcript's `tool_result` events for content the
- *   agent demonstrably retrieved THIS SESSION via `Read` / `WebFetch` /
- *   `WebSearch`. If one of those entity-mentioning results NLI-entails the
- *   proposition, the gate snapshots it as a dossier, files the claim against
- *   it, and passes — turning a false-positive fire into a recorded grounding
- *   instead of training the agent to dodge. Lazy (only on a fire), bounded
- *   (entity-matching results only, K-capped NLI, size-capped per result), and
- *   it ONLY trusts content that came back from a tool — never the assistant's
- *   own asserted prose. Anything not retrieved via a tool still blocks exactly
- *   as before.
+ *   agent demonstrably retrieved THIS SESSION: via the `Read` / `WebFetch` /
+ *   `WebSearch` tools, or via `Bash` when the command is an unambiguous
+ *   single-file read (`cat F`, `head … F`, `tail … F`, `< F`) — agents `cat`
+ *   files at least as often as they use the `Read` tool. If one of those
+ *   entity-mentioning results NLI-entails the proposition, the gate snapshots
+ *   it as a dossier, files the claim against it, and passes — turning a
+ *   false-positive fire into a recorded grounding instead of training the agent
+ *   to dodge. Lazy (only on a fire), bounded (entity-matching results only,
+ *   K-capped NLI, size-capped per result), and it ONLY trusts content that came
+ *   back from a tool — never the assistant's own asserted prose. Bash output
+ *   that pipes / globs / merges files / runs another program is opaque and is
+ *   NOT ingested (those claims block as normal); a path mis-parse can only make
+ *   the dossier's provenance metadata less precise, never produce a wrong
+ *   grounding, because NLI still gates it. Anything not retrieved via a tool
+ *   still blocks exactly as before.
  */
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { generateObject } from "ai";
 import { z } from "zod";
 
@@ -143,7 +151,7 @@ export interface GroundedPair extends ExtractedPair {
    *  transcript was available or the pair was already grounded. */
   session_sources_checked?: number;
   /** True when this pair was resolved by auto-grounding against a source the
-   *  agent retrieved this session (Read / WebFetch / WebSearch). */
+   *  agent retrieved this session (Read / WebFetch / WebSearch / Bash cat). */
   auto_grounded?: boolean;
 }
 
@@ -277,33 +285,177 @@ export async function checkGrounding(
 }
 
 // ---------------------------------------------------------------------------
-// Session-evidence auto-grounding (issue #21)
+// Session-evidence auto-grounding (issues #21, #22)
 //
 // Before the gate blocks an ungrounded ASSERT, it checks whether the agent
 // already retrieved a source supporting the proposition THIS SESSION — via a
-// `Read` (local file), `WebFetch` (page content), or `WebSearch` (result
-// snippets). Those live in the transcript's `tool_result` events. If one
-// entity-mentioning result NLI-entails the proposition, we snapshot it as a
-// dossier, file the claim against it, and pass.
+// `Read` (local file), `WebFetch` (page content), `WebSearch` (result
+// snippets), or a `Bash` single-file read (`cat`/`head`/`tail`/`< F`). Those
+// live in the transcript's `tool_result` events. If one entity-mentioning
+// result NLI-entails the proposition, we snapshot it as a dossier, file the
+// claim against it, and pass.
 //
 // We trust ONLY content that came back from a tool — never the assistant's own
 // asserted prose. WebFetch content is model-extracted (not raw HTML), so a
-// failed NLI there is the cue to do a real `vouch fetch <url>`.
+// failed NLI there is the cue to do a real `vouch fetch <url>`. Bash output is
+// unstructured, so only the narrow set of commands whose output IS a file's
+// content verbatim counts (see `safeFileReadCommand`) — anything that pipes,
+// globs, merges files, or runs another program is opaque and ignored.
 // ---------------------------------------------------------------------------
 
 export interface SessionSource {
-  tool: "Read" | "WebFetch" | "WebSearch";
-  /** Source identifier: a file path (Read), URL (WebFetch), or `websearch:<query>`. */
+  /** `Bash` = a recognized single-file read (`cat`/`head`/`tail`/`< F`). */
+  tool: "Read" | "WebFetch" | "WebSearch" | "Bash";
+  /** Source identifier: a file path (Read / Bash), URL (WebFetch), or `websearch:<query>`. */
   uri: string;
   content: string;
 }
 
-const SESSION_SOURCE_TOOLS = new Set(["Read", "WebFetch", "WebSearch"]);
+const SESSION_SOURCE_TOOLS = new Set(["Read", "WebFetch", "WebSearch", "Bash"]);
 /** Max candidate session sources NLI-checked per ungrounded pair. */
 const SESSION_AUTOGROUND_K = 3;
 /** Most-recent unique session sources retained from a transcript. */
 const SESSION_SOURCES_MAX = 50;
-const TOOL_PRIORITY: Record<string, number> = { Read: 0, WebFetch: 1, WebSearch: 2 };
+const TOOL_PRIORITY: Record<string, number> = { Read: 0, Bash: 0, WebFetch: 1, WebSearch: 2 };
+
+// --- Bash file-read recognition (issue #22) --------------------------------
+//
+// Agents read file content via `Bash` (`cat F`, `head -n N F`, `tail F`, `< F`)
+// at least as often as via the `Read` tool, and that path was invisible to the
+// auto-grounding parser — a claim about something the agent just `cat`-ed would
+// still fire. Only an UNAMBIGUOUS single-file read counts: `cat`/`head`/`tail`
+// of exactly one file (optionally via a `< F` input redirect). Anything that
+// pipes (`cat x | grep y`), substitutes (`$(...)`, backticks), globs
+// (`cat *.md`), merges (`cat a b`), or runs another program is opaque and is
+// rejected — those claims block as normal. Risk is bounded by NLI still running
+// after: a path mis-parse only makes the recorded `source_url` less precise, it
+// can never produce a grounding that the content doesn't actually entail.
+
+const HOME = homedir();
+
+/** Expand a leading `~` / `~/…` — the only tilde form bash expands at word
+ *  start; other uses are literal and left alone. */
+function expandTilde(p: string): string {
+  if (p === "~") return HOME;
+  if (p.startsWith("~/")) return join(HOME, p.slice(2));
+  return p;
+}
+
+/** Tokenize a shell command into words, honoring `'…'` / `"…"` quoting and `\`
+ *  escapes. Returns `null` the moment it sees any construct meaning the command
+ *  does more than read one file verbatim: pipes, `;`, `&`, command / process /
+ *  arithmetic substitution, parameter expansion, output redirects, globs, brace
+ *  expansion, `!`, `#`. A bare `<` is emitted as its own token (the one
+ *  redirect we understand). */
+function tokenizeShellRead(cmd: string): string[] | null {
+  const tokens: string[] = [];
+  let cur = "";
+  let started = false; // current token has begun (so we keep an empty "" arg)
+  let inSingle = false;
+  let inDouble = false;
+  const flush = () => {
+    if (started) tokens.push(cur);
+    cur = "";
+    started = false;
+  };
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i]!;
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      else cur += ch;
+      started = true;
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '"') inDouble = false;
+      else if (ch === "$" || ch === "`") return null; // expansion inside ""
+      else if (ch === "\\" && i + 1 < cmd.length && '"\\$`'.includes(cmd[i + 1]!)) cur += cmd[++i]!;
+      else cur += ch;
+      started = true;
+      continue;
+    }
+    if (/\s/.test(ch)) { flush(); continue; }
+    switch (ch) {
+      case "'": inSingle = true; started = true; continue;
+      case '"': inDouble = true; started = true; continue;
+      case "\\":
+        if (i + 1 < cmd.length) { cur += cmd[++i]!; started = true; }
+        continue;
+      case "<":
+        flush();
+        tokens.push("<");
+        continue;
+      case "|": case ";": case "&": case "$": case "`":
+      case "(": case ")": case "{": case "}":
+      case "*": case "?": case "[": case "]":
+      case ">": case "#": case "!":
+        return null;
+      default:
+        cur += ch;
+        started = true;
+    }
+  }
+  if (inSingle || inDouble) return null;
+  flush();
+  return tokens;
+}
+
+/** A `head`/`tail` option flag we can safely skip — the output then stays a
+ *  prefix/suffix of the file, still useful to NLI. */
+function isHeadTailFlag(tok: string): boolean {
+  return (
+    /^-\d+[bkmcKMG]?$/.test(tok) ||                          // -10  -10k
+    /^-[nc]\d+[bkmKMG]?$/.test(tok) ||                       // -n10 -c20k
+    /^-[ncqvz]+$/.test(tok) ||                               // -n -c -q -v -z (and bundled)
+    /^--lines(=.*)?$/.test(tok) ||
+    /^--bytes(=.*)?$/.test(tok) ||
+    /^--(quiet|silent|verbose|zero-terminated)$/.test(tok)
+  );
+}
+/** Value-bearing forms — the count comes from the following token. */
+const FLAG_TAKES_NEXT_COUNT = /^(-[nc]|--lines|--bytes)$/;
+const COUNT_VALUE = /^[+-]?\d+[bkmcKMG]?$/;
+
+/** If `cmd` is an unambiguous single-file read (`cat F`, `head … F`, `tail … F`,
+ *  optionally with a `< F` input redirect), return the (tilde-expanded) path —
+ *  the Bash result text IS that file's content (or a prefix/suffix of it).
+ *  Everything else (pipes, substitutions, globs, multiple files, output
+ *  redirects, any other command, stdin / fd pseudo-files) → `null`. */
+export function safeFileReadCommand(cmd: string): string | null {
+  const tokens = tokenizeShellRead((cmd || "").trim());
+  if (!tokens || tokens.length < 2) return null;
+  let name = tokens[0]!;
+  const slash = Math.max(name.lastIndexOf("/"), name.lastIndexOf("\\"));
+  if (slash >= 0) name = name.slice(slash + 1);
+  if (name !== "cat" && name !== "head" && name !== "tail") return null;
+
+  let positional: string | null = null;
+  let redirect: string | null = null;
+  let endOfOptions = false;
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    if (t === "<") {
+      const target = tokens[++i];
+      if (!target || target === "<" || redirect) return null;
+      redirect = target;
+      continue;
+    }
+    if (!endOfOptions && t === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && t.length > 1 && t.startsWith("-")) {
+      if (name === "cat") return null; // any `cat` flag (-n, -A, -b, …) transforms output
+      if (!isHeadTailFlag(t)) return null; // unrecognized head/tail flag (e.g. tail -f)
+      if (FLAG_TAKES_NEXT_COUNT.test(t) && COUNT_VALUE.test(tokens[i + 1] ?? "")) i++; // consume count
+      continue;
+    }
+    if (positional) return null; // a second file → ambiguous concat
+    positional = t;
+  }
+  if (redirect && positional) return null; // both → ambiguous
+  const path = redirect ?? positional;
+  if (!path || path === "-" || path === "/dev/stdin") return null;
+  if (/^\/(dev\/fd|proc\/self\/fd)\//.test(path)) return null;
+  return expandTilde(path);
+}
 
 function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -329,9 +481,10 @@ function stripLineNumbers(text: string): string {
 }
 
 /** Parse a Claude Code transcript JSONL for content the agent retrieved via
- *  Read / WebFetch / WebSearch this session. Returns `[]` for anything that
- *  doesn't look like a Claude Code transcript (the "fall through to current
- *  behavior" path — a thin adapter for other harnesses can be added later). */
+ *  Read / WebFetch / WebSearch / a Bash single-file read this session. Returns
+ *  `[]` for anything that doesn't look like a Claude Code transcript (the "fall
+ *  through to current behavior" path — a thin adapter for other harnesses can
+ *  be added later). */
 export function parseSessionSources(transcriptPath: string): SessionSource[] {
   let raw: string;
   try {
@@ -374,19 +527,27 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
       if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string" || b.is_error) continue;
       const tu = toolUseById.get(b.tool_use_id);
       if (!tu || !SESSION_SOURCE_TOOLS.has(tu.name)) continue;
+      // Bash only counts when the command is an unambiguous single-file read.
+      let bashPath: string | null = null;
+      if (tu.name === "Bash") {
+        bashPath = safeFileReadCommand(String(tu.input?.command ?? ""));
+        if (!bashPath) continue;
+      }
       let text = toolResultText(b.content).trim();
       if (!text && ev.toolUseResult) {
         const r = ev.toolUseResult;
         if (tu.name === "Read") text = String(r?.file?.content ?? "").trim();
         else if (tu.name === "WebFetch") text = String(r?.result ?? "").trim();
+        else if (tu.name === "Bash") text = String(r?.stdout ?? "").trim();
       }
       if (!text) continue;
       let uri = "";
       if (tu.name === "Read") uri = String(tu.input?.file_path ?? "");
       else if (tu.name === "WebFetch") uri = String(tu.input?.url ?? "");
       else if (tu.name === "WebSearch") uri = "websearch:" + String(tu.input?.query ?? "");
+      else if (tu.name === "Bash") uri = bashPath!;
       if (!uri || uri === "websearch:") continue;
-      if (tu.name === "Read") text = stripLineNumbers(text);
+      if (tu.name === "Read") text = stripLineNumbers(text); // Bash output is raw — no `cat -n` to strip
       if (text.length > MAX_SOURCE_CHARS) text = text.slice(0, MAX_SOURCE_CHARS);
       out.push({ tool: tu.name as SessionSource["tool"], uri, content: text });
     }
@@ -398,7 +559,7 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
 }
 
 function sessionSourceTitle(src: SessionSource): string {
-  if (src.tool === "Read") {
+  if (src.tool === "Read" || src.tool === "Bash") {
     const p = src.uri.replace(/^file:\/\//, "");
     const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
     return i >= 0 ? p.slice(i + 1) : p;
@@ -441,7 +602,7 @@ async function autoGroundPair(
     // the "quote" is the retrieved content itself, which NLI just entailed —
     // the anti-fabrication primitive (a claim must trace to content vouch can
     // see) is satisfied by construction.
-    const scope = src.tool === "Read" ? "workspace" : "third-party";
+    const scope = src.tool === "Read" || src.tool === "Bash" ? "workspace" : "third-party";
     let dossierEmb: Float32Array | null = null;
     try {
       dossierEmb = await embedOne(slice.slice(0, 8000));

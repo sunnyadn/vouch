@@ -175,14 +175,17 @@ Or hedge explicitly with "(unverified, from training memory)" near the claim.
 ```
 
 Before it blocks, the gate first checks whether the agent **already
-retrieved a supporting source this session** — a file read with `Read`, a
-page pulled with `WebFetch`, results from `WebSearch`. Those live in the
-transcript. If one of them entails the proposition (same NLI judge), the
-gate snapshots that content as a dossier, files the claim against it, and
-passes — so a claim about something the agent demonstrably saw doesn't
-force a redundant re-fetch. Anything the agent only *asserted* (training
-memory, paraphrase) still blocks. A `Read` source is recorded with
-`scope: workspace`; a `WebFetch` source with `scope: third-party`.
+retrieved a supporting source this session** — a file read with `Read` or
+with `Bash` (`cat F`, `head F`, `tail F`, `< F` — the unambiguous
+single-file cases only; pipes / globs / multi-file / anything that
+transforms output don't count), a page pulled with `WebFetch`, results
+from `WebSearch`. Those live in the transcript. If one of them entails the
+proposition (same NLI judge), the gate snapshots that content as a dossier,
+files the claim against it, and passes — so a claim about something the
+agent demonstrably saw doesn't force a redundant re-fetch. Anything the
+agent only *asserted* (training memory, paraphrase) still blocks. A `Read`
+or `Bash` source is recorded with `scope: workspace`; a `WebFetch` source
+with `scope: third-party`.
 
 When the gate does block, the agent (with the skill loaded) runs the loop:
 
@@ -190,9 +193,10 @@ When the gate does block, the agent (with the skill loaded) runs the loop:
    verified claim already exists, cite its `claim_id` and skip ahead.
 2. **Otherwise fetch the source** — `vouch fetch <url>` returns a
    `dossier_slug`; vouch performs the HTTP request itself and persists the
-   content. (If the agent already pulled this with `WebFetch` this session,
-   it doesn't reach this step — the gate auto-grounds from that. This step is
-   for sources the agent hasn't retrieved.)
+   content. (If the agent already pulled this with `WebFetch` — or read a
+   local file with `Read` / `cat` — this session, it doesn't reach this step:
+   the gate auto-grounds from that. This step is for sources the agent hasn't
+   retrieved.)
 3. **Read what vouch saved** — `vouch get-dossier <slug> --full`. The
    quote must come from this dossier text, not the agent's own read of
    the URL — HTML strippers differ and the quote-in-dossier check
