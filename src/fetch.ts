@@ -3,8 +3,11 @@
  *  architecture: claims must reference dossiers vouch fetched itself.
  */
 import { fetchUrl } from "./fetchers/index.ts";
+import type { FetcherResult } from "./fetchers/types.ts";
 import { embedOne } from "./embedder.ts";
 import * as store from "./store.ts";
+import { existsSync } from "node:fs";
+import { basename, resolve } from "node:path";
 
 interface FetchResult {
   dossier_slug: string;
@@ -39,14 +42,68 @@ function sliceContent(full: string, opts: { full?: boolean; contentLimit?: numbe
   return full.slice(0, limit);
 }
 
+function isHttpUrl(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+interface LocalFileInfo {
+  canonicalUrl: string;
+  absolutePath: string;
+}
+
+function resolveLocalFile(url: string): LocalFileInfo | null {
+  if (url.startsWith("file://")) {
+    const path = url.slice("file://".length);
+    const abs = resolve(path);
+    if (existsSync(abs)) {
+      return { canonicalUrl: `file://${abs}`, absolutePath: abs };
+    }
+    throw new Error(`local file not found: ${path}`);
+  }
+  if (!isHttpUrl(url)) {
+    const abs = resolve(url);
+    if (existsSync(abs)) {
+      return { canonicalUrl: `file://${abs}`, absolutePath: abs };
+    }
+  }
+  return null;
+}
+
+async function fetchLocalFile(path: string): Promise<FetcherResult> {
+  const file = Bun.file(path);
+  const buf = await file.arrayBuffer();
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let content: string;
+  try {
+    content = decoder.decode(buf);
+  } catch {
+    throw new Error("local-file fetch supports text files; for binary sources use a URL");
+  }
+  return {
+    content,
+    title: basename(path),
+    source_type: "local-file",
+    publication_date: null,
+    author_attribution: null,
+  };
+}
+
 export async function fetchAndStore(
   url: string,
   opts: { hint?: string; forceRefetch?: boolean; full?: boolean; contentLimit?: number } = {},
 ): Promise<FetchResult> {
+  const local = resolveLocalFile(url);
+  const targetUrl = local ? local.canonicalUrl : url;
+
   // Cache hit: same URL fetched < 24h ago via a real fetcher (not just an
   // agent-submitted quote). Skip refetch.
   if (!opts.forceRefetch) {
-    const cached = store.getRecentFetchedDossier(url, 24);
+    const cached = store.getRecentFetchedDossier(targetUrl, 24);
     if (cached) {
       const fullContent = cached.content || "";
       return {
@@ -64,7 +121,9 @@ export async function fetchAndStore(
     }
   }
 
-  const result = await fetchUrl(url, opts.hint);
+  const result = local
+    ? await fetchLocalFile(local.absolutePath)
+    : await fetchUrl(url, opts.hint);
 
   // Embed for hybrid search. Use a representative slice — content might be
   // larger than the embedding model's input cap.
@@ -76,7 +135,7 @@ export async function fetchAndStore(
   }
 
   const slug = store.writeDossier({
-    source_url: url,
+    source_url: targetUrl,
     source_type: result.source_type,
     title: result.title,
     verbatim_content: result.content,
@@ -87,7 +146,7 @@ export async function fetchAndStore(
 
   return {
     dossier_slug: slug,
-    source_url: url,
+    source_url: targetUrl,
     source_type: result.source_type,
     title: result.title,
     publication_date: result.publication_date,
