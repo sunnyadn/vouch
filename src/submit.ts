@@ -24,7 +24,7 @@ import type { ClaimType, SubmitClaimRequest } from "./types.ts";
 
 interface RejectedSubmission {
   error: string;
-  reason: "missing-dossier" | "quote-not-in-dossier" | "missing-deps" | "missing-deps-claims" | "missing-source" | "bad-claim-type" | "empty-text";
+  reason: "missing-dossier" | "quote-not-in-dossier" | "missing-deps" | "missing-deps-claims" | "missing-source" | "bad-deps" | "bad-claim-type" | "empty-text";
   detail?: unknown;
 }
 

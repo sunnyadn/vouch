@@ -312,7 +312,7 @@ program
   .option("--advisory", "exit 0 + stderr warning only; never block")
   .option("--bypass-env <name>", "env var that disables the gate when set to '1'", "VOUCH_GATE_BYPASS")
   .option("--model <id>", "extractor model (LiteLLM-style)", DEFAULT_GATE_MODEL)
-  .option("--top-k <n>", "candidate claims fetched per entity", (v) => parseInt(v, 10), 5)
+  .option("--top-k <n>", "candidate claims fetched per proposition", (v) => parseInt(v, 10), 8)
   .action(async (opts: any) => {
     let transcriptPath: string | undefined = opts.transcriptPath;
     let hookPayload: any | undefined;

@@ -145,6 +145,40 @@ describe("runGate grounding", () => {
     expect(v.pairs[0]!.matched_claim_id).toBe(cid);
   });
 
+  it("near-verbatim restate of a supported claim → grounded via lexical fast-path (no NLI call)", async () => {
+    const slug = store.writeDossier({
+      source_url: "https://example.com",
+      source_type: "test",
+      verbatim_content: "FEVER consists of 185,445 claims classified as Supported, Refuted or NotEnoughInfo.",
+    });
+    const cid = store.recordClaim({
+      dossier_slug: slug,
+      claim_text: "FEVER consists of 185445 claims",
+      score: 0.95,
+      status: "supported",
+      claim_type: "ATOMIC",
+      embedding: queryVec,
+    });
+
+    // Only the extractor mock is queued. If the gate falls through to an NLI
+    // round-trip, generateObject is called a second time and returns the
+    // default { pairs: [] }, which would NOT be "supported" → test would fail.
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "FEVER", stance: "ASSERT", proposition: "FEVER consists of 185445 claims" }] },
+      } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "FEVER consists of 185,445 claims.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.matched_claim_id).toBe(cid);
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
   it("KB hit unsupported → not grounded → blocked", async () => {
     const slug = store.writeDossier({
       source_url: "https://example.com",
@@ -351,6 +385,26 @@ describe("runGate stance dispatch", () => {
     });
     expect(v.blocked).toBe(false);
     expect(v.pairs[0]!.grounded).toBe(true);
+  });
+
+  it("OPINION: value/normative judgment → not blocked, no KB lookup", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            { entity: "FEVER", stance: "OPINION", proposition: "FEVER is the best dataset for this." },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "FEVER is the best dataset for this comparison.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.stance).toBe("OPINION");
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
   });
 
   it("acceptance: transcript with only HEDGE + RETRACT → gate fires zero times", async () => {

@@ -4,14 +4,15 @@
  *   1. Read the last assistant text from a Claude Code transcript.
  *   2. Use a fast LLM to extract {proposition, stance, entity} triples — every
  *      proposition the draft makes about a NAMED EXTERNAL ENTITY, labelled
- *      with its stance (ASSERT, HEDGE, SPECULATE, NEGATE, COMPARE, META,
- *      RETRACT, REFER). Workspace context and common knowledge are excluded
- *      at extraction.
- *   3. For each ASSERT triple: hybrid-search vouch's claim KB; for each
- *      supported candidate run NLI (proposition vs claim_text + dossier
- *      source quote). Grounded if ANY supported claim entails the proposition.
- *      Non-ASSERT triples short-circuit as grounded — there is no fact to
- *      verify against a source.
+ *      with its stance (ASSERT, OPINION, HEDGE, SPECULATE, NEGATE, COMPARE,
+ *      META, RETRACT, REFER). Workspace context and common knowledge are
+ *      excluded at extraction.
+ *   3. For each ASSERT triple: hybrid-search vouch's claim KB (on the
+ *      proposition, not the bare entity); a supported claim with high lexical
+ *      overlap short-circuits as grounded; otherwise run NLI (proposition vs
+ *      claim_text + dossier source quote). Grounded if ANY supported claim
+ *      entails the proposition. Non-ASSERT triples (OPINION / HEDGE / … )
+ *      short-circuit as grounded — there is no checkable fact to verify.
  *   4. Block (exit 2) if any ASSERT triple is ungrounded; otherwise pass.
  *
  * Fail-open: classifier/network/transient errors → exit 0, never block.
@@ -39,6 +40,7 @@ export const DEFAULT_GATE_MODEL =
 
 export const STANCES = [
   "ASSERT",
+  "OPINION",
   "HEDGE",
   "SPECULATE",
   "NEGATE",
@@ -76,18 +78,21 @@ For each proposition, return { proposition, entity, stance }:
   - proposition: 1-sentence verbatim or close paraphrase
   - entity: short canonical name
   - stance — exactly one of:
-      ASSERT    — declarative factual claim ("X has 100 features", "X beats Y by 3")
+      ASSERT    — declarative, checkable factual claim about a measurable property ("X has 100 features", "X beats Y by 3 points", "X was released in 2023")
+      OPINION   — evaluative or normative judgment, not a measurable fact ("X is the best Y", "X is as valuable as Y", "X matters here", "X is overkill", "X is the right choice", "X's approach is cleaner") — including value-comparisons ("X is better than Y" with no metric)
       HEDGE     — assertion + caveat in the same sentence/clause: "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "凭印象", or equivalent
       SPECULATE — hypothetical / conditional / modal ("X might do Y", "if X then Y")
       NEGATE    — explicit denial ("X does not support Y")
       COMPARE   — entity is the comparison topic without an asserted outcome ("we evaluated against X", "X vs Y")
       META      — reflective reference to a prior claim ("earlier I said X is Y")
       RETRACT   — explicit cancellation ("retracting earlier claim about X")
-      REFER     — name as label only ("see also X")
+      REFER     — name as label only ("see also X"), OR a one-line gloss of what an entity/tool/skill IS at the level a directory listing would give ("kimi-task is a task-dispatch skill", "X is a CLI for Y") — provided no quantitative or specific factual property is asserted
 
 DECISION RULES:
   - Hedge tokens in the same sentence/clause → stance is HEDGE, even if surface looks declarative. Hedge wins over ASSERT.
-  - "X vs Y" without an outcome → both X and Y are COMPARE; with an outcome ("X beat Y") → ASSERT.
+  - Evaluative/normative wording (best/worst/right/wrong/valuable/sufficient/overkill/cleaner/better-without-a-metric) → stance is OPINION, not ASSERT. "Is X good enough" is OPINION; "does X score ≥ 0.8" is ASSERT.
+  - A claim about the model currently running this session (its capabilities, context budget, speed, resource use while doing the present work) → that is meta-commentary about the conversation → WORKSPACE, do not return a triple. The running model is not a third-party external entity here.
+  - "X vs Y" without an outcome → both X and Y are COMPARE; with a measured outcome ("X beat Y by N") → ASSERT; with an unmeasured value-outcome ("X is better than Y") → OPINION.
   - Retraction sentences re-mention the entity by necessity → stance is RETRACT, never ASSERT.
   - Annotations like "(claim N)", "(claim_id: N)", "(supported NLI)" → stance is META (already-grounded handle).
 
@@ -144,13 +149,37 @@ export async function extractPairs(
   }
 }
 
+/** Normalized token set for cheap lexical overlap checks. */
+function tokenSet(s: string): Set<string> {
+  return new Set(
+    s
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((t) => t.length > 1),
+  );
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
 export async function checkGrounding(
   pair: ExtractedPair,
-  topK = 5,
+  topK = 8,
 ): Promise<GroundedPair> {
+  // Retrieve on the PROPOSITION, not the bare entity name. The proposition is
+  // far more discriminative — embedding "ALCE" pulls every ALCE claim and the
+  // top-K cut then drops the one that actually entails; embedding the
+  // proposition ranks the entailing claim first. Falls back to entity if the
+  // proposition somehow embeds to nothing useful (kept implicit — both go
+  // through the same hybrid scan).
   let queryEmb: Float32Array;
   try {
-    queryEmb = await embedOne(pair.entity);
+    queryEmb = await embedOne(`${pair.entity}. ${pair.proposition}`);
   } catch (e: any) {
     return {
       ...pair,
@@ -161,6 +190,7 @@ export async function checkGrounding(
   }
 
   const hits = store.searchHybrid(queryEmb, topK).filter((h) => h.kind === "claim");
+  const propTokens = tokenSet(pair.proposition);
 
   for (const h of hits) {
     if (h.id == null) continue;
@@ -168,6 +198,18 @@ export async function checkGrounding(
     if (!claim) continue;
     if (claim.status !== "supported") continue;
     if (claim.superseded_by != null) continue;
+
+    // Fast path: the draft is restating a claim already filed and supported.
+    // High lexical overlap with a supported claim's text → grounded without an
+    // NLI round-trip. (Anti-demoralizer: "I grounded this, why are you firing".)
+    if (jaccard(propTokens, tokenSet(claim.claim_text)) >= 0.8) {
+      return {
+        ...pair,
+        grounded: true,
+        matched_claim_id: claim.id,
+        reason: `restates supported claim ${claim.id} (lexical overlap)`,
+      };
+    }
 
     let quote = "";
     if (claim.dossier_slug) {
