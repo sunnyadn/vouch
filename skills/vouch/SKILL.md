@@ -1,34 +1,22 @@
 ---
 name: vouch
 description: |
-  vouch is a strict claim verifier + persistent KB for LLM agents. You do the
-  research with your NATIVE tools (Read / WebFetch / WebSearch / `cat`); vouch's
-  Stop-hook (`vouch gate`) then checks any ungrounded named-entity factual claim
-  in your draft. If you already retrieved a supporting source THIS SESSION, the
-  gate finds it in the transcript, snapshots it as a dossier, files the claim,
-  and passes — you'll see `[verified: <id>] auto-grounded from session`, and you
-  do nothing. You run vouch commands by hand only when:
-    (a) the gate fires on something you have NOT retrieved (training memory, or a
-        source you never actually read): `vouch search "<q>"` (does the KB
-        already have it?) → `vouch fetch <url>` (vouch does the HTTP + persists
-        the dossier) → read what vouch saved → `vouch claim "<text>" --type
-        ATOMIC --dossier <slug>` (quote auto-selected; vouch runs NLI). Or hedge
-        `(unverified, from training memory)`.
-    (b) you're DELIBERATELY building source-traceable KB (decision memo, dossier
-        work where the user wants claim_ids): same `vouch search → fetch →
-        claim` loop, run proactively.
-    (c) inferences from KB claims: `vouch claim "..." --type INFERENCE
-        --depends-on <ids>`; corrections: `vouch supersede <old> <new>`.
-  Use your native WebSearch/WebFetch freely — the gate captures whatever you
-  read. `vouch search` is for reusing the KB (dedup against dossiers/claims you
-  already have), not as your web-search tool.
+  vouch is a strict claim verifier + persistent KB. You research with your
+  native tools (Read / WebFetch / WebSearch / `cat`); vouch's Stop-hook (`vouch
+  gate`) checks ungrounded named-entity factual claims in your draft and
+  auto-grounds any whose source you already retrieved this session. If it fires
+  on something you have NOT retrieved: `vouch fetch <url>` → `vouch claim
+  "<text>" --dossier <slug>`, or hedge `(unverified, from training memory)`.
+  Inferences from KB claims: `vouch claim --type INFERENCE --depends-on <ids>`;
+  corrections: `vouch supersede`. `vouch search "<q>"` reuses the KB. Full
+  workflow + claim-type rules below.
 
-  Triggers: research-grounded writing, decision memos, comparative analyses,
-  any synthesis where the user wants source-traceable factual statements. Or
-  when user explicitly says "use vouch" / "vouch verify this" / "build kb on X".
+  Triggers: research-grounded writing, decision memos, comparative analyses, any
+  synthesis where the user wants source-traceable factual statements; or when the
+  user says "use vouch" / "vouch verify this" / "build kb on X".
 
-  Skip when: casual chat, code help, real-time data ("current btc price"), or
-  questions where source-grounding adds friction without value.
+  Skip when: casual chat, code help, real-time data, source-grounding adds
+  friction without value.
 ---
 
 # vouch — Claude-driven verification
