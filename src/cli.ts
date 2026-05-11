@@ -80,7 +80,8 @@ program
   .description(
     "Create a user-attested dossier. The user takes responsibility for the content; " +
       "vouch does not fetch or independently verify it. Downstream claims still verify " +
-      "via quote-in-dossier + NLI.",
+      "via quote-in-dossier + NLI. Pass --claim to file a representative claim against " +
+      "the new dossier in the same call (auto-quote, defaults to ATOMIC).",
   )
   .requiredOption("--slug <slug>", "stable slug; lowercase + dashes/underscores only")
   .option("--content <text>", "attested content (inline)")
@@ -89,6 +90,11 @@ program
   .option("--date <YYYY-MM-DD>", "attestation date; defaults to today UTC")
   .option("--topic <topic>", "searchability tag")
   .option("--force-overwrite", "replace existing attestation at same slug")
+  .option(
+    "--claim <text>",
+    "file a representative claim against the new dossier in the same call (auto-quotes from content)",
+  )
+  .option("--claim-type <type>", "claim type when --claim is set: ATOMIC (default) | QUOTATION", "ATOMIC")
   .action(async (opts: any) => {
     let content = opts.content;
     if (!content && opts.contentFile) {
@@ -103,8 +109,24 @@ program
       );
       process.exit(2);
     }
+
+    // Validate --claim-type up front so we don't attest and then bail. Only the
+    // dossier-backed types make sense here — SYNTHESIS needs --sources,
+    // INFERENCE/INTERPRETATION need --depends-on, HYPOTHESIS ignores dossiers.
+    if (opts.claim) {
+      const allowed = ["ATOMIC", "QUOTATION"];
+      if (!allowed.includes(opts.claimType)) {
+        fail(
+          `invalid --claim-type "${opts.claimType}" for attest --claim. ` +
+            `Use one of: ${allowed.join(", ")}. (SYNTHESIS/INFERENCE/INTERPRETATION/HYPOTHESIS ` +
+            `don't fit the attest-and-claim shape — file them separately with \`vouch claim\`.)`,
+        );
+      }
+    }
+
+    let attestResult: Awaited<ReturnType<typeof attestAndStore>>;
     try {
-      const result = await attestAndStore({
+      attestResult = await attestAndStore({
         slug: opts.slug,
         content,
         attribution: opts.attribution,
@@ -112,12 +134,49 @@ program
         topic: opts.topic,
         forceOverwrite: opts.forceOverwrite,
       });
-      emit(result);
     } catch (e: any) {
       console.error(
         JSON.stringify({ error: e.message, reason: "attest-failed" }),
       );
       process.exit(1);
+    }
+
+    if (!opts.claim) {
+      emit(attestResult);
+      return;
+    }
+
+    // Attestation persisted; now file the representative claim against it.
+    // Auto-quote (no --source-quote) is the default — most attest-and-claim
+    // cases have the claim text already entailed by the content. If NLI says
+    // unsupported, the response still carries the dossier_slug so the caller
+    // can retry with reworded text without re-attesting.
+    try {
+      const claimResult = await submitClaim({
+        text: opts.claim,
+        claim_type: opts.claimType as ClaimType,
+        topic: opts.topic,
+        author: "claude-skill",
+        dossier_slug: attestResult.dossier_slug,
+      });
+      // Flat-merge: attest's dossier_slug/source_url match the claim's
+      // (same dossier), so no field collisions. Claim fields are the
+      // additive payload (claim_id, status, score, ...).
+      emit({ ...attestResult, ...claimResult });
+    } catch (e: any) {
+      if (e instanceof TransientVerifierError) {
+        // Attestation succeeded, verifier was transiently unreachable. Carry
+        // dossier_slug so the caller can retry the claim without re-attesting.
+        emit({
+          error: e.message,
+          kind: e.kind,
+          hint: e.hint,
+          recorded: false,
+          dossier_slug: attestResult.dossier_slug,
+        });
+        process.exit(2);
+      }
+      throw e;
     }
   });
 

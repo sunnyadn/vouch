@@ -213,6 +213,104 @@ describe("claim against attestation", () => {
   });
 });
 
+describe("attest + claim combined (cli.ts spread shape)", () => {
+  // Mirrors what `vouch attest --claim "<text>"` does: attestAndStore, then
+  // submitClaim against the new dossier, then flat-merge the two responses.
+  // The merge itself lives in cli.ts; these tests lock in the contract that
+  // the merged object surfaces both halves' fields without collision.
+  //
+  // We pass source_quote explicitly here so the file's NLI-shaped ai mock
+  // does the right thing (autoSelectQuote needs a different mock shape).
+  // In production cli.ts omits source_quote and lets auto-quote run.
+  it("merges attest + claim responses with both dossier_slug and claim_id", async () => {
+    const attestation = await attest.attestAndStore({
+      slug: "combined-happy",
+      content: "vouch takes the single active OSS-strike slot.",
+      attribution: "sunny",
+    });
+
+    const claim = await submit.submitClaim({
+      text: "vouch takes the single active OSS-strike slot.",
+      claim_type: "ATOMIC",
+      dossier_slug: attestation.dossier_slug,
+      source_quote: "vouch takes the single active OSS-strike slot.",
+      author: "claude-skill",
+    });
+
+    const merged = { ...attestation, ...claim };
+    expect(merged.dossier_slug).toBe("evidence/attestations/combined-happy");
+    expect(merged.source_url).toBe("attestation://combined-happy");
+    expect(merged.attribution).toBe("sunny");
+    expect(merged.claim_id).toBeDefined();
+    expect(typeof merged.claim_id).toBe("number");
+    expect(merged.status).toBe("supported");
+    expect(merged.quote_match).toBe("exact");
+  });
+
+  it("response still carries dossier_slug when the claim is unsupported", async () => {
+    // Re-mock ai's generateObject to flip the NLI verdict to unsupported.
+    // bun:test's mock.module replaces the module-level mock for subsequent
+    // imports; we restore the original supported=true mock at the end so
+    // later tests in this file aren't affected.
+    mock.module("ai", () => ({
+      generateObject: () =>
+        Promise.resolve({ object: { supported: false, score: 0.1, reason: "no" } }),
+      embed: () => Promise.resolve({ embedding: [1, 0, 0, 0] }),
+    }));
+
+    try {
+      const attestation = await attest.attestAndStore({
+        slug: "combined-unsupported",
+        content: "The quick brown fox jumps over the lazy dog.",
+        attribution: "tester",
+      });
+      const claim = await submit.submitClaim({
+        text: "Cats are unrelated to the content above.",
+        claim_type: "ATOMIC",
+        dossier_slug: attestation.dossier_slug,
+        source_quote: "The quick brown fox jumps over the lazy dog.",
+        author: "claude-skill",
+      });
+
+      const merged = { ...attestation, ...claim };
+      // Even when NLI says unsupported, the merged response must still
+      // surface dossier_slug + claim_id so callers can retry the claim text
+      // without re-attesting (acceptance bullet 4).
+      expect(merged.dossier_slug).toBe("evidence/attestations/combined-unsupported");
+      expect(merged.claim_id).toBeDefined();
+      expect(typeof merged.claim_id).toBe("number");
+      expect(merged.status).toBe("unsupported");
+    } finally {
+      mock.module("ai", () => ({
+        generateObject: () =>
+          Promise.resolve({ object: { supported: true, score: 0.9, reason: "test" } }),
+        embed: () => Promise.resolve({ embedding: [1, 0, 0, 0] }),
+      }));
+    }
+  });
+
+  it("--claim-type QUOTATION routes through the same dossier-backed path", async () => {
+    const attestation = await attest.attestAndStore({
+      slug: "combined-quotation",
+      content: "All cats are mammals.",
+      attribution: "tester",
+    });
+
+    const claim = await submit.submitClaim({
+      text: "All cats are mammals.",
+      claim_type: "QUOTATION",
+      dossier_slug: attestation.dossier_slug,
+      source_quote: "All cats are mammals.",
+      author: "claude-skill",
+    });
+
+    const merged = { ...attestation, ...claim };
+    expect(merged.dossier_slug).toBe("evidence/attestations/combined-quotation");
+    expect(merged.claim_id).toBeDefined();
+    expect(merged.status).toBe("supported");
+  });
+});
+
 describe("list-dossiers includes attestations", () => {
   it("returns attestations with source_type filter", async () => {
     await attest.attestAndStore({
