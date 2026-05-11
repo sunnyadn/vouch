@@ -7,3 +7,8 @@ dist/
 bun.lock
 *.bun-build
 web-articles/
+
+# bench/phase0 transients — HF model cache, python bytecode (never commit)
+bench/phase0/.minicheck_cache/
+bench/phase0/__pycache__/
+*.pyc
