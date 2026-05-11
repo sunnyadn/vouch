@@ -24,6 +24,19 @@
  *   the prose. Forcing the extractor to commit to an explicit stance per
  *   proposition makes "this is not an assertion" a first-class output rather
  *   than an implicit prompt-side filter.
+ *
+ * Session-evidence auto-grounding (issue #21):
+ *   When an ASSERT proposition isn't grounded by the KB, the gate — before
+ *   blocking — scans the transcript's `tool_result` events for content the
+ *   agent demonstrably retrieved THIS SESSION via `Read` / `WebFetch` /
+ *   `WebSearch`. If one of those entity-mentioning results NLI-entails the
+ *   proposition, the gate snapshots it as a dossier, files the claim against
+ *   it, and passes — turning a false-positive fire into a recorded grounding
+ *   instead of training the agent to dodge. Lazy (only on a fire), bounded
+ *   (entity-matching results only, K-capped NLI, size-capped per result), and
+ *   it ONLY trusts content that came back from a tool — never the assistant's
+ *   own asserted prose. Anything not retrieved via a tool still blocks exactly
+ *   as before.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { generateObject } from "ai";
@@ -124,6 +137,14 @@ export interface GroundedPair extends ExtractedPair {
   grounded: boolean;
   matched_claim_id: number | null;
   reason: string;
+  /** Set when the gate fired on this pair and then scanned session evidence
+   *  (tool_result events) for the entity: number of candidate session sources
+   *  NLI-checked. 0 = none matched the entity. Absent when no session
+   *  transcript was available or the pair was already grounded. */
+  session_sources_checked?: number;
+  /** True when this pair was resolved by auto-grounding against a source the
+   *  agent retrieved this session (Read / WebFetch / WebSearch). */
+  auto_grounded?: boolean;
 }
 
 export interface GateVerdict {
@@ -166,6 +187,12 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   let inter = 0;
   for (const t of a) if (b.has(t)) inter++;
   return inter / (a.size + b.size - inter);
+}
+
+/** Alphanumeric-only fold (ASCII + CJK), for entity-mention matching that
+ *  tolerates spacing/punctuation drift ("MiniCheck-7B" vs "MiniCheck 7B"). */
+function alphanumOnly(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9一-鿿]/g, "");
 }
 
 export async function checkGrounding(
@@ -249,10 +276,226 @@ export async function checkGrounding(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Session-evidence auto-grounding (issue #21)
+//
+// Before the gate blocks an ungrounded ASSERT, it checks whether the agent
+// already retrieved a source supporting the proposition THIS SESSION — via a
+// `Read` (local file), `WebFetch` (page content), or `WebSearch` (result
+// snippets). Those live in the transcript's `tool_result` events. If one
+// entity-mentioning result NLI-entails the proposition, we snapshot it as a
+// dossier, file the claim against it, and pass.
+//
+// We trust ONLY content that came back from a tool — never the assistant's own
+// asserted prose. WebFetch content is model-extracted (not raw HTML), so a
+// failed NLI there is the cue to do a real `vouch fetch <url>`.
+// ---------------------------------------------------------------------------
+
+export interface SessionSource {
+  tool: "Read" | "WebFetch" | "WebSearch";
+  /** Source identifier: a file path (Read), URL (WebFetch), or `websearch:<query>`. */
+  uri: string;
+  content: string;
+}
+
+const SESSION_SOURCE_TOOLS = new Set(["Read", "WebFetch", "WebSearch"]);
+/** Max candidate session sources NLI-checked per ungrounded pair. */
+const SESSION_AUTOGROUND_K = 3;
+/** Most-recent unique session sources retained from a transcript. */
+const SESSION_SOURCES_MAX = 50;
+const TOOL_PRIORITY: Record<string, number> = { Read: 0, WebFetch: 1, WebSearch: 2 };
+
+function toolResultText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => typeof b === "string" || b?.type === "text")
+      .map((b: any) => (typeof b === "string" ? b : b?.text ?? ""))
+      .join("\n");
+  }
+  return "";
+}
+
+/** Claude Code `Read` results are `cat -n` formatted ("␣␣␣␣␣1\tcontent").
+ *  Strip the line-number prefix so the snapshot is a clean copy of the file. */
+function stripLineNumbers(text: string): string {
+  return text
+    .split("\n")
+    .map((l) => {
+      const m = l.match(/^\s*\d+\t([\s\S]*)$/);
+      return m ? m[1]! : l;
+    })
+    .join("\n");
+}
+
+/** Parse a Claude Code transcript JSONL for content the agent retrieved via
+ *  Read / WebFetch / WebSearch this session. Returns `[]` for anything that
+ *  doesn't look like a Claude Code transcript (the "fall through to current
+ *  behavior" path — a thin adapter for other harnesses can be added later). */
+export function parseSessionSources(transcriptPath: string): SessionSource[] {
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, "utf8");
+  } catch {
+    return [];
+  }
+  const lines = raw.split("\n").filter((l) => l.trim());
+  if (!lines.length) return [];
+
+  const events: any[] = [];
+  // Pass 1: tool_use id → {name, input} from main-thread assistant events.
+  const toolUseById = new Map<string, { name: string; input: any }>();
+  for (const line of lines) {
+    let ev: any;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    events.push(ev);
+    if (ev?.type !== "assistant" || ev?.isSidechain) continue;
+    const c = ev?.message?.content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (b?.type === "tool_use" && typeof b.id === "string") {
+        toolUseById.set(b.id, { name: String(b.name ?? ""), input: b.input ?? {} });
+      }
+    }
+  }
+  if (!events.some((e) => typeof e?.type === "string")) return []; // not a CC transcript
+
+  // Pass 2: tool_result blocks in main-thread user events.
+  const out: SessionSource[] = [];
+  for (const ev of events) {
+    if (ev?.type !== "user" || ev?.isSidechain) continue;
+    const c = ev?.message?.content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string" || b.is_error) continue;
+      const tu = toolUseById.get(b.tool_use_id);
+      if (!tu || !SESSION_SOURCE_TOOLS.has(tu.name)) continue;
+      let text = toolResultText(b.content).trim();
+      if (!text && ev.toolUseResult) {
+        const r = ev.toolUseResult;
+        if (tu.name === "Read") text = String(r?.file?.content ?? "").trim();
+        else if (tu.name === "WebFetch") text = String(r?.result ?? "").trim();
+      }
+      if (!text) continue;
+      let uri = "";
+      if (tu.name === "Read") uri = String(tu.input?.file_path ?? "");
+      else if (tu.name === "WebFetch") uri = String(tu.input?.url ?? "");
+      else if (tu.name === "WebSearch") uri = "websearch:" + String(tu.input?.query ?? "");
+      if (!uri || uri === "websearch:") continue;
+      if (tu.name === "Read") text = stripLineNumbers(text);
+      if (text.length > MAX_SOURCE_CHARS) text = text.slice(0, MAX_SOURCE_CHARS);
+      out.push({ tool: tu.name as SessionSource["tool"], uri, content: text });
+    }
+  }
+  // Dedup by (tool|uri), keeping the freshest occurrence; cap total.
+  const byKey = new Map<string, SessionSource>();
+  for (const s of out) byKey.set(`${s.tool}|${s.uri}`, s);
+  return [...byKey.values()].slice(-SESSION_SOURCES_MAX);
+}
+
+function sessionSourceTitle(src: SessionSource): string {
+  if (src.tool === "Read") {
+    const p = src.uri.replace(/^file:\/\//, "");
+    const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
+    return i >= 0 ? p.slice(i + 1) : p;
+  }
+  if (src.tool === "WebSearch") return src.uri.replace(/^websearch:/, "web search: ");
+  return src.uri;
+}
+
+type AutoGroundOutcome =
+  | { grounded: true; pair: GroundedPair }
+  | { grounded: false; checked: number };
+
+/** Try to ground `pair` against one of the session sources. May throw a
+ *  TransientVerifierError (caller fail-opens, as with the KB check). */
+async function autoGroundPair(
+  pair: GroundedPair,
+  sources: SessionSource[],
+): Promise<AutoGroundOutcome> {
+  const ent = pair.entity.toLowerCase().trim();
+  const entAlnum = alphanumOnly(pair.entity);
+  const matching = sources
+    .filter((s) => {
+      const lc = s.content.toLowerCase();
+      if (ent && lc.includes(ent)) return true;
+      return entAlnum.length >= 4 && alphanumOnly(s.content).includes(entAlnum);
+    })
+    .sort((a, b) => (TOOL_PRIORITY[a.tool] ?? 9) - (TOOL_PRIORITY[b.tool] ?? 9))
+    .slice(0, SESSION_AUTOGROUND_K);
+  if (!matching.length) return { grounded: false, checked: 0 };
+
+  let n = 0;
+  for (const src of matching) {
+    n++;
+    const slice = src.content.slice(0, MAX_SOURCE_CHARS);
+    const verdict = await verifyClaimAgainstSource(pair.proposition, slice);
+    if (verdict.status !== "supported") continue;
+
+    // Entailed by a tool-retrieved source. Snapshot it as a dossier and file
+    // the claim against it. The quote-in-dossier invariant holds trivially:
+    // the "quote" is the retrieved content itself, which NLI just entailed —
+    // the anti-fabrication primitive (a claim must trace to content vouch can
+    // see) is satisfied by construction.
+    const scope = src.tool === "Read" ? "workspace" : "third-party";
+    let dossierEmb: Float32Array | null = null;
+    try {
+      dossierEmb = await embedOne(slice.slice(0, 8000));
+    } catch {
+      // non-fatal — dossier persists, just won't be hybrid-searchable
+    }
+    const slug = store.writeDossier({
+      source_url: src.uri,
+      source_type: `session-${src.tool.toLowerCase()}`,
+      title: sessionSourceTitle(src),
+      verbatim_content: slice,
+      embedding: dossierEmb,
+      scope,
+    });
+    let claimEmb: Float32Array | null = null;
+    try {
+      claimEmb = await embedOne(pair.proposition);
+    } catch {
+      // non-fatal
+    }
+    const cid = store.recordClaim({
+      dossier_slug: slug,
+      claim_text: pair.proposition,
+      score: verdict.score,
+      status: verdict.status,
+      source_passage: verdict.source_passage,
+      claim_type: "ATOMIC",
+      source_offset_start: 0,
+      source_offset_end: slice.length,
+      embedding: claimEmb,
+      verification: "nli-session",
+    });
+    return {
+      grounded: true,
+      pair: {
+        ...pair,
+        grounded: true,
+        matched_claim_id: cid,
+        auto_grounded: true,
+        session_sources_checked: n,
+        reason: `auto-grounded from session ${src.tool} of ${src.uri} (claim ${cid}, score=${verdict.score.toFixed(2)})`,
+      },
+    };
+  }
+  return { grounded: false, checked: n };
+}
+
 export async function runGate(opts: {
   draft: string;
   model: string;
   topK?: number;
+  /** Claude Code transcript path; if present and the gate fires, session-
+   *  retrieved sources are scanned for auto-grounding before blocking. */
+  sessionTranscriptPath?: string;
 }): Promise<GateVerdict> {
   const extracted = await extractPairs(opts.draft, opts.model);
   if (extracted === null) {
@@ -285,6 +528,38 @@ export async function runGate(opts: {
       };
     }
   }
+
+  // Lazy: only parse the transcript / run session NLI when the gate would
+  // otherwise fire on something.
+  const ungroundedIdx = checked.flatMap((p, i) => (p.grounded ? [] : [i]));
+  if (ungroundedIdx.length && opts.sessionTranscriptPath) {
+    let sources: SessionSource[] = [];
+    try {
+      sources = parseSessionSources(opts.sessionTranscriptPath);
+    } catch {
+      sources = [];
+    }
+    if (sources.length) {
+      for (const i of ungroundedIdx) {
+        try {
+          const res = await autoGroundPair(checked[i]!, sources);
+          checked[i] = res.grounded
+            ? res.pair
+            : { ...checked[i]!, session_sources_checked: res.checked };
+        } catch (e) {
+          const transient = classifyError(e);
+          return {
+            blocked: false,
+            pairs: checked,
+            classifier_error:
+              transient?.message ||
+              (e instanceof Error ? e.message : String(e)).slice(0, 200),
+          };
+        }
+      }
+    }
+  }
+
   const ungrounded = checked.filter((p) => !p.grounded);
   return { blocked: ungrounded.length > 0, pairs: checked };
 }
@@ -488,8 +763,9 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
     }
   }
 
+  const transcriptAvailable = !!transcriptPath && existsSync(transcriptPath);
   if (!draft && transcriptPath) {
-    if (!existsSync(transcriptPath)) {
+    if (!transcriptAvailable) {
       return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
     }
     try {
@@ -510,9 +786,19 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
     return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
   }
 
-  const verdict = await runGate({ draft, model: opts.model, topK: opts.topK });
+  const verdict = await runGate({
+    draft,
+    model: opts.model,
+    topK: opts.topK,
+    sessionTranscriptPath: transcriptAvailable ? transcriptPath : undefined,
+  });
   if (!verdict.blocked) {
-    return { verdict, exitCode: 0 };
+    const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
+    return {
+      verdict,
+      exitCode: 0,
+      ...(autoGrounded.length ? { message: formatAutoGroundMessage(autoGrounded) } : {}),
+    };
   }
   if (!opts.strict) {
     return { verdict, exitCode: 0, message: formatBlockMessage(verdict, true) };
@@ -520,20 +806,44 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
   return { verdict, exitCode: 2, message: formatBlockMessage(verdict, false) };
 }
 
+function formatAutoGroundMessage(autoGrounded: GroundedPair[]): string {
+  const lines = autoGrounded.map(
+    (p) => `  • [verified: ${p.matched_claim_id}] ${p.entity} — ${p.reason}`,
+  );
+  return (
+    `[vouch-gate] auto-grounded ${autoGrounded.length} claim(s) from source(s) you ` +
+    `retrieved this session — recorded in the KB:\n${lines.join("\n")}\n`
+  );
+}
+
 function formatBlockMessage(verdict: GateVerdict, advisory: boolean): string {
   const ungrounded = verdict.pairs.filter((p) => !p.grounded);
-  const lines = ungrounded.map(
-    (p) => `  • ${p.entity}: "${p.proposition.slice(0, 200)}" (${p.reason})`,
-  );
+  const lines = ungrounded.map((p) => {
+    const checked =
+      p.session_sources_checked && p.session_sources_checked > 0
+        ? ` — checked ${p.session_sources_checked} session source(s), none entailed`
+        : "";
+    return `  • ${p.entity}: "${p.proposition.slice(0, 200)}" (${p.reason})${checked}`;
+  });
+  const anySessionChecked = ungrounded.some((p) => (p.session_sources_checked ?? 0) > 0);
+  const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
+  const agNote = autoGrounded.length
+    ? `\n(also auto-grounded from session source(s): ${autoGrounded
+        .map((p) => `[verified: ${p.matched_claim_id}] ${p.entity}`)
+        .join(", ")})`
+    : "";
   const header = advisory
     ? `[vouch-gate advisory] Ungrounded named-entity claim(s) in draft:`
     : `[vouch-gate] Detected ungrounded factual claim(s) about named external entities.`;
+  const fetchHint = anySessionChecked
+    ? ` — for a WebFetch result that didn't entail, \`vouch fetch <url>\` pulls the raw page (WebFetch returns model-extracted text)`
+    : "";
   const guidance = advisory
     ? ""
     : `\nBefore answering, ground each claim:\n` +
       `  • vouch search "<keyword>" — check the KB\n` +
-      `  • vouch fetch <url> — pull the source\n` +
+      `  • vouch fetch <url> — pull the source${fetchHint}\n` +
       `  • vouch claim "<text>" --type ATOMIC --dossier <slug> --source-quote "..."\n` +
       `Or hedge explicitly with "(unverified, from training memory)" near the claim.\n`;
-  return `${header}\n${lines.join("\n")}${guidance ? "\n" + guidance : "\n"}`;
+  return `${header}\n${lines.join("\n")}${agNote}${guidance ? "\n" + guidance : "\n"}`;
 }

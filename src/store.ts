@@ -52,14 +52,22 @@ function initSchema(db: Database) {
       embedding BLOB
     );
   `);
-  // Additive migration: verification column (v0.2). SQLite lacks ADD COLUMN IF NOT EXISTS.
-  try {
-    db.exec(`ALTER TABLE claims ADD COLUMN verification TEXT;`);
-  } catch (e: any) {
-    if (e?.message?.includes("duplicate column")) {
-      // Column already exists — no-op for idempotency
-    } else {
-      throw e;
+  // Additive migrations. SQLite lacks ADD COLUMN IF NOT EXISTS.
+  for (const stmt of [
+    `ALTER TABLE claims ADD COLUMN verification TEXT;`,
+    // dossier provenance class: 'third-party' (web), 'workspace' (local file
+    // the agent read), 'attested' (user self-declared). NULL on legacy rows /
+    // the plain `vouch fetch` path — treated as 'third-party' by readers.
+    `ALTER TABLE dossiers ADD COLUMN scope TEXT;`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch (e: any) {
+      if (e?.message?.includes("duplicate column")) {
+        // Column already exists — no-op for idempotency
+      } else {
+        throw e;
+      }
     }
   }
   db.exec(`
@@ -139,6 +147,8 @@ export interface WriteDossierInput {
   embedding?: number[] | Float32Array | null;
   publication_date?: string | null;
   author_attribution?: string | null;
+  /** 'third-party' | 'workspace' | 'attested'. Defaults to NULL (≡ third-party). */
+  scope?: string | null;
   slug?: string;
 }
 
@@ -152,8 +162,8 @@ export function writeDossier(d: WriteDossierInput): string {
     .prepare(
       `INSERT OR REPLACE INTO dossiers
        (slug, source_url, source_type, capture_date, last_refetched, source_hash, title, content,
-        embedding, publication_date, author_attribution)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        embedding, publication_date, author_attribution, scope)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       slug,
@@ -167,6 +177,7 @@ export function writeDossier(d: WriteDossierInput): string {
       embBlob,
       d.publication_date || null,
       d.author_attribution || null,
+      d.scope || null,
     );
   return slug;
 }
@@ -215,7 +226,7 @@ export function listDossiers(opts: { source_type?: string; limit?: number } = {}
     return db
       .prepare(
         `SELECT slug, title, source_url, source_type, capture_date, length(content) AS content_len,
-                publication_date, author_attribution
+                publication_date, author_attribution, scope
          FROM dossiers WHERE source_type = ? ORDER BY capture_date DESC LIMIT ?`,
       )
       .all(opts.source_type, limit);
@@ -223,7 +234,7 @@ export function listDossiers(opts: { source_type?: string; limit?: number } = {}
   return db
     .prepare(
       `SELECT slug, title, source_url, source_type, capture_date, length(content) AS content_len,
-              publication_date, author_attribution
+              publication_date, author_attribution, scope
        FROM dossiers ORDER BY capture_date DESC LIMIT ?`,
     )
     .all(limit);

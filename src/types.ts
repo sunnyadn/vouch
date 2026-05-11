@@ -22,6 +22,10 @@ export interface Dossier {
   embedding: Float32Array | null;
   publication_date: string | null;
   author_attribution: string | null;
+  /** Provenance class: 'third-party' (web) | 'workspace' (local file the
+   *  agent read) | 'attested' (user self-declared). NULL on legacy rows and
+   *  the plain `vouch fetch` path — readers treat NULL as 'third-party'. */
+  scope: string | null;
 }
 
 export interface Claim {

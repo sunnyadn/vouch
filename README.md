@@ -174,7 +174,17 @@ Before answering, ground each claim:
 Or hedge explicitly with "(unverified, from training memory)" near the claim.
 ```
 
-The agent (with the skill loaded) then runs the loop:
+Before it blocks, the gate first checks whether the agent **already
+retrieved a supporting source this session** — a file read with `Read`, a
+page pulled with `WebFetch`, results from `WebSearch`. Those live in the
+transcript. If one of them entails the proposition (same NLI judge), the
+gate snapshots that content as a dossier, files the claim against it, and
+passes — so a claim about something the agent demonstrably saw doesn't
+force a redundant re-fetch. Anything the agent only *asserted* (training
+memory, paraphrase) still blocks. A `Read` source is recorded with
+`scope: workspace`; a `WebFetch` source with `scope: third-party`.
+
+When the gate does block, the agent (with the skill loaded) runs the loop:
 
 1. **Search the KB first** — `vouch search "<keyword>"`. If a relevant
    verified claim already exists, cite its `claim_id` and skip ahead.

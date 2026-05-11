@@ -931,3 +931,282 @@ describe("runGateCli race-fix integration", () => {
     expect(r.verdict.blocked).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// parseSessionSources — transcript tool_result extraction (issue #21)
+// ---------------------------------------------------------------------------
+
+describe("parseSessionSources", () => {
+  it("extracts Read / WebFetch / WebSearch content; strips Read line numbers", () => {
+    const path = join(tmp, "ps1.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "tool_use", id: "tu_read", name: "Read", input: { file_path: "/repo/notes.md" } }] },
+        }),
+        JSON.stringify({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tu_read", content: "     1\t# Notes\n     2\tFoo benchmark has 42 tasks." }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "tool_use", id: "tu_fetch", name: "WebFetch", input: { url: "https://example.com/foo", prompt: "..." } }] },
+        }),
+        JSON.stringify({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tu_fetch", content: [{ type: "text", text: "Foo benchmark page: 42 tasks total." }] }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          message: { content: [{ type: "tool_use", id: "tu_search", name: "WebSearch", input: { query: "foo benchmark size" } }] },
+        }),
+        JSON.stringify({
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tu_search", content: "Results: Foo benchmark — 42 tasks ..." }] },
+        }),
+      ].join("\n"),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(3);
+    const byTool = Object.fromEntries(got.map((s) => [s.tool, s]));
+    expect(byTool.Read!.uri).toBe("/repo/notes.md");
+    expect(byTool.Read!.content).toBe("# Notes\nFoo benchmark has 42 tasks.");
+    expect(byTool.WebFetch!.uri).toBe("https://example.com/foo");
+    expect(byTool.WebFetch!.content).toContain("42 tasks total");
+    expect(byTool.WebSearch!.uri).toBe("websearch:foo benchmark size");
+  });
+
+  it("ignores non-source tools, error results, and sidechain events", () => {
+    const path = join(tmp, "ps2.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [
+              { type: "tool_use", id: "tu_bash", name: "Bash", input: { command: "ls" } },
+              { type: "tool_use", id: "tu_read_err", name: "Read", input: { file_path: "/missing" } },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "user",
+          message: {
+            content: [
+              { type: "tool_result", tool_use_id: "tu_bash", content: "a.txt b.txt" },
+              { type: "tool_result", tool_use_id: "tu_read_err", is_error: true, content: "ENOENT" },
+            ],
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: true,
+          message: { content: [{ type: "tool_use", id: "tu_sub", name: "Read", input: { file_path: "/sub/file" } }] },
+        }),
+        JSON.stringify({
+          type: "user",
+          isSidechain: true,
+          message: { content: [{ type: "tool_result", tool_use_id: "tu_sub", content: "     1\tsubagent read" }] },
+        }),
+      ].join("\n"),
+    );
+    expect(gate.parseSessionSources(path)).toEqual([]);
+  });
+
+  it("returns [] for a non-Claude-Code file or a missing file", () => {
+    const path = join(tmp, "ps3.txt");
+    writeFileSync(path, "just some text\nnot jsonl at all\n");
+    expect(gate.parseSessionSources(path)).toEqual([]);
+    expect(gate.parseSessionSources(join(tmp, "no-such-file.jsonl"))).toEqual([]);
+  });
+
+  it("dedups by (tool|uri), keeping the freshest content", () => {
+    const path = join(tmp, "ps4.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_a", name: "Read", input: { file_path: "/f" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_a", content: "     1\told version" }] } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_b", name: "Read", input: { file_path: "/f" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_b", content: "     1\tnew version" }] } }),
+      ].join("\n"),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(1);
+    expect(got[0]!.content).toBe("new version");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGate — session-evidence auto-grounding (issue #21)
+// ---------------------------------------------------------------------------
+
+describe("runGate session-evidence auto-grounding", () => {
+  function transcriptWithSource(toolName: string, id: string, input: any, resultContent: any): string {
+    return [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name: toolName, input }] } }),
+      JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: resultContent }] } }),
+    ].join("\n");
+  }
+
+  it("ungrounded ASSERT entailed by a session Read → auto-grounds, records dossier+claim, not blocked", async () => {
+    const path = join(tmp, "ag1.jsonl");
+    writeFileSync(
+      path,
+      transcriptWithSource("Read", "tu1", { file_path: "/repo/META.md" }, "     1\tFoo benchmark consists of 42 evaluation tasks across 6 domains."),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] },
+      } as any),
+    );
+    // KB empty → checkGrounding makes no NLI call; next mock is the session NLI.
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { supported: true, score: 0.91, reason: "source states 42 tasks" } } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "Foo benchmark has 42 evaluation tasks.",
+      model: "vertex_ai/test",
+      sessionTranscriptPath: path,
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.auto_grounded).toBe(true);
+    expect(v.pairs[0]!.session_sources_checked).toBe(1);
+    const cid = v.pairs[0]!.matched_claim_id!;
+    const claim = store.getClaim(cid)!;
+    expect(claim.status).toBe("supported");
+    expect(claim.verification).toBe("nli-session");
+    const dossier = store.getDossier(claim.dossier_slug)!;
+    expect(dossier.scope).toBe("workspace");
+    expect(dossier.source_type).toBe("session-read");
+    expect(dossier.source_url).toBe("/repo/META.md");
+    expect(generateObjectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("session WebFetch entailment → scope third-party, source_type session-webfetch", async () => {
+    const path = join(tmp, "ag2.jsonl");
+    writeFileSync(
+      path,
+      transcriptWithSource("WebFetch", "tu1", { url: "https://example.org/bar" }, [{ type: "text", text: "Bar dataset: 1,000 labeled examples." }]),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Bar dataset", stance: "ASSERT", proposition: "Bar dataset has 1,000 labeled examples." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.88, reason: "stated" } } as any));
+    const v = await gate.runGate({ draft: "Bar dataset has 1,000 labeled examples.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(false);
+    const dossier = store.getDossier(store.getClaim(v.pairs[0]!.matched_claim_id!)!.dossier_slug)!;
+    expect(dossier.scope).toBe("third-party");
+    expect(dossier.source_type).toBe("session-webfetch");
+    expect(dossier.source_url).toBe("https://example.org/bar");
+  });
+
+  it("session source mentions the entity but does not entail → still blocked, session_sources_checked recorded", async () => {
+    const path = join(tmp, "ag3.jsonl");
+    writeFileSync(path, transcriptWithSource("Read", "tu1", { file_path: "/repo/x.md" }, "     1\tFoo benchmark is a popular evaluation suite."));
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: false, score: 0.1, reason: "no task count in source" } } as any));
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 evaluation tasks.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.grounded).toBe(false);
+    expect(v.pairs[0]!.session_sources_checked).toBe(1);
+    expect(v.pairs[0]!.auto_grounded).toBeUndefined();
+    // No dossier/claim should have been recorded for a non-entailing source.
+    expect(store.listDossiers().length).toBe(0);
+  });
+
+  it("no session source mentions the entity → no NLI attempt, blocked with session_sources_checked=0", async () => {
+    const path = join(tmp, "ag4.jsonl");
+    writeFileSync(path, transcriptWithSource("Read", "tu1", { file_path: "/repo/unrelated.md" }, "     1\tThis file is about something else entirely."));
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] } } as any),
+    );
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 evaluation tasks.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.session_sources_checked).toBe(0);
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("no sessionTranscriptPath → unchanged behavior, no session fields", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 tasks." }] } } as any),
+    );
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 tasks.", model: "t" });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.session_sources_checked).toBeUndefined();
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("only the agent's own draft text, no tool sources → does not auto-ground", async () => {
+    // Transcript with the assistant turn only (no tool_result events): the
+    // proposition is "supported" by nothing the agent retrieved via a tool.
+    const path = join(tmp, "ag5.jsonl");
+    writeFileSync(
+      path,
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Foo benchmark has 42 tasks." }] } }) + "\n",
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 tasks." }] } } as any),
+    );
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 tasks.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.session_sources_checked).toBeUndefined(); // parseSessionSources returned [] → loop skipped
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGateCli — session-evidence auto-grounding integration (issue #21)
+// ---------------------------------------------------------------------------
+
+describe("runGateCli session-evidence integration", () => {
+  it("transcript with a prior tool_result → auto-grounds the just-emitted draft, exit 0 + visible message", async () => {
+    const path = join(tmp, "cli-ag.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/repo/META.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "     1\tQux corpus contains 7,532 documents." }] } }),
+        JSON.stringify({ type: "assistant", timestamp: nowIso, message: { content: [{ type: "text", text: "The Qux corpus contains 7,532 documents." }] } }),
+      ].join("\n"),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Qux corpus", stance: "ASSERT", proposition: "The Qux corpus contains 7,532 documents." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.93, reason: "stated verbatim" } } as any));
+    const r = await gate.runGateCli({ transcriptPath: path, model: "vertex_ai/test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(0);
+    expect(r.verdict.blocked).toBe(false);
+    expect(r.verdict.pairs[0]!.auto_grounded).toBe(true);
+    expect(r.message).toContain("auto-grounded");
+    expect(r.message).toContain("verified:");
+  });
+
+  it("strict block message reports how many session sources were checked", async () => {
+    const path = join(tmp, "cli-ag-block.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "WebFetch", input: { url: "https://example.org/q" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "Quux is a widely used tool." }] } }),
+        JSON.stringify({ type: "assistant", timestamp: nowIso, message: { content: [{ type: "text", text: "Quux has 12,345 users." }] } }),
+      ].join("\n"),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Quux", stance: "ASSERT", proposition: "Quux has 12,345 users." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: false, score: 0.05, reason: "no user count" } } as any));
+    const r = await gate.runGateCli({ transcriptPath: path, model: "vertex_ai/test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(2);
+    expect(r.message).toContain("checked 1 session source(s), none entailed");
+  });
+});
