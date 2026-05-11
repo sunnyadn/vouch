@@ -208,6 +208,20 @@ When the gate does block, the agent (with the skill loaded) runs the loop:
    memory)` for claims the agent chose not to ground. Hook re-checks; if
    every factual claim is tagged or hedged, the turn unblocks.
 
+The same hook does a second pass on a draft it lets **pass**: it harvests
+the *derived* claims the skill's tag table makes the agent write inline —
+`[inference-from: <ids>]` → an `INFERENCE` claim, `[synthesis-of: <ids>]` →
+`SYNTHESIS`, `[interpretation: <id>]` → `INTERPRETATION`, `[hypothesis]` →
+`HYPOTHESIS` (a `; score: <0..1>` suffix overrides the default `soft_score`),
+each with the cited claim ids as `depends_on`. These are the agent's own
+deductions / paraphrases, not source-entailments, so there is no NLI step —
+they record with `status: recorded` and `verification: tag-harvest`, and are
+deduped on `(claim_text, claim_type, depends_on)` so re-emitting a draft after
+a block doesn't double-file. `[verified: <id>]` never files anything new; a
+dangling or non-`supported` id is flagged. The agent no longer runs
+`vouch claim --type INFERENCE …` by hand for tagged segments — tagging is
+enough; the bookkeeping is the hook's job.
+
 The full agent instructions live in `skills/vouch/SKILL.md` — the
 canonical source for the workflow including INFERENCE / SYNTHESIS rules,
 supersede semantics, output tagging conventions, and anti-patterns.
