@@ -89,6 +89,7 @@ describe("fetch local file", () => {
     const hash1 = d1.source_hash;
 
     writeFileSync(path, "Changed content.");
+    await Bun.sleep(5); // ensure last_refetched advances past d1's millisecond
     const r2 = await fetchAndStore(`file://${path}`, { forceRefetch: true });
     expect(r2.cached).toBe(false);
 
