@@ -187,3 +187,129 @@ function titleTokens(s: string): Set<string> {
       .filter((t) => t.length > 2),
   );
 }
+
+// ---------------------------------------------------------------------------
+// General web search — DuckDuckGo HTML endpoint
+// ---------------------------------------------------------------------------
+//
+// opencli's `google search` adapter needs the Chrome browser-bridge extension
+// connected — too fragile for the default path. The DDG HTML endpoint is a
+// public, bridge-free, key-free page that returns a clean result list; ~30
+// lines of regex extraction (mirroring src/fetchers/generic.ts's approach) is
+// less fragile than the opencli-google route. This is NOT building a search
+// engine — it's wrapping one public HTML endpoint for the general-web case;
+// academic search still goes through opencli's HTTP adapters above.
+
+const DDG_HTML_ENDPOINT = "https://html.duckduckgo.com/html/";
+const WEB_SEARCH_UA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+export interface WebResult {
+  title: string;
+  url: string;
+  snippet?: string;
+}
+
+export class WebSearchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WebSearchError";
+  }
+}
+
+export async function ddgSearch(query: string, limit = 5): Promise<WebResult[]> {
+  let html: string;
+  try {
+    const res = await fetch(DDG_HTML_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "User-Agent": WEB_SEARCH_UA,
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "text/html,application/xhtml+xml",
+      },
+      body: new URLSearchParams({ q: query, kl: "us-en" }).toString(),
+    });
+    if (!res.ok) {
+      throw new WebSearchError(`DuckDuckGo HTML endpoint returned HTTP ${res.status}`);
+    }
+    html = await res.text();
+  } catch (e: any) {
+    if (e instanceof WebSearchError) throw e;
+    throw new WebSearchError(`DuckDuckGo request failed: ${e?.message || String(e)}`);
+  }
+
+  // DDG sometimes returns a near-empty page or a captcha/blocked notice instead
+  // of results (rate-limit). Detect "no result__a anchors at all".
+  const results = parseDdgHtml(html, limit);
+  if (results.length === 0) {
+    if (/anomaly|captcha|unusual traffic|blocked/i.test(html)) {
+      throw new WebSearchError(
+        "DuckDuckGo blocked the request (rate-limit / captcha). Retry later, or pass --provider <academic> for scholarly sources.",
+      );
+    }
+    // Genuinely zero results — not an error, just an empty list.
+  }
+  return results;
+}
+
+function parseDdgHtml(html: string, limit: number): WebResult[] {
+  const out: WebResult[] = [];
+  // Each result anchor: <a ... class="result__a" ... href="<redirect>">title html</a>
+  const anchorRe = /<a\b[^>]*class="[^"]*\bresult__a\b[^"]*"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  // Snippets, in document order, pair up positionally with anchors.
+  const snippetRe = /<a\b[^>]*class="[^"]*\bresult__snippet\b[^"]*"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippets: string[] = [];
+  let sm: RegExpExecArray | null;
+  while ((sm = snippetRe.exec(html)) !== null) {
+    snippets.push(stripTags(decodeHtmlEntities(sm[1] ?? "")).trim());
+  }
+  let am: RegExpExecArray | null;
+  let i = 0;
+  while ((am = anchorRe.exec(html)) !== null && out.length < limit) {
+    const url = resolveDdgRedirect(am[1] ?? "");
+    const title = stripTags(decodeHtmlEntities(am[2] ?? "")).trim();
+    if (!url || !title) {
+      i++;
+      continue;
+    }
+    out.push({ title, url, snippet: snippets[i] || undefined });
+    i++;
+  }
+  return out;
+}
+
+/** DDG wraps result hrefs as `//duckduckgo.com/l/?uddg=<urlencoded target>&rut=…`.
+ * Unwrap to the real URL; if it's already a plain absolute URL, pass through. */
+function resolveDdgRedirect(href: string): string {
+  let h = decodeHtmlEntities(href).trim();
+  if (h.startsWith("//")) h = "https:" + h;
+  try {
+    const u = new URL(h);
+    const uddg = u.searchParams.get("uddg");
+    if (uddg) return uddg;
+  } catch {
+    // not a parseable URL — fall through
+  }
+  if (/^https?:\/\//i.test(h)) return h;
+  return "";
+}
+
+function stripTags(s: string): string {
+  return s.replace(/<[^>]+>/g, "");
+}
+
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0*39;|&apos;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+
+// Exported for unit tests (stubbed HTML, no network).
+export const __test = { parseDdgHtml, resolveDdgRedirect, decodeHtmlEntities };

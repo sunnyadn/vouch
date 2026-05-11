@@ -19,8 +19,12 @@ import { runDoctor } from "./doctor.ts";
 import {
   SEARCH_PROVIDERS,
   searchCitations,
+  ddgSearch,
+  isSearchProvider,
   titleSimilarity,
+  WebSearchError,
   type CitationCandidate,
+  type WebResult,
 } from "./searchers.ts";
 import type { ClaimType } from "./types.ts";
 
@@ -196,7 +200,8 @@ program
 program
   .command("search-citation <query>")
   .description(
-    "Search academic-source adapters (via opencli) for a citable paper. " +
+    "[deprecated — use `vouch search <query> --provider <p>`] " +
+      "Search academic-source adapters (via opencli) for a citable paper. " +
       "Returns candidates with title/authors/year/doi/url — pick one and run " +
       "`vouch fetch <url>` then `vouch claim`. Providers: " +
       SEARCH_PROVIDERS.join(" | ") + ".",
@@ -216,9 +221,9 @@ program
 program
   .command("claim-cite <text>")
   .description(
-    "One-shot citation grounding: search for the cited source, fetch the top " +
-      "hit as a dossier, and file the claim against it (auto-quote). Use " +
-      "`vouch search-citation` first if you want to inspect candidates.",
+    "[deprecated — use `vouch search` → `vouch fetch` → `vouch claim`] " +
+      "One-shot citation grounding: search for the cited source, fetch the top " +
+      "hit as a dossier, and file the claim against it (auto-quote).",
   )
   .requiredOption("--search <query>", "search terms identifying the cited source")
   .requiredOption("--provider <name>", `one of: ${SEARCH_PROVIDERS.join(", ")}`)
@@ -398,11 +403,78 @@ program
 // ---------- search ----------
 program
   .command("search <query>")
-  .description("Hybrid search across claims + dossiers (cosine over embeddings)")
-  .option("--top-k <n>", "default 10", (v) => parseInt(v, 10), 10)
+  .description(
+    "Find a source for a claim. KB-first: returns dossiers + claims you already " +
+      "have (reuse them, don't re-fetch). If the KB has no strong match, falls " +
+      "through to a web search — DuckDuckGo by default (general), or an academic " +
+      "index with --provider (" + SEARCH_PROVIDERS.join(" | ") + "). " +
+      "Pick a web result and `vouch fetch <url>` it, then `vouch claim`.",
+  )
+  .option("--top-k <n>", "KB hits to return", (v) => parseInt(v, 10), 10)
+  .option(
+    "--provider <name>",
+    `web fallback provider: ddg (default, general) | ${SEARCH_PROVIDERS.join(" | ")} (academic)`,
+  )
+  .option("--limit <n>", "web candidates to return", (v) => parseInt(v, 10), 5)
+  .option(
+    "--kb-threshold <f>",
+    "top-KB-hit similarity at/above which the KB is 'sufficient' (skip web)",
+    parseFloat,
+    0.7,
+  )
+  .option("--kb-only", "never web-search, even when the KB is thin")
+  .option("--web-only", "skip the KB, go straight to web search")
   .action(async (query: string, opts: any) => {
-    const qEmb = await embedOne(query);
-    emit(store.searchHybrid(qEmb, opts.topK));
+    const provider: string = opts.provider || "ddg";
+    if (provider !== "ddg" && !isSearchProvider(provider)) {
+      fail(`unknown --provider "${provider}". Use: ddg, ${SEARCH_PROVIDERS.join(", ")}`);
+    }
+
+    let kb: ReturnType<typeof store.searchHybrid> = [];
+    let kbSufficient = false;
+    if (!opts.webOnly) {
+      try {
+        const qEmb = await embedOne(query);
+        kb = store.searchHybrid(qEmb, opts.topK);
+      } catch (e: any) {
+        // embed failure shouldn't sink the whole search — fall through to web
+        kb = [];
+      }
+      const top = kb[0];
+      kbSufficient = !!top && typeof top.similarity === "number" && top.similarity >= opts.kbThreshold;
+    }
+
+    let web: (WebResult | CitationCandidate)[] | null = null;
+    let webError: string | undefined;
+    const doWeb = opts.webOnly || (!opts.kbOnly && !kbSufficient);
+    if (doWeb) {
+      try {
+        web =
+          provider === "ddg"
+            ? await ddgSearch(query, opts.limit)
+            : await searchCitations(provider, query, opts.limit);
+      } catch (e: any) {
+        web = null;
+        webError =
+          e instanceof WebSearchError ? e.message : e?.message || String(e);
+      }
+    }
+
+    emit({
+      query,
+      kb_sufficient: kbSufficient,
+      kb,
+      web,
+      web_provider: doWeb ? provider : null,
+      ...(webError ? { web_error: webError } : {}),
+      providers_available: ["ddg", ...SEARCH_PROVIDERS],
+      ...(!doWeb && !kbSufficient
+        ? {
+            hint:
+              "KB had no strong match and --kb-only suppressed web search. Drop --kb-only (auto-uses DuckDuckGo) or pass --provider <openalex|pubmed|arxiv|google-scholar> for scholarly sources, then `vouch fetch <url>` the right hit.",
+          }
+        : {}),
+    });
   });
 
 // ---------- gate ----------

@@ -202,15 +202,22 @@ vouch is agent-driven by design, but the CLI is fully usable from a shell
 for one-off claims, debugging, or KB inspection.
 
 ```bash
-# Fetch (vouch performs the HTTP request itself — this is the trust boundary)
+# Find a source (KB-first: reuses dossiers/claims you already have; falls
+# through to a web search when the KB has no strong match)
+vouch search "nginx rate limiting limit_req_zone burst"
+# → {"kb_sufficient":false,"kb":[...],"web":[{"title":"...","url":"https://...","snippet":"..."}],
+#     "web_provider":"ddg",...}
+vouch search "Fine Gray 1999 subdistribution hazard" --provider openalex   # academic index
+vouch search "ALCE citation benchmark" --kb-only                            # never web-search
+
+# Fetch — vouch performs the HTTP request itself (the trust boundary) AND
+# returns the readable content, so this is a drop-in for a web-fetch tool
 vouch fetch https://arxiv.org/abs/2410.05779
-# → {"dossier_slug":"evidence/arxiv/...","content_chars":68151,...}
+# → {"dossier_slug":"evidence/arxiv/...","content":"<first ~8000 chars>","content_chars":68151,...}
+vouch fetch <url> --full                # entire content
+vouch get-dossier <slug> --offset 8000 --limit 4000   # paged re-read later
 
-# Read what vouch saved
-vouch get-dossier <slug> --full
-vouch get-dossier <slug> --offset 8000 --limit 4000
-
-# Submit a claim (—source-quote optional: vouch auto-selects a supporting
+# Submit a claim (--source-quote optional: vouch auto-selects a supporting
 # passage from the dossier if you omit it)
 vouch claim "<text>" --type ATOMIC \
   --dossier <slug> \
@@ -221,10 +228,9 @@ vouch claim "<text>" --type ATOMIC \
 # Build derived claims (no source step — depends on existing KB claim_ids)
 vouch claim "<text>" --type INFERENCE --depends-on 1,2 --topic <topic> --soft-score 0.8
 
-# Browse + search
+# Browse
 vouch list-topics
 vouch list-claims --topic <X> --status supported
-vouch search "<query>" --top-k 5 --pretty
 vouch chain <id>                  # walk dependency DAG
 
 # Self-correct (audit trail preserved)
@@ -238,40 +244,32 @@ See `vouch <command> --help` for full flags.
 
 Default DB at `~/.vouch/store.db` (SQLite). Override with `VOUCH_DB_PATH`.
 
-## Citation grounding
+## The research loop
 
-When a claim references a paper / package / dataset, the brittle step is
-finding the canonical URL. `vouch search-citation` and `vouch claim-cite`
-delegate that to [opencli](https://github.com/jackwener/opencli)'s scholarly
-adapters (PubMed, arXiv, OpenAlex, Google Scholar) and feed the result
-straight into the `fetch → claim` pipeline.
+vouch is meant to *be* the agent's research tools, so the dossier a claim
+cites is a byproduct of reading the source — not a separate ceremony:
 
-```bash
-# Look up candidates (inspect, then fetch + claim the right one yourself)
-vouch search-citation "Fine Gray 1999 subdistribution hazard competing risk" \
-  --provider openalex --limit 5
-# → {"provider":"openalex","candidates":[{"title":"A proportional hazards model...",
-#     "url":"https://openalex.org/W...","year":1999,"doi":"10.1080/...",...}, ...]}
-
-# One-shot: search → fetch the top hit → file the claim against it (auto-quote)
-vouch claim-cite \
-  "Fine and Gray 1999 introduce the subdistribution-hazard regression model for competing risks." \
-  --search "Fine Gray 1999 subdistribution hazard competing risk" \
-  --provider openalex --auto --topic survival-analysis
-# → {"status":"supported","claim_id":201,"picked":{...},"dossier":{...}}
+```
+vouch search "<question>"          → check KB first; web-fallback if thin
+   ↓ pick a result
+vouch fetch <url>                  → returns the content AND persists the dossier
+   ↓ read, reason
+vouch claim "<sentence>" --dossier <slug>   → quote auto-selected; NLI-verified
 ```
 
+`vouch search` is KB-first: if you already have a dossier (or a supported
+claim) covering the query it returns that — no re-fetch. When the KB has no
+strong match it web-searches: **DuckDuckGo by default** (general web), or an
+academic index with `--provider openalex|pubmed|arxiv|google-scholar` (HTTP,
+via [opencli](https://github.com/jackwener/opencli)). Academic indices need
+`opencli` on PATH (`bun install -g @jackwener/opencli`; `VOUCH_OPENCLI_BIN`
+overrides); the DuckDuckGo default needs nothing.
+
 Notes:
-- `--provider` is mandatory — pick the right index for the field. PubMed
-  doesn't index pure-statistics journals (e.g. JASA), so a stats source needs
-  `openalex` or `google-scholar`; biomedical sources are fine on `pubmed`.
-- `claim-cite` needs `--auto` to proceed non-interactively. Without it (or if
-  the top hit's title looks unrelated to the query) it prints the candidates
-  and exits non-zero so you can pick manually.
-- Requires `opencli` on PATH (`bun install -g @jackwener/opencli`). If it's
-  missing, `vouch search-citation` / `claim-cite` fail with a clear install
-  hint — vouch does **not** silently fall back to a generic web search.
-  Override the binary with `VOUCH_OPENCLI_BIN`.
+- For academic claims pass `--provider` — PubMed doesn't index pure-statistics
+  journals (e.g. JASA), so a stats source needs `openalex` / `google-scholar`.
+- `vouch search-citation` and `vouch claim-cite` are **deprecated** aliases of
+  this flow (`search --provider` + `fetch` + `claim`); they'll be removed.
 
 ## Claim types
 
