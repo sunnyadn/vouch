@@ -13,6 +13,12 @@ interface FetchResult {
   title: string | null;
   publication_date: string | null;
   author_attribution: string | null;
+  /** The fetched content, sliced to `contentLimit` (or the whole thing when
+   *  `full` is set / the document is small). This makes `vouch fetch` a
+   *  drop-in for a built-in web-fetch tool: one call yields the readable text
+   *  AND persists the dossier the agent will cite. */
+  content: string;
+  /** Total length of the persisted dossier content (>= content.length). */
   content_chars: number;
   cached: boolean;
   fetched_at: string;
@@ -23,12 +29,26 @@ interface FetchResult {
   metadata?: Record<string, unknown>;
 }
 
-export async function fetchAndStore(url: string, opts: { hint?: string; forceRefetch?: boolean } = {}): Promise<FetchResult> {
+/** Default head-chunk size returned in `content` when neither --full nor an
+ *  explicit --content-limit is given. Matches the embedding-input slice. */
+export const DEFAULT_FETCH_CONTENT_CHARS = 8000;
+
+function sliceContent(full: string, opts: { full?: boolean; contentLimit?: number }): string {
+  if (opts.full) return full;
+  const limit = opts.contentLimit && opts.contentLimit > 0 ? opts.contentLimit : DEFAULT_FETCH_CONTENT_CHARS;
+  return full.slice(0, limit);
+}
+
+export async function fetchAndStore(
+  url: string,
+  opts: { hint?: string; forceRefetch?: boolean; full?: boolean; contentLimit?: number } = {},
+): Promise<FetchResult> {
   // Cache hit: same URL fetched < 24h ago via a real fetcher (not just an
   // agent-submitted quote). Skip refetch.
   if (!opts.forceRefetch) {
     const cached = store.getRecentFetchedDossier(url, 24);
     if (cached) {
+      const fullContent = cached.content || "";
       return {
         dossier_slug: cached.slug,
         source_url: cached.source_url,
@@ -36,7 +56,8 @@ export async function fetchAndStore(url: string, opts: { hint?: string; forceRef
         title: cached.title,
         publication_date: cached.publication_date,
         author_attribution: cached.author_attribution,
-        content_chars: (cached.content || "").length,
+        content: sliceContent(fullContent, opts),
+        content_chars: fullContent.length,
         cached: true,
         fetched_at: cached.capture_date,
       };
@@ -71,6 +92,7 @@ export async function fetchAndStore(url: string, opts: { hint?: string; forceRef
     title: result.title,
     publication_date: result.publication_date,
     author_attribution: result.author_attribution,
+    content: sliceContent(result.content, opts),
     content_chars: result.content.length,
     cached: false,
     fetched_at: new Date().toISOString(),

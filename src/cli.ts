@@ -48,16 +48,22 @@ function fail(msg: string, code = 1): never {
 program
   .command("fetch <url>")
   .description(
-    "Fetch a URL and persist it as a dossier (the trust-establishing step). " +
-      "Subsequent `vouch claim` references the returned dossier_slug.",
+    "Fetch a URL and persist it as a dossier (the trust-establishing step), " +
+      "returning the readable content so this is a drop-in for a web-fetch " +
+      "tool. Subsequent `vouch claim --dossier <slug>` cites it (quote " +
+      "auto-selected from the dossier).",
   )
   .option("--fetcher <name>", "Force a specific fetcher (arxiv | generic)")
   .option("--force-refetch", "Skip 24h cache and re-fetch even if dossier exists")
+  .option("--full", "Return the entire content (default: first ~8000 chars)")
+  .option("--content-limit <n>", "Return the first N chars of content", (v) => parseInt(v, 10))
   .action(async (url: string, opts: any) => {
     try {
       const result = await fetchAndStore(url, {
         hint: opts.fetcher,
         forceRefetch: opts.forceRefetch,
+        full: opts.full,
+        contentLimit: opts.contentLimit,
       });
       emit(result);
     } catch (e: any) {
