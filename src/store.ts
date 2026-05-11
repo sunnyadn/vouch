@@ -331,6 +331,28 @@ export function getClaim(id: number): (Claim & { depends_on: ClaimDependency[] }
   return row;
 }
 
+/** Claims (any status) with this exact text + type, each with its dependency
+ *  edges. Used by the gate's tagged-derived-claim harvest to dedup — re-emitting
+ *  a draft after a block must not double-file the same derived claim. */
+export function findClaimsByTextType(
+  claimText: string,
+  claimType: ClaimType,
+): { id: number; status: string; superseded_by: number | null; depends_on: ClaimDependency[] }[] {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT id, status, superseded_by FROM claims WHERE claim_text = ? AND claim_type = ?")
+    .all(claimText, claimType) as { id: number; status: string; superseded_by: number | null }[];
+  const depStmt = db.prepare(
+    "SELECT depends_on_id, dependency_type FROM claim_dependencies WHERE claim_id = ?",
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    status: r.status,
+    superseded_by: r.superseded_by,
+    depends_on: depStmt.all(r.id) as ClaimDependency[],
+  }));
+}
+
 export interface ListClaimsOpts {
   topic?: string;
   status?: string;

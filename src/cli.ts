@@ -415,6 +415,7 @@ program
     emit({
       blocked: result.verdict.blocked,
       pairs: result.verdict.pairs,
+      ...(result.verdict.harvest ? { harvest: result.verdict.harvest } : {}),
       ...(result.verdict.classifier_error
         ? { classifier_error: result.verdict.classifier_error }
         : {}),

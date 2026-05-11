@@ -1345,3 +1345,203 @@ describe("runGateCli session-evidence integration", () => {
     expect(r.message).toContain("checked 1 session source(s), none entailed");
   });
 });
+
+// ---------------------------------------------------------------------------
+// parseDerivedTags (issue #23)
+// ---------------------------------------------------------------------------
+
+describe("parseDerivedTags", () => {
+  it("parses each tag form with ids, segment, and a `; score:` override", () => {
+    const draft =
+      "GraphRAG uses community detection over a knowledge graph [verified: 5]. " +
+      "Given GraphRAG's high indexing cost and LightRAG's lower token usage, LightRAG is the more defensible default for cost-constrained SaaS [inference-from: 5, 6; score: 0.85]. " +
+      "GraphRAG and LightRAG both target RAG quality [synthesis-of: 5, 6]. " +
+      "Restating: LightRAG keeps retrieval cheap [interpretation: 6]. " +
+      "It might also help latency-sensitive workloads [hypothesis].";
+    const tags = gate.parseDerivedTags(draft);
+    expect(tags.map((t) => t.kind)).toEqual([
+      "verified",
+      "inference-from",
+      "synthesis-of",
+      "interpretation",
+      "hypothesis",
+    ]);
+    const inf = tags[1]!;
+    expect(inf.ids).toEqual([5, 6]);
+    expect(inf.softScore).toBe(0.85);
+    expect(inf.segment).toBe(
+      "Given GraphRAG's high indexing cost and LightRAG's lower token usage, LightRAG is the more defensible default for cost-constrained SaaS",
+    );
+    expect(tags[3]!.ids).toEqual([6]);
+    expect(tags[3]!.softScore).toBeNull();
+    expect(tags[4]!.ids).toEqual([]);
+    expect(tags[4]!.segment).toBe("It might also help latency-sensitive workloads");
+  });
+
+  it("accepts bare [inference: ids] / [synthesis: ids] aliases and [hypothesis; score: N]", () => {
+    const tags = gate.parseDerivedTags("X deduces Y [inference: 9]. X plus Z give W [synthesis: 9, 10]. Maybe Q [hypothesis; score: 0.3].");
+    expect(tags[0]!.kind).toBe("inference-from");
+    expect(tags[0]!.ids).toEqual([9]);
+    expect(tags[1]!.kind).toBe("synthesis-of");
+    expect(tags[1]!.ids).toEqual([9, 10]);
+    expect(tags[2]!.kind).toBe("hypothesis");
+    expect(tags[2]!.ids).toEqual([]);
+    expect(tags[2]!.softScore).toBe(0.3);
+  });
+
+  it("does not split a segment on a mid-sentence abbreviation, but does at a real sentence end", () => {
+    expect(gate.parseDerivedTags("Per the paper, e.g. Table 2, method X beats Y by 3 points [inference-from: 1].")[0]!.segment).toBe(
+      "Per the paper, e.g. Table 2, method X beats Y by 3 points",
+    );
+    expect(gate.parseDerivedTags("Here is meta prose. We then set up X. Given the data, X wins [inference-from: 1].")[0]!.segment).toBe(
+      "Given the data, X wins",
+    );
+  });
+
+  it("returns [] for untagged prose", () => {
+    expect(gate.parseDerivedTags("Just a normal sentence with no tags at all.")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGate — tagged-derived-claim harvesting (issue #23)
+// ---------------------------------------------------------------------------
+
+describe("runGate tagged-derived-claim harvest", () => {
+  function atomic(text: string, topic?: string): number {
+    const slug = store.writeDossier({ source_url: "https://x/" + text.slice(0, 8), source_type: "test", verbatim_content: text + " — full source text." });
+    return store.recordClaim({
+      dossier_slug: slug,
+      claim_text: text,
+      score: 1,
+      status: "supported",
+      claim_type: "ATOMIC",
+      topic: topic ?? null,
+      embedding: queryVec,
+    });
+  }
+
+  it("passing draft → harvests INFERENCE/SYNTHESIS/INTERPRETATION/HYPOTHESIS with right deps + soft_score; dedups on re-emit", async () => {
+    const c1 = atomic("LightRAG retrieval token cost is lower than GraphRAG", "rag");
+    const c2 = atomic("Microsoft's GraphRAG README warns it is expensive to index", "rag");
+    // No extractor mock queued → default returns { pairs: [] } → gate passes.
+    const draft =
+      `LightRAG retrieval token cost is lower than GraphRAG [verified: ${c1}]. ` +
+      `Given LightRAG's lower retrieval cost and GraphRAG's own 'expensive' warning, LightRAG is the more defensible default for cost-constrained SaaS [inference-from: ${c1}, ${c2}; score: 0.85]. ` +
+      `LightRAG and GraphRAG both implement graph-structured RAG [synthesis-of: ${c1}, ${c2}]. ` +
+      `Restating: GraphRAG's indexing step is the costly part [interpretation: ${c2}]. ` +
+      `It may also matter for latency-sensitive setups [hypothesis].`;
+    const v = await gate.runGate({ draft, model: "t" });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest).toBeDefined();
+    const filed = v.harvest!.filed;
+    expect(filed.map((f) => f.claim_type).sort()).toEqual(["HYPOTHESIS", "INFERENCE", "INTERPRETATION", "SYNTHESIS"]);
+
+    const inf = filed.find((f) => f.claim_type === "INFERENCE")!;
+    expect([...inf.depends_on].sort()).toEqual([c1, c2].sort());
+    expect(inf.soft_score).toBe(0.85);
+    const infClaim = store.getClaim(inf.claim_id)!;
+    expect(infClaim.claim_type).toBe("INFERENCE");
+    expect(infClaim.status).toBe("recorded");
+    expect(infClaim.verification).toBe("tag-harvest");
+    expect(infClaim.topic).toBe("rag"); // inherited — both upstreams share it
+    expect(infClaim.depends_on.map((d) => d.depends_on_id).sort()).toEqual([c1, c2].sort());
+
+    const syn = filed.find((f) => f.claim_type === "SYNTHESIS")!;
+    expect([...syn.depends_on].sort()).toEqual([c1, c2].sort());
+    expect(store.getClaim(syn.claim_id)!.depends_on[0]!.dependency_type).toBe("support");
+
+    const interp = filed.find((f) => f.claim_type === "INTERPRETATION")!;
+    expect(interp.depends_on).toEqual([c2]);
+
+    const hyp = filed.find((f) => f.claim_type === "HYPOTHESIS")!;
+    expect(hyp.depends_on).toEqual([]);
+    expect(hyp.soft_score).toBe(0.4);
+    expect(store.getClaim(hyp.claim_id)!.author).toBe("gate-harvest");
+
+    // [verified: c1] never creates a claim — only the 4 derived ones were filed.
+    const allClaims = store.listClaims({ limit: 100 });
+    expect(allClaims.filter((c) => c.author === "gate-harvest").length).toBe(4);
+
+    // Re-emit the same draft → nothing new filed; the 4 derived are reported as skipped.
+    const v2 = await gate.runGate({ draft, model: "t" });
+    expect(v2.blocked).toBe(false);
+    expect(v2.harvest!.filed.length).toBe(0);
+    expect(v2.harvest!.skipped.length).toBe(4);
+    expect(store.listClaims({ limit: 100 }).filter((c) => c.author === "gate-harvest").length).toBe(4);
+  });
+
+  it("flags a dangling [verified: id], and a missing-upstream [inference-from:]; does not file a claim with no resolvable deps", async () => {
+    const v = await gate.runGate({
+      draft: "Foo is great [verified: 99999]. Therefore bar [inference-from: 99998].",
+      model: "t",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest!.filed.length).toBe(0);
+    expect(v.harvest!.flags.some((f) => f.includes("99999") && f.includes("not in the KB"))).toBe(true);
+    expect(v.harvest!.flags.some((f) => f.includes("99998") && f.includes("dropped from depends_on"))).toBe(true);
+    expect(v.harvest!.flags.some((f) => f.includes("inference-from") && f.includes("not filed"))).toBe(true);
+  });
+
+  it("[verified: id] pointing at an unsupported claim is flagged (not re-filed)", async () => {
+    const slug = store.writeDossier({ source_url: "https://u", source_type: "test", verbatim_content: "blah blah" });
+    const cid = store.recordClaim({ dossier_slug: slug, claim_text: "Unsupported thing", score: 0, status: "unsupported", claim_type: "ATOMIC", embedding: queryVec });
+    const v = await gate.runGate({ draft: `Unsupported thing [verified: ${cid}].`, model: "t" });
+    expect(v.harvest!.filed.length).toBe(0);
+    expect(v.harvest!.flags.some((f) => f.includes(`${cid}`) && f.includes("status=unsupported"))).toBe(true);
+  });
+
+  it("a blocked draft does NOT harvest", async () => {
+    const c1 = atomic("Some upstream claim");
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Widget", stance: "ASSERT", proposition: "Widget has 9000 features." }] } } as any),
+    );
+    const v = await gate.runGate({
+      draft: `Widget has 9000 features. Therefore widgets win [inference-from: ${c1}].`,
+      model: "t",
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.harvest).toBeUndefined();
+    expect(store.listClaims({ claim_type: "INFERENCE", limit: 10 }).length).toBe(0);
+  });
+
+  it("untagged passing draft → no harvest field", async () => {
+    const v = await gate.runGate({ draft: "Looking at the vault now. Nothing to ground here.", model: "t" });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGateCli — harvest integration (issue #23)
+// ---------------------------------------------------------------------------
+
+describe("runGateCli harvest integration", () => {
+  it("passing transcript with derived tags → exit 0, claims recorded, visible harvest message", async () => {
+    const slug = store.writeDossier({ source_url: "https://h", source_type: "test", verbatim_content: "Premise text here." });
+    const c1 = store.recordClaim({ dossier_slug: slug, claim_text: "Premise about Frobnicator", score: 1, status: "supported", claim_type: "ATOMIC", topic: "frob", embedding: queryVec });
+    const path = join(tmp, "cli-harvest.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "user", message: { content: "do it" } }),
+        JSON.stringify({
+          type: "assistant",
+          timestamp: nowIso,
+          message: { content: [{ type: "text", text: `Premise about Frobnicator [verified: ${c1}]. Given the premise, the Frobnicator approach is the safer default here [inference-from: ${c1}].` }] },
+        }),
+      ].join("\n"),
+    );
+    // No extractor mock queued → default { pairs: [] } → gate passes.
+    const r = await gate.runGateCli({ transcriptPath: path, model: "vertex_ai/test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(0);
+    expect(r.verdict.blocked).toBe(false);
+    expect(r.verdict.harvest!.filed.length).toBe(1);
+    expect(r.verdict.harvest!.filed[0]!.claim_type).toBe("INFERENCE");
+    expect(r.message).toContain("harvested 1 derived claim");
+    const filedClaim = store.getClaim(r.verdict.harvest!.filed[0]!.claim_id)!;
+    expect(filedClaim.topic).toBe("frob");
+    expect(filedClaim.depends_on[0]!.depends_on_id).toBe(c1);
+  });
+});
