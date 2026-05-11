@@ -99,7 +99,10 @@ def make_true_t5_nli(quantize_8bit: bool = False):
     kwargs = dict(device_map="auto")
     if quantize_8bit:
         from transformers import BitsAndBytesConfig
-        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_enable_fp32_cpu_offload=True,
+        )
     else:
         kwargs["torch_dtype"] = torch.bfloat16
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
@@ -108,7 +111,7 @@ def make_true_t5_nli(quantize_8bit: bool = False):
     def nli(passage: str, claim: str) -> int:
         text = f"premise: {passage} hypothesis: {claim}"
         inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
-        input_ids = inputs.input_ids.to(model.device)
+        input_ids = inputs.input_ids.to(next(model.parameters()).device)
         with torch.inference_mode():
             out = model.generate(input_ids, max_new_tokens=10)
         result = tokenizer.decode(out[0], skip_special_tokens=True).strip()
