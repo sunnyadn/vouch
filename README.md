@@ -210,10 +210,11 @@ vouch fetch https://arxiv.org/abs/2410.05779
 vouch get-dossier <slug> --full
 vouch get-dossier <slug> --offset 8000 --limit 4000
 
-# Submit a claim
+# Submit a claim (—source-quote optional: vouch auto-selects a supporting
+# passage from the dossier if you omit it)
 vouch claim "<text>" --type ATOMIC \
   --dossier <slug> \
-  --source-quote "<verbatim 1–3 sentences from the dossier>" \
+  [--source-quote "<verbatim 1–3 sentences from the dossier>"] \
   --topic <topic> --attribution "<authors / org>"
 # → {"status":"supported","score":1,"claim_id":1,"quote_match":"exact"}
 
@@ -236,6 +237,41 @@ vouch doctor
 See `vouch <command> --help` for full flags.
 
 Default DB at `~/.vouch/store.db` (SQLite). Override with `VOUCH_DB_PATH`.
+
+## Citation grounding
+
+When a claim references a paper / package / dataset, the brittle step is
+finding the canonical URL. `vouch search-citation` and `vouch claim-cite`
+delegate that to [opencli](https://github.com/jackwener/opencli)'s scholarly
+adapters (PubMed, arXiv, OpenAlex, Google Scholar) and feed the result
+straight into the `fetch → claim` pipeline.
+
+```bash
+# Look up candidates (inspect, then fetch + claim the right one yourself)
+vouch search-citation "Fine Gray 1999 subdistribution hazard competing risk" \
+  --provider openalex --limit 5
+# → {"provider":"openalex","candidates":[{"title":"A proportional hazards model...",
+#     "url":"https://openalex.org/W...","year":1999,"doi":"10.1080/...",...}, ...]}
+
+# One-shot: search → fetch the top hit → file the claim against it (auto-quote)
+vouch claim-cite \
+  "Fine and Gray 1999 introduce the subdistribution-hazard regression model for competing risks." \
+  --search "Fine Gray 1999 subdistribution hazard competing risk" \
+  --provider openalex --auto --topic survival-analysis
+# → {"status":"supported","claim_id":201,"picked":{...},"dossier":{...}}
+```
+
+Notes:
+- `--provider` is mandatory — pick the right index for the field. PubMed
+  doesn't index pure-statistics journals (e.g. JASA), so a stats source needs
+  `openalex` or `google-scholar`; biomedical sources are fine on `pubmed`.
+- `claim-cite` needs `--auto` to proceed non-interactively. Without it (or if
+  the top hit's title looks unrelated to the query) it prints the candidates
+  and exits non-zero so you can pick manually.
+- Requires `opencli` on PATH (`bun install -g @jackwener/opencli`). If it's
+  missing, `vouch search-citation` / `claim-cite` fail with a clear install
+  hint — vouch does **not** silently fall back to a generic web search.
+  Override the binary with `VOUCH_OPENCLI_BIN`.
 
 ## Claim types
 
