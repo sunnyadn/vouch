@@ -21,7 +21,6 @@ import {
   searchCitations,
   ddgSearch,
   isSearchProvider,
-  titleSimilarity,
   WebSearchError,
   type CitationCandidate,
   type WebResult,
@@ -193,103 +192,6 @@ program
         process.exit(2);
       }
       throw e;
-    }
-  });
-
-// ---------- search-citation ----------
-program
-  .command("search-citation <query>")
-  .description(
-    "[deprecated — use `vouch search <query> --provider <p>`] " +
-      "Search academic-source adapters (via opencli) for a citable paper. " +
-      "Returns candidates with title/authors/year/doi/url — pick one and run " +
-      "`vouch fetch <url>` then `vouch claim`. Providers: " +
-      SEARCH_PROVIDERS.join(" | ") + ".",
-  )
-  .requiredOption("--provider <name>", `one of: ${SEARCH_PROVIDERS.join(", ")}`)
-  .option("--limit <n>", "max candidates", (v) => parseInt(v, 10), 5)
-  .action(async (query: string, opts: any) => {
-    try {
-      const candidates = await searchCitations(opts.provider, query, opts.limit);
-      emit({ provider: opts.provider, query, count: candidates.length, candidates });
-    } catch (e: any) {
-      fail(e?.message || String(e));
-    }
-  });
-
-// ---------- claim-cite (search → fetch → claim, one shot) ----------
-program
-  .command("claim-cite <text>")
-  .description(
-    "[deprecated — use `vouch search` → `vouch fetch` → `vouch claim`] " +
-      "One-shot citation grounding: search for the cited source, fetch the top " +
-      "hit as a dossier, and file the claim against it (auto-quote).",
-  )
-  .requiredOption("--search <query>", "search terms identifying the cited source")
-  .requiredOption("--provider <name>", `one of: ${SEARCH_PROVIDERS.join(", ")}`)
-  .option("-t, --type <type>", "claim type (ATOMIC default)", "ATOMIC")
-  .option("--auto", "proceed with the top search hit without an interactive pick")
-  .option("--limit <n>", "search breadth", (v) => parseInt(v, 10), 5)
-  .option("--topic <topic>")
-  .option("--attribution <attribution>", "override the dossier-derived attribution")
-  .option("--source-quote <quote>", "override the auto-selected supporting passage")
-  .action(async (text: string, opts: any) => {
-    const ct = opts.type as ClaimType;
-    if (ct !== "ATOMIC" && ct !== "QUOTATION") {
-      fail(`claim-cite supports ATOMIC or QUOTATION (got "${ct}")`);
-    }
-    let candidates: CitationCandidate[];
-    try {
-      candidates = await searchCitations(opts.provider, opts.search, opts.limit);
-    } catch (e: any) {
-      fail(e?.message || String(e));
-    }
-    if (!candidates!.length) {
-      fail(`no candidates from ${opts.provider} for "${opts.search}"`);
-    }
-    const top = candidates![0]!;
-    const sim = titleSimilarity(opts.search, top.title);
-
-    if (!opts.auto) {
-      // No interactive picker in a piped CLI — surface candidates, refuse.
-      console.error(
-        JSON.stringify({
-          error:
-            "claim-cite needs --auto (no interactive picker available). Inspect the candidates and either re-run with --auto, or use `vouch search-citation` + `vouch fetch <url>` + `vouch claim` manually.",
-          candidates: candidates!,
-        }),
-      );
-      process.exit(2);
-    }
-    if (sim < 0.15) {
-      console.error(
-        JSON.stringify({
-          error: `top hit "${top.title}" looks unrelated to query "${opts.search}" (title similarity ${sim.toFixed(2)} < 0.15); refusing to auto-pick. Use \`vouch search-citation\` to inspect.`,
-          candidates: candidates!,
-        }),
-      );
-      process.exit(2);
-    }
-    if (!top.url) fail(`top candidate has no URL: ${top.title}`);
-
-    try {
-      const dossier = await fetchAndStore(top.url, {});
-      const claim = await submitClaim({
-        text,
-        claim_type: ct,
-        topic: opts.topic,
-        attribution: opts.attribution,
-        author: "claude-skill",
-        dossier_slug: dossier.dossier_slug,
-        source_quote: opts.sourceQuote,
-      });
-      emit({ ...claim, picked: top, dossier });
-    } catch (e: any) {
-      if (e instanceof TransientVerifierError) {
-        emit({ error: e.message, kind: e.kind, hint: e.hint, recorded: false });
-        process.exit(2);
-      }
-      fail(e?.message || String(e));
     }
   });
 

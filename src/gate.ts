@@ -92,6 +92,7 @@ DECISION RULES:
   - Hedge tokens in the same sentence/clause → stance is HEDGE, even if surface looks declarative. Hedge wins over ASSERT.
   - Evaluative/normative wording (best/worst/right/wrong/valuable/sufficient/overkill/cleaner/better-without-a-metric) → stance is OPINION, not ASSERT. "Is X good enough" is OPINION; "does X score ≥ 0.8" is ASSERT.
   - A claim about the model currently running this session (its capabilities, context budget, speed, resource use while doing the present work) → that is meta-commentary about the conversation → WORKSPACE, do not return a triple. The running model is not a third-party external entity here.
+  - Composition claims: a proposition of the form "<the workspace project> {uses | defaults to | depends on | integrates | ships with | wraps | is built on} <third-party X>" is a claim about the workspace project's own code/config — verifiable by reading its source — NOT a claim about X. Skip it (WORKSPACE), even though X is a third-party name. Contrast: "<X> {has | returns | requires | scored} ..." (a property of X itself) is a real ASSERT about X.
   - "X vs Y" without an outcome → both X and Y are COMPARE; with a measured outcome ("X beat Y by N") → ASSERT; with an unmeasured value-outcome ("X is better than Y") → OPINION.
   - Retraction sentences re-mention the entity by necessity → stance is RETRACT, never ASSERT.
   - Annotations like "(claim N)", "(claim_id: N)", "(supported NLI)" → stance is META (already-grounded handle).

@@ -6,19 +6,19 @@ description: |
   itself (the trust-establishing step), persists them as dossiers, then
   verifies claims you make against those dossiers via NLI.
 
-  YOU drive the workflow:
-    1. Decide whether the KB already has relevant claims (`vouch list-claims`,
-       `vouch search`)
-    2. If gap exists, point vouch at the source: `vouch fetch <url>` →
-       returns a dossier_slug
-    3. Read what vouch fetched: `vouch get-dossier <slug> --full` (or paged)
-    4. Pick a verbatim 1–3 sentence quote FROM THE DOSSIER TEXT (not from
-       your own WebFetch — vouch's stripped text may differ)
-    5. `vouch claim "<text>" --type ATOMIC --dossier <slug> --source-quote "..."`
-       — vouch verifies the quote is in the dossier, then runs NLI
-    6. For inferences from KB claims: `vouch claim "..." --type INFERENCE
+  Do your research THROUGH vouch — the dossier a claim cites is a byproduct
+  of reading the source, not a separate step:
+    1. `vouch search "<question>"` — KB-first (reuses dossiers/claims you
+       have); web-fallback (DuckDuckGo, or --provider for academic) when thin
+    2. `vouch fetch <url>` — vouch does the HTTP request AND returns the
+       content (drop-in for a web-fetch tool); the dossier persists as a side
+       effect. Don't use a built-in WebFetch for anything you'll cite.
+    3. `vouch claim "<text>" --type ATOMIC --dossier <slug>` — quote
+       auto-selected from the dossier (pass --source-quote only to pin one);
+       vouch runs NLI
+    4. For inferences from KB claims: `vouch claim "..." --type INFERENCE
        --depends-on <ids>`
-    7. Use claim_ids when responding to user
+    5. Use claim_ids when responding to user
 
   Triggers: research-grounded writing, decision memos, comparative analyses,
   any synthesis where the user wants source-traceable factual statements. Or
@@ -30,54 +30,59 @@ description: |
 
 # vouch — Claude-driven verification
 
-## Mental model
+## Mental model — vouch IS your research loop
 
 ```
-You are the agent. vouch is a tool with two phases:
-
-  Your job:                          vouch's job:
-  ─────────                          ────────────
-  · pick what to research            · fetch the URL itself
-  · ask vouch to fetch the URL       · persist full content as a dossier
-  · read the dossier vouch saved     · check your quote is in the dossier
-  · pick a verbatim quote from it    · run NLI on (claim, quote)
-  · classify each statement          · store result + dependency DAG
-  · own inference logic              · supersede on correction
+Your natural loop:        →  routes through vouch:           vouch's job:
+─────────────────            ──────────────────────          ────────────
+search for a source          vouch search "<q>"              KB-first; web-fallback
+read the source              vouch fetch <url>               fetch + persist + RETURN content
+reason, write a sentence     vouch claim "<text>" --dossier  auto-pick quote, run NLI
+classify each statement      (you set --type)                store result + dependency DAG
+correct yourself             vouch supersede                 audit trail preserved
 ```
 
-**Critical**: the source quote you submit must appear in the dossier vouch
-fetched. If you WebFetch a URL yourself and submit a quote from your own
-read, the text will likely diverge from what vouch stored (different
-HTML→text strippers). Always read `vouch get-dossier --full` first and pick
-the quote from there.
+Do your research THROUGH vouch, not alongside it. `vouch fetch` returns the
+page content directly (head chunk, or `--full`) — it is a drop-in for a
+built-in web-fetch tool, and the side effect is that the dossier the agent
+cites is a byproduct of the read, not a separate ceremony. **For anything you
+will cite, `vouch fetch` it — don't use a built-in WebFetch** (its stripped
+text diverges from vouch's, which breaks the quote check). Built-in WebSearch
+is fine for *discovering* candidate URLs when `vouch search`'s web fallback is
+thin, but the URL you settle on goes through `vouch fetch`.
+
+`--source-quote` on `vouch claim` is optional: omit it and vouch auto-selects
+a supporting passage from the dossier. Pass it only to pin a specific quote.
 
 ## Smoke test before first use
 
 ```bash
-vouch doctor
-# → {"ok":true,"checks":[{"name":"db","status":"ok",...},...]}
+vouch health
+# → {"ok":true,"db_path":"...","verifier_model":"vertex_ai/gemini-3.1-pro-preview","db_ok":true}
 ```
 
-If `vouch` not on PATH or any check is `fail`: see the vouch repo README
-for install + provider-credential setup.
+If `vouch` not on PATH: install per `~/Projects/vouch/README.md`.
 
 ## Commands
 
 ```bash
-# Phase 1: fetch (trust-establishing)
-vouch fetch <url> [--fetcher arxiv|generic] [--force-refetch]
-# → {dossier_slug, source_type, title, publication_date, author_attribution,
-#    content_chars, cached, fetched_at}
+# Find a source — KB-first, web-fallback (DuckDuckGo by default; --provider
+# openalex|pubmed|arxiv|google-scholar for academic). Reuses dossiers/claims
+# you already have, so check this BEFORE fetching anything.
+vouch search "<question>" [--provider <p>] [--limit 5] [--kb-only] [--web-only]
+# → {kb_sufficient, kb:[...hits...], web:[{title,url,snippet}]|null, web_provider, ...}
 
-# Read what vouch saved
-vouch get-dossier <slug>             # 4000-char preview
-vouch get-dossier <slug> --full      # full content
-vouch get-dossier <slug> --offset 8000 --limit 4000  # specific window
+# Fetch — vouch does the HTTP request itself (trust boundary) AND returns the
+# content, so this is your web-fetch tool. The dossier persists as a side effect.
+vouch fetch <url> [--fetcher arxiv|generic] [--force-refetch] [--full | --content-limit N]
+# → {dossier_slug, content:"<first ~8000 chars>", content_chars, title, ...}
+vouch get-dossier <slug> --offset 8000 --limit 4000   # re-read a later window
 
-# Phase 2: claim (against an already-fetched dossier)
+# Claim (against an already-fetched dossier). --source-quote OPTIONAL — omit it
+# and vouch auto-selects the supporting passage from the dossier.
 vouch claim "<text>" --type ATOMIC \
   --dossier <slug> \
-  --source-quote "<verbatim 1–3 sentences from the dossier>" \
+  [--source-quote "<verbatim 1–3 sentences from the dossier>"] \
   --topic <topic> \
   --attribution "<authors / org>"
 
@@ -97,7 +102,6 @@ vouch list-topics
 vouch list-claims --topic <X> --status supported --contains <kw>
 vouch get-claim <id>
 vouch chain <id>                     # walk dependency DAG
-vouch search "<query>" --top-k 8     # hybrid: claims + dossiers
 vouch list-dossiers
 
 # Correct yourself
@@ -109,66 +113,74 @@ vouch --pretty <command> ...
 
 ## Workflow
 
-### Step 1 — Check KB before fetching
+### Step 1 — `vouch search` (KB-first, web-fallback in one call)
 
 ```bash
-vouch list-topics
-vouch list-claims --topic <existing> --contains <keyword>
 vouch search "<your question>"
-# If KB already covers this, read the existing claims, synthesize, skip Step 2.
+# kb_sufficient: true  → the KB already covers this. Read the kb hits
+#                        (vouch get-claim <id> / get-dossier <slug>), cite the
+#                        existing claim_ids, synthesize. Skip to Step 4 or done.
+# kb_sufficient: false → web[] holds candidate URLs. Pick the right one → Step 2.
+#                        For a scholarly source pass --provider openalex|pubmed|
+#                        arxiv|google-scholar (the DuckDuckGo default is general).
 ```
 
-### Step 2 — Fetch (only if KB gap)
+`vouch list-topics` / `vouch list-claims --topic <X> --contains <kw>` are still
+useful for browsing, but `vouch search` is the one move that both dedups
+against the KB and finds new sources.
+
+### Step 2 — `vouch fetch` the chosen URL
 
 ```bash
 vouch fetch https://arxiv.org/abs/2410.05779
-# → {"dossier_slug":"evidence/arxiv/...", "content_chars":68151, ...}
+# → {"dossier_slug":"evidence/arxiv/...", "content":"<first ~8000 chars>", "content_chars":68151, ...}
+vouch fetch <url> --full          # entire content if the head chunk isn't enough
 ```
 
-vouch picks the right fetcher (arxiv special case, generic fallback). For
-arxiv URLs, vouch fetches the HTML version (cleaner than PDF/abstract) and
-populates publication_date + author_attribution from the arxiv API.
+The `content` in the result IS the page text — read it directly, no separate
+call needed. For very long sources, `vouch get-dossier <slug> --offset N --limit M`
+pages through later. vouch picks the right fetcher (arxiv → HTML version +
+arxiv-API metadata; generic fallback otherwise).
 
-**Fetch tool selection:**
-1. **`vouch fetch`** — primary. Public, static, or arxiv-style URLs.
-2. **WebFetch / OpenCLI for general research** — to discover URLs worth
-   submitting to vouch. Then `vouch fetch` the chosen ones.
-3. If `vouch fetch` errors (auth wall, JS-heavy site, PDF without HTML
-   alternative), surface the limit to the user; don't fabricate.
+**Don't use a built-in WebFetch for anything you'll cite** — vouch's stripped
+text diverges from a built-in fetcher's, which breaks the quote check. Built-in
+WebSearch is OK only to *discover* candidate URLs when `vouch search`'s web
+fallback came up thin; the URL you settle on still goes through `vouch fetch`.
+If `vouch fetch` errors (auth wall, JS-heavy site, PDF without HTML), surface
+the limit to the user — don't fabricate, and don't quietly fall back to a
+built-in fetcher and then claim against it.
 
-### Step 3 — Read the dossier
-
-```bash
-vouch get-dossier <slug> --full | jq -r .content
-# Search for relevant section, e.g. with grep / a sub-agent / your own read.
-```
-
-For long dossiers (papers, READMEs), use `--offset / --limit` to page through.
-
-### Step 4 — Submit claims
+### Step 3 — Submit claims (quote auto-selected)
 
 ```bash
 vouch claim "LightRAG outperforms GraphRAG on Agriculture, CS, Legal datasets" \
   --type ATOMIC \
   --dossier evidence/arxiv/... \
-  --source-quote "On the Agriculture, CS, and Legal datasets, LightRAG shows a clear advantage..." \
   --topic rag-systems \
   --attribution "Guo et al. 2024"
-# → {"status":"supported","score":1,"claim_id":12,"quote_match":"exact"}
+# → {"status":"supported","score":1,"claim_id":12,"quote_match":"...","metadata":{"auto_selected_quote":true}}
+#
+# Pass --source-quote "<verbatim 1–3 sentences from the dossier>" only when you
+# want to pin a specific passage rather than let vouch pick.
 ```
 
-**If `error: quote-not-in-dossier`**: your quote does not appear in vouch's
-stripped text. Either:
-- Re-read `vouch get-dossier --full` and copy the EXACT phrasing
-- Pick a different quote from the dossier
-- The dossier may not actually cover what you want — fetch a different URL
+**If `error: quote-not-in-dossier`** (only happens when you passed
+`--source-quote`): the quote you pinned isn't in vouch's stripped text. Drop
+`--source-quote` (let vouch auto-pick), or re-read the dossier `content` and
+copy the EXACT phrasing, or the dossier may not cover what you want — fetch a
+different URL.
+
+**If `error: quote-not-in-dossier` with `auto_selected`** / `auto-quote: no
+supporting passage found`: the dossier genuinely contains nothing that
+entails the claim — the source doesn't support it. Fetch a different source or
+drop the claim.
 
 **If `status: unsupported` (NLI rejected)**: the quote IS in the dossier but
-doesn't actually support your claim. Tighten the claim, find a stronger
-quote, or drop the claim. NLI is strict by design — claims that overshoot
-their quote are caught here.
+doesn't actually support your claim. Tighten the claim, pass a stronger
+`--source-quote`, or drop the claim. NLI is strict by design — claims that
+overshoot their quote are caught here.
 
-### Step 5 — Tag the synthesis
+### Step 4 — Tag the synthesis
 
 When drafting your response to the user, every factual segment carries a tag:
 
@@ -192,7 +204,7 @@ Only in two cases:
 If neither: **DOWNGRADE TO HYPOTHESIS**. Free-form "interesting connection"
 is HYPOTHESIS, not INFERENCE.
 
-### Step 6 — Heuristic for adversarial decisions
+### Step 5 — Heuristic for adversarial decisions
 
 When the user asks "X vs Y, which?", the most credible evidence is **a quote
 where the loser admits the weakness in their own docs**. A vendor admitting
@@ -204,7 +216,7 @@ So: when answering "X vs Y", spend fetch budget finding self-incriminating
 quotes from each side, not balanced comparison documents. One self-admission
 quote per option > five neutral-comparison quotes.
 
-### Step 7 — Record derived claims back
+### Step 6 — Record derived claims back
 
 For each `[inference-from: ...]` / `[synthesis-of: ...]` / `[hypothesis]`
 segment, file it back so future sessions can build on it:
@@ -221,7 +233,7 @@ vouch claim "Given LightRAG's lower retrieval token cost and the Microsoft READM
 DO NOT post `[verified]` / `[interpretation]` segments unless the
 interpretation is a substantive reframing worth re-using.
 
-### Step 8 — Self-audit before responding
+### Step 7 — Self-audit before responding
 
 Scan your draft:
 
@@ -257,14 +269,17 @@ Markdown response:
 
 ## Anti-patterns (don't do these)
 
-- ❌ Don't WebFetch a URL and submit a quote from your own read — submit
-  via `vouch fetch` then quote from `vouch get-dossier --full`
-- ❌ Don't ask vouch to do web search (you do it via WebSearch)
+- ❌ Don't use a built-in WebFetch for a URL you'll cite — `vouch fetch` it
+  (returns the content AND persists the dossier); a built-in fetcher's
+  stripped text diverges from vouch's and breaks the quote check
+- ❌ Don't skip `vouch search` and fetch blindly — search is KB-first, it
+  tells you whether you already have a dossier/claim to reuse
 - ❌ Don't tag `[verified]` for things you derived but didn't fetch
 - ❌ Don't tag `[inference]` for "interesting connections" — those are HYPOTHESIS
 - ❌ Don't fabricate claim_ids — they must come from `vouch list-claims` output
 - ❌ Don't auto-supersede other agents' claims without strong justification
-- ❌ Don't paraphrase the source quote — it must be verbatim from the dossier
+- ❌ Don't pass a paraphrased `--source-quote` — it must be verbatim from the
+  dossier (or omit it and let vouch auto-select)
 
 ## Anti-pattern: silent rewriting
 
