@@ -189,8 +189,10 @@ When the gate does block, the agent (with the skill loaded) runs the loop:
 1. **Search the KB first** — `vouch search "<keyword>"`. If a relevant
    verified claim already exists, cite its `claim_id` and skip ahead.
 2. **Otherwise fetch the source** — `vouch fetch <url>` returns a
-   `dossier_slug`. vouch performs the HTTP request itself; the agent's
-   own WebFetch is not the trust boundary.
+   `dossier_slug`; vouch performs the HTTP request itself and persists the
+   content. (If the agent already pulled this with `WebFetch` this session,
+   it doesn't reach this step — the gate auto-grounds from that. This step is
+   for sources the agent hasn't retrieved.)
 3. **Read what vouch saved** — `vouch get-dossier <slug> --full`. The
    quote must come from this dossier text, not the agent's own read of
    the URL — HTML strippers differ and the quote-in-dossier check

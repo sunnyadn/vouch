@@ -1,24 +1,27 @@
 ---
 name: vouch
 description: |
-  Use vouch as a strict claim verifier + persistent KB while YOU (Claude) do
-  the research and decision-making. vouch is a CLI that fetches sources
-  itself (the trust-establishing step), persists them as dossiers, then
-  verifies claims you make against those dossiers via NLI.
-
-  Do your research THROUGH vouch — the dossier a claim cites is a byproduct
-  of reading the source, not a separate step:
-    1. `vouch search "<question>"` — KB-first (reuses dossiers/claims you
-       have); web-fallback (DuckDuckGo, or --provider for academic) when thin
-    2. `vouch fetch <url>` — vouch does the HTTP request AND returns the
-       content (drop-in for a web-fetch tool); the dossier persists as a side
-       effect. Don't use a built-in WebFetch for anything you'll cite.
-    3. `vouch claim "<text>" --type ATOMIC --dossier <slug>` — quote
-       auto-selected from the dossier (pass --source-quote only to pin one);
-       vouch runs NLI
-    4. For inferences from KB claims: `vouch claim "..." --type INFERENCE
-       --depends-on <ids>`
-    5. Use claim_ids when responding to user
+  vouch is a strict claim verifier + persistent KB for LLM agents. You do the
+  research with your NATIVE tools (Read / WebFetch / WebSearch / `cat`); vouch's
+  Stop-hook (`vouch gate`) then checks any ungrounded named-entity factual claim
+  in your draft. If you already retrieved a supporting source THIS SESSION, the
+  gate finds it in the transcript, snapshots it as a dossier, files the claim,
+  and passes — you'll see `[verified: <id>] auto-grounded from session`, and you
+  do nothing. You run vouch commands by hand only when:
+    (a) the gate fires on something you have NOT retrieved (training memory, or a
+        source you never actually read): `vouch search "<q>"` (does the KB
+        already have it?) → `vouch fetch <url>` (vouch does the HTTP + persists
+        the dossier) → read what vouch saved → `vouch claim "<text>" --type
+        ATOMIC --dossier <slug>` (quote auto-selected; vouch runs NLI). Or hedge
+        `(unverified, from training memory)`.
+    (b) you're DELIBERATELY building source-traceable KB (decision memo, dossier
+        work where the user wants claim_ids): same `vouch search → fetch →
+        claim` loop, run proactively.
+    (c) inferences from KB claims: `vouch claim "..." --type INFERENCE
+        --depends-on <ids>`; corrections: `vouch supersede <old> <new>`.
+  Use your native WebSearch/WebFetch freely — the gate captures whatever you
+  read. `vouch search` is for reusing the KB (dedup against dossiers/claims you
+  already have), not as your web-search tool.
 
   Triggers: research-grounded writing, decision memos, comparative analyses,
   any synthesis where the user wants source-traceable factual statements. Or
@@ -30,29 +33,41 @@ description: |
 
 # vouch — Claude-driven verification
 
-## Mental model — vouch IS your research loop
+## Mental model — research natively; the gate verifies + remembers
 
-```
-Your natural loop:        →  routes through vouch:           vouch's job:
-─────────────────            ──────────────────────          ────────────
-search for a source          vouch search "<q>"              KB-first; web-fallback
-read the source              vouch fetch <url>               fetch + persist + RETURN content
-reason, write a sentence     vouch claim "<text>" --dossier  auto-pick quote, run NLI
-classify each statement      (you set --type)                store result + dependency DAG
-correct yourself             vouch supersede                 audit trail preserved
-```
+You don't route research *through* vouch. Use your normal tools — `Read`,
+`WebFetch`, `WebSearch`, `cat` — and vouch sits behind them:
 
-Do your research THROUGH vouch, not alongside it. `vouch fetch` returns the
-page content directly (head chunk, or `--full`) — it is a drop-in for a
-built-in web-fetch tool, and the side effect is that the dossier the agent
-cites is a byproduct of the read, not a separate ceremony. **For anything you
-will cite, `vouch fetch` it — don't use a built-in WebFetch** (its stripped
-text diverges from vouch's, which breaks the quote check). Built-in WebSearch
-is fine for *discovering* candidate URLs when `vouch search`'s web fallback is
-thin, but the URL you settle on goes through `vouch fetch`.
+- **The Stop-hook (`vouch gate`)** scans your draft for ungrounded named-entity
+  factual claims. If a claim fires and you **already pulled a supporting source
+  this session** (a file you `Read`/`cat`-ed, a page you `WebFetch`-ed, results
+  from `WebSearch`), the gate finds it in the transcript, snapshots it as a
+  dossier, files the claim, and passes — you'll see `[verified: <id>]
+  auto-grounded from session ...`. **You do nothing** for that case; the source
+  you already read *is* the grounding.
+- If a claim fires and **no session source supports it** — you're citing
+  something you never actually retrieved, or it's straight from training memory.
+  *Then* you act: `vouch search "<q>"` (does the KB already have it?) → `vouch
+  fetch <url>` (vouch retrieves + persists it) → read what vouch saved → `vouch
+  claim "<text>" --dossier <slug>`. Or hedge `(unverified, from training
+  memory)`. The gate's block message tells you how many session sources it
+  checked and, for a `WebFetch` result that didn't entail, suggests `vouch fetch
+  <url>` for the raw page (WebFetch returns model-extracted text, which can miss
+  the supporting span).
+- You also run the `search → fetch → claim` loop **proactively** when you're
+  deliberately building source-traceable KB (decision memo, dossier work where
+  the user wants `claim_ids`) rather than waiting for the gate to fire.
+- `vouch search` is for **reusing the KB** — "do I already have a dossier/claim
+  on this?" Use your native `WebSearch` to *discover* new web sources; use
+  `vouch search` to dedup against what vouch already knows.
 
-`--source-quote` on `vouch claim` is optional: omit it and vouch auto-selects
-a supporting passage from the dossier. Pass it only to pin a specific quote.
+When you *do* call `vouch claim` by hand against a `vouch fetch` dossier, quote
+from what vouch saved (`vouch get-dossier <slug>`), not from your own read of
+the URL — vouch's stripped text can differ from a built-in fetcher's, and the
+quote-in-dossier check rejects mismatches. (`--source-quote` is optional anyway:
+omit it and vouch auto-selects a supporting passage. Pass it only to pin one.)
+Using your native `WebFetch` for *research* is fine — it's only the manual
+`--source-quote` path that needs the quote to come from vouch's dossier text.
 
 ## Smoke test before first use
 
@@ -111,7 +126,12 @@ vouch supersede <old_id> <new_id> --reason "<why old was wrong>"
 vouch --pretty <command> ...
 ```
 
-## Workflow
+## Workflow — the `search → fetch → claim` loop
+
+Run this loop when the gate fired on a claim you *haven't* already retrieved a
+source for, OR when you're proactively building source-traceable KB. If you
+already read the source this session, the gate auto-grounds it for you — skip
+to Step 4 (tagging) and just cite the auto-grounded `claim_id` it printed.
 
 ### Step 1 — `vouch search` (KB-first, web-fallback in one call)
 
@@ -142,13 +162,14 @@ call needed. For very long sources, `vouch get-dossier <slug> --offset N --limit
 pages through later. vouch picks the right fetcher (arxiv → HTML version +
 arxiv-API metadata; generic fallback otherwise).
 
-**Don't use a built-in WebFetch for anything you'll cite** — vouch's stripped
-text diverges from a built-in fetcher's, which breaks the quote check. Built-in
-WebSearch is OK only to *discover* candidate URLs when `vouch search`'s web
-fallback came up thin; the URL you settle on still goes through `vouch fetch`.
-If `vouch fetch` errors (auth wall, JS-heavy site, PDF without HTML), surface
-the limit to the user — don't fabricate, and don't quietly fall back to a
-built-in fetcher and then claim against it.
+You can also reach this dossier from a source you already pulled with your
+native `WebFetch` this session — the gate snapshots it automatically when it
+auto-grounds a claim. `vouch fetch` here is for the case where you're citing a
+source you *haven't* retrieved (or want vouch's canonical copy for a manual
+`--source-quote`). If `vouch fetch` errors (auth wall, JS-heavy site, PDF
+without HTML), surface the limit to the user — don't fabricate, and don't
+quietly fall back to a built-in fetcher and then `vouch claim --source-quote`
+against text vouch never saw.
 
 ### Step 3 — Submit claims (quote auto-selected)
 
@@ -269,11 +290,12 @@ Markdown response:
 
 ## Anti-patterns (don't do these)
 
-- ❌ Don't use a built-in WebFetch for a URL you'll cite — `vouch fetch` it
-  (returns the content AND persists the dossier); a built-in fetcher's
-  stripped text diverges from vouch's and breaks the quote check
-- ❌ Don't skip `vouch search` and fetch blindly — search is KB-first, it
-  tells you whether you already have a dossier/claim to reuse
+- ❌ Don't `vouch claim --source-quote "..."` from your own WebFetch read —
+  a manual quote must come from vouch's dossier text (`vouch get-dossier`), or
+  omit `--source-quote` and let vouch auto-select. (Using native WebFetch for
+  *research* is fine — the gate auto-grounds from it.)
+- ❌ Don't skip `vouch search` when you're about to fetch/build — it's KB-first,
+  it tells you whether you already have a dossier/claim to reuse
 - ❌ Don't tag `[verified]` for things you derived but didn't fetch
 - ❌ Don't tag `[inference]` for "interesting connections" — those are HYPOTHESIS
 - ❌ Don't fabricate claim_ids — they must come from `vouch list-claims` output
