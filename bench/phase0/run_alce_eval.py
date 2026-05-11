@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --quiet --with google-genai --with nltk --with rouge_score --with numpy --with tqdm --with accelerate --with minicheck@git+https://github.com/Liyan06/MiniCheck.git@main
+#!/usr/bin/env -S uv run --quiet --with google-genai --with nltk --with rouge_score --with numpy --with tqdm --with accelerate --with bitsandbytes --with minicheck@git+https://github.com/Liyan06/MiniCheck.git@main
 """
 run_alce_eval.py — Phase 1 lite scorer for the Phase 0 dry-run outputs.
 
@@ -79,6 +79,41 @@ Rules:
 - Reject "almost-true" claims that overstate, generalize, or paraphrase beyond what the source says.
 
 Return your verdict as JSON: { "supported": true|false }."""
+
+
+def make_true_t5_nli(quantize_8bit: bool = False):
+    """ALCE paper's canonical evaluator: google/t5_xxl_true_nli_mixture.
+    Loads via Hugging Face transformers. Uses bf16 + device_map="auto" by
+    default (auto-splits GPU + CPU); pass quantize_8bit=True for bitsandbytes
+    8-bit (~half the memory, slight precision tradeoff).
+
+    The NLI prompt format mirrors ALCE eval.py exactly:
+      input: "premise: <passage> hypothesis: <claim>"
+      output: "1" (entailed) or "0" (not entailed)
+    """
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    model_name = "google/t5_xxl_true_nli_mixture"
+    print(f"[nli] loading {model_name} (quantize_8bit={quantize_8bit})", file=sys.stderr)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    kwargs = dict(device_map="auto")
+    if quantize_8bit:
+        from transformers import BitsAndBytesConfig
+        kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+    else:
+        kwargs["torch_dtype"] = torch.bfloat16
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name, **kwargs)
+    model.eval()
+
+    def nli(passage: str, claim: str) -> int:
+        text = f"premise: {passage} hypothesis: {claim}"
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=2048)
+        input_ids = inputs.input_ids.to(model.device)
+        with torch.inference_mode():
+            out = model.generate(input_ids, max_new_tokens=10)
+        result = tokenizer.decode(out[0], skip_special_tokens=True).strip()
+        return 1 if result == "1" else 0
+    return nli
 
 
 def make_vertex_nli(model_id: str):
@@ -238,9 +273,13 @@ def main() -> int:
     ap.add_argument("--input", default=None, help="Specific JSON to score")
     ap.add_argument("--both", action="store_true",
                     help="Score both alce_dryrun_without_vouch.json and alce_dryrun_with_vouch.json")
-    ap.add_argument("--nli", choices=["minicheck", "vertex-pro", "vertex-flash"],
+    ap.add_argument("--nli", choices=["minicheck", "vertex-pro", "vertex-flash",
+                                       "true-t5-xxl", "true-t5-xxl-8bit"],
                     default="minicheck",
-                    help="NLI engine: minicheck (default, local MIT), vertex-pro (fidelity ref), vertex-flash (cheap)")
+                    help="NLI engine: minicheck (default, local MIT), vertex-pro "
+                         "(fidelity ref), vertex-flash (cheap), true-t5-xxl "
+                         "(ALCE paper canonical, bf16), true-t5-xxl-8bit "
+                         "(same but bitsandbytes 8bit for tighter VRAM)")
     ap.add_argument("--limit", type=int, default=None,
                     help="Score only first N samples per arm (for canonical-NLI subset checks)")
     ap.add_argument("--out", default=None, help="Output JSON path (default: alce_eval_results_<nli>.json)")
@@ -252,6 +291,10 @@ def main() -> int:
         nli = make_vertex_nli("gemini-3.1-pro-preview")
     elif args.nli == "vertex-flash":
         nli = make_vertex_nli("gemini-3.1-flash-lite")
+    elif args.nli == "true-t5-xxl":
+        nli = make_true_t5_nli(quantize_8bit=False)
+    elif args.nli == "true-t5-xxl-8bit":
+        nli = make_true_t5_nli(quantize_8bit=True)
     else:
         ap.error(f"unknown --nli {args.nli}")
 
