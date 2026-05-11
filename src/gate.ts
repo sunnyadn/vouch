@@ -1228,9 +1228,32 @@ export interface GateRunResult {
   message?: string;
 }
 
+function formatDeltaMessage(
+  delta: store.KbDelta,
+  unsupportedSkipped: number,
+  advisories: number,
+): string {
+  const total = delta.atomicSupported + delta.derivedHarvested + delta.dossiersSnapshotted + unsupportedSkipped + advisories;
+  if (total === 0) {
+    return "[vouch-gate] turn Δ: (nothing entered the KB this turn)\n";
+  }
+  const kbParts = [
+    `${delta.atomicSupported} ATOMIC supported (auto-grounded)`,
+    `${delta.derivedHarvested} derived (harvested)`,
+    `${delta.dossiersSnapshotted} dossier(s) snapshotted`,
+  ];
+  return (
+    `[vouch-gate] turn Δ: ${kbParts.join(" / ")} · ${unsupportedSkipped} unsupported attempt${unsupportedSkipped === 1 ? "" : "s"} skipped · ${advisories} advisory${advisories === 1 ? "" : "s"}\n`
+  );
+}
+
 export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
+  const gateStart = new Date().toISOString();
+  let turnAnchor = gateStart;
+
   if (opts.bypassEnv && process.env[opts.bypassEnv] === "1") {
-    return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
+    const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+    return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
   }
 
   let draft = opts.draft;
@@ -1244,7 +1267,8 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
   const transcriptAvailable = !!transcriptPath && existsSync(transcriptPath);
   if (!draft && transcriptPath) {
     if (!transcriptAvailable) {
-      return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
+      const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+      return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
     }
     try {
       const turn = await readLatestAssistantTurn(transcriptPath);
@@ -1252,16 +1276,20 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
         // Transcript-flush race: the just-finished turn is not yet in the
         // file (or no recent turn exists). Fail-open rather than block on
         // potentially-stale prior-turn content.
-        return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
+        const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+        return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
       }
       draft = turn.text;
+      if (turn.timestamp) turnAnchor = turn.timestamp;
     } catch {
-      return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
+      const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+      return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
     }
   }
 
   if (!draft?.trim()) {
-    return { verdict: { blocked: false, pairs: [] }, exitCode: 0 };
+    const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+    return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
   }
 
   const verdict = await runGate({
@@ -1270,20 +1298,28 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
     topK: opts.topK,
     sessionTranscriptPath: transcriptAvailable ? transcriptPath : undefined,
   });
+
+  const delta = store.getKbDelta(turnAnchor);
+  const unsupportedSkipped = verdict.pairs.filter(
+    (p) => p.stance === "ASSERT" && !p.grounded && !p.auto_grounded && (p.session_sources_checked ?? 0) > 0,
+  ).length;
+  const advisories = verdict.harvest?.flags.length ?? 0;
+  const deltaMsg = formatDeltaMessage(delta, unsupportedSkipped, advisories);
+
   if (!verdict.blocked) {
     const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
-    const msgs: string[] = [];
+    const msgs: string[] = [deltaMsg];
     if (autoGrounded.length) msgs.push(formatAutoGroundMessage(autoGrounded));
     if (verdict.harvest) {
       const hm = formatHarvestMessage(verdict.harvest);
       if (hm) msgs.push(hm);
     }
-    return { verdict, exitCode: 0, ...(msgs.length ? { message: msgs.join("") } : {}) };
+    return { verdict, exitCode: 0, message: msgs.join("") };
   }
   if (!opts.strict) {
-    return { verdict, exitCode: 0, message: formatBlockMessage(verdict, true) };
+    return { verdict, exitCode: 0, message: formatBlockMessage(verdict, true) + deltaMsg };
   }
-  return { verdict, exitCode: 2, message: formatBlockMessage(verdict, false) };
+  return { verdict, exitCode: 2, message: formatBlockMessage(verdict, false) + deltaMsg };
 }
 
 function formatAutoGroundMessage(autoGrounded: GroundedPair[]): string {

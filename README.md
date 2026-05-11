@@ -174,6 +174,16 @@ Before answering, ground each claim:
 Or hedge explicitly with "(unverified, from training memory)" near the claim.
 ```
 
+On **every** stop — block, pass, pass-with-harvest, or quiet-pass — the gate
+emits a one-line KB-delta summary on stderr so you know what changed this turn:
+
+```
+[vouch-gate] turn Δ: 2 ATOMIC supported (auto-grounded) / 4 derived (harvested) / 3 dossier(s) snapshotted · 1 unsupported attempt skipped · 0 advisories
+```
+
+If nothing entered the KB, it prints `(nothing entered the KB this turn)`.
+This is purely informational — exit codes and JSON output are unchanged.
+
 Before it blocks, the gate first checks whether the agent **already
 retrieved a supporting source this session** — a file read with `Read` or
 with `Bash` (`cat F`, `head F`, `tail F`, `< F` — the unambiguous
@@ -261,6 +271,9 @@ vouch claim "<text>" --type INFERENCE --depends-on 1,2 --topic <topic> --soft-sc
 # Browse
 vouch list-topics
 vouch list-claims --topic <X> --status supported
+vouch list-claims --author claude-skill --since 1d --newest-first
+vouch list-claims --depends-on 42 --claim-type INFERENCE
+vouch recent                      # recency-ordered summary + claim list (default --since 1d --limit 20)
 vouch chain <id>                  # walk dependency DAG
 
 # Self-correct (audit trail preserved)

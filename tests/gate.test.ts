@@ -572,6 +572,107 @@ describe("runGateCli", () => {
 });
 
 // ---------------------------------------------------------------------------
+// runGateCli — per-turn KB-delta summary (issue #29)
+// ---------------------------------------------------------------------------
+
+describe("runGateCli KB-delta summary", () => {
+  it("quiet pass → delta line says nothing entered the KB this turn", async () => {
+    const r = await gate.runGateCli({
+      draft: "Looking at the vault now. Nothing to ground here.",
+      model: "test",
+      strict: true,
+      bypassEnv: "VOUCH_GATE_BYPASS",
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.message).toContain("[vouch-gate] turn Δ:");
+    expect(r.message).toContain("nothing entered the KB this turn");
+  });
+
+  it("block → delta line is present alongside block message", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "Z", stance: "ASSERT", proposition: "Z has 100 features." }] },
+      } as any),
+    );
+    const r = await gate.runGateCli({
+      draft: "Z has 100 features.",
+      model: "test",
+      strict: true,
+      bypassEnv: "VOUCH_GATE_BYPASS",
+    });
+    expect(r.exitCode).toBe(2);
+    expect(r.message).toContain("[vouch-gate] turn Δ:");
+    expect(r.message).toContain("nothing entered the KB this turn");
+    expect(r.message).toContain("Detected ungrounded factual claim");
+  });
+
+  it("pass with harvest → delta line counts the harvested claims", async () => {
+    const slug = store.writeDossier({ source_url: "https://h-delta", source_type: "test", verbatim_content: "Premise text here." });
+    const c1 = store.recordClaim({ dossier_slug: slug, claim_text: "Premise about DeltaThing", score: 1, status: "supported", claim_type: "ATOMIC", topic: "delta", embedding: queryVec });
+    const r = await gate.runGateCli({
+      draft: `Premise about DeltaThing [verified: ${c1}]. Given the premise, DeltaThing is safer [inference-from: ${c1}].`,
+      model: "test",
+      strict: true,
+      bypassEnv: "VOUCH_GATE_BYPASS",
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.message).toContain("[vouch-gate] turn Δ:");
+    expect(r.message).toContain("1 derived (harvested)");
+    expect(r.message).toContain("0 dossier(s) snapshotted");
+  });
+
+  it("auto-ground + harvest → delta line counts both buckets", async () => {
+    // Seed an upstream claim for the harvest tag to cite (no embedding so it
+    // doesn't show up in hybrid search and short-circuit auto-grounding).
+    const upSlug = store.writeDossier({ source_url: "https://up", source_type: "test", verbatim_content: "DeltaCorp is a tech company." });
+    const upstream = store.recordClaim({ dossier_slug: upSlug, claim_text: "DeltaCorp is a tech company.", score: 1, status: "supported", claim_type: "ATOMIC" });
+
+    const path = join(tmp, "delta-ag.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/repo/DELTA.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "     1\tDeltaCorp has 42 employees." }] } }),
+        JSON.stringify({ type: "assistant", timestamp: nowIso, message: { content: [{ type: "text", text: `DeltaCorp has 42 employees. Therefore DeltaCorp is a tech company [inference-from: ${upstream}].` }] } }),
+      ].join("\n"),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "DeltaCorp", stance: "ASSERT", proposition: "DeltaCorp has 42 employees." }] } } as any),
+    );
+    // KB empty for this proposition → auto-grounding runs session NLI.
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.93, reason: "stated verbatim" } } as any));
+    const r = await gate.runGateCli({ transcriptPath: path, model: "vertex_ai/test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(0);
+    expect(r.message).toContain("[vouch-gate] turn Δ:");
+    expect(r.message).toContain("1 ATOMIC supported (auto-grounded)");
+    expect(r.message).toContain("1 derived (harvested)");
+    expect(r.message).toContain("1 dossier(s) snapshotted");
+  });
+
+  it("unsupported session source check → delta line counts the skipped attempt", async () => {
+    const path = join(tmp, "delta-skip.jsonl");
+    const nowIso = new Date().toISOString();
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/repo/SKIP.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "     1\tSkipCorp is a company." }] } }),
+        JSON.stringify({ type: "assistant", timestamp: nowIso, message: { content: [{ type: "text", text: "SkipCorp has 99 patents." }] } }),
+      ].join("\n"),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "SkipCorp", stance: "ASSERT", proposition: "SkipCorp has 99 patents." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: false, score: 0.1, reason: "no patent count" } } as any));
+    const r = await gate.runGateCli({ transcriptPath: path, model: "vertex_ai/test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(2);
+    expect(r.message).toContain("[vouch-gate] turn Δ:");
+    expect(r.message).toContain("1 unsupported attempt skipped");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // lastAssistantText — transcript JSONL parsing
 // ---------------------------------------------------------------------------
 

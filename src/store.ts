@@ -353,6 +353,35 @@ export function findClaimsByTextType(
   }));
 }
 
+export interface KbDelta {
+  atomicSupported: number;
+  derivedHarvested: number;
+  dossiersSnapshotted: number;
+}
+
+export function getKbDelta(turnAnchor: string): KbDelta {
+  const db = getDb();
+  const atomicSupported = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM claims
+       WHERE verified_at >= ? AND claim_type = 'ATOMIC' AND status = 'supported' AND verification = 'nli-session'`,
+    )
+    .get(turnAnchor) as { n: number };
+  const derivedHarvested = db
+    .prepare(`SELECT COUNT(*) AS n FROM claims WHERE verified_at >= ? AND author = 'gate-harvest'`)
+    .get(turnAnchor) as { n: number };
+  const dossiersSnapshotted = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM dossiers WHERE capture_date >= ? AND source_type LIKE 'session-%'`,
+    )
+    .get(turnAnchor) as { n: number };
+  return {
+    atomicSupported: atomicSupported.n,
+    derivedHarvested: derivedHarvested.n,
+    dossiersSnapshotted: dossiersSnapshotted.n,
+  };
+}
+
 export interface ListClaimsOpts {
   topic?: string;
   status?: string;
@@ -360,6 +389,11 @@ export interface ListClaimsOpts {
   claim_type?: string;
   contains?: string;
   limit?: number;
+  author?: string;
+  verification?: string;
+  depends_on_id?: number;
+  since?: string;
+  newestFirst?: boolean;
 }
 
 export function listClaims(opts: ListClaimsOpts = {}): Claim[] {
@@ -385,12 +419,75 @@ export function listClaims(opts: ListClaimsOpts = {}): Claim[] {
     where.push("claim_text LIKE ?");
     params.push(`%${opts.contains}%`);
   }
+  if (opts.author) {
+    where.push("author = ?");
+    params.push(opts.author);
+  }
+  if (opts.verification) {
+    where.push("verification = ?");
+    params.push(opts.verification);
+  }
+  if (opts.since) {
+    where.push("verified_at >= ?");
+    params.push(opts.since);
+  }
+  if (opts.depends_on_id != null) {
+    where.push(
+      "EXISTS (SELECT 1 FROM claim_dependencies cd WHERE cd.claim_id = claims.id AND cd.depends_on_id = ?)",
+    );
+    params.push(opts.depends_on_id);
+  }
   let sql =
     "SELECT id, dossier_slug, claim_text, source_passage, nli_score, status, verified_at, claim_type, topic, author, soft_score, attribution, superseded_by, supersede_reason, source_offset_start, source_offset_end, verification FROM claims";
   if (where.length) sql += " WHERE " + where.join(" AND ");
-  sql += " ORDER BY id DESC LIMIT ?";
+  sql += opts.newestFirst ? " ORDER BY verified_at DESC, id DESC LIMIT ?" : " ORDER BY id DESC LIMIT ?";
   params.push(opts.limit ?? 50);
   return getDb().prepare(sql).all(...params) as Claim[];
+}
+
+export interface RecentSummary {
+  total: number;
+  supported: number;
+  unsupported: number;
+  recorded: number;
+  dossiers: number;
+  authorBreakdown: Record<string, number>;
+}
+
+export function listRecentClaimsSummary(since: string): RecentSummary {
+  const db = getDb();
+  const statusRow = db
+    .prepare(
+      `SELECT
+        COUNT(*) AS total,
+        SUM(CASE WHEN status = 'supported' THEN 1 ELSE 0 END) AS supported,
+        SUM(CASE WHEN status = 'unsupported' THEN 1 ELSE 0 END) AS unsupported,
+        SUM(CASE WHEN status = 'recorded' THEN 1 ELSE 0 END) AS recorded
+       FROM claims WHERE verified_at >= ?`,
+    )
+    .get(since) as { total: number; supported: number; unsupported: number; recorded: number };
+  const dossierRow = db
+    .prepare(
+      `SELECT COUNT(DISTINCT dossier_slug) AS n FROM claims WHERE verified_at >= ? AND dossier_slug IS NOT NULL AND dossier_slug != ''`,
+    )
+    .get(since) as { n: number };
+  const authorRows = db
+    .prepare(
+      `SELECT author, COUNT(*) AS n FROM claims WHERE verified_at >= ? GROUP BY author`,
+    )
+    .all(since) as { author: string | null; n: number }[];
+  const authorBreakdown: Record<string, number> = {};
+  for (const row of authorRows) {
+    authorBreakdown[row.author ?? "(none)"] = row.n;
+  }
+  return {
+    total: statusRow.total,
+    supported: statusRow.supported,
+    unsupported: statusRow.unsupported,
+    recorded: statusRow.recorded,
+    dossiers: dossierRow.n,
+    authorBreakdown,
+  };
 }
 
 export function listTopics(): { topic: string; n_claims: number; n_supported: number }[] {

@@ -76,6 +76,8 @@ vouch claim "<text>" --type HYPOTHESIS --topic <topic> --soft-score 0.4
 # Read / correct the KB
 vouch list-topics
 vouch list-claims --topic <X> --status supported --contains <kw>
+vouch list-claims --author gate-harvest --since 1d --claim-type INFERENCE
+vouch recent                                         # recency summary + claim list (default --since 1d --limit 20)
 vouch get-claim <id>
 vouch chain <id>                                     # walk dependency DAG
 vouch list-dossiers

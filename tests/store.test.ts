@@ -166,6 +166,60 @@ describe("store", () => {
     expect(x.n_supported).toBe(1);
   });
 
+  it("listClaims filters by author, verification, depends_on, newest-first", () => {
+    const slug = store.writeDossier({ source_url: "https://f.test", source_type: "web-submitted", verbatim_content: "foo" });
+    const c1 = store.recordClaim({ dossier_slug: slug, claim_text: "alpha", score: 1, status: "supported", claim_type: "ATOMIC", author: "claude-skill", verification: "nli-quote" });
+    const c2 = store.recordClaim({ dossier_slug: slug, claim_text: "beta", score: 1, status: "supported", claim_type: "INFERENCE", author: "gate-harvest", verification: "tag-harvest", depends_on_ids: [c1] });
+    store.recordClaim({ dossier_slug: slug, claim_text: "gamma", score: 0, status: "unsupported", claim_type: "ATOMIC", author: "claude-skill", verification: "nli-quote" });
+
+    expect(store.listClaims({ author: "claude-skill" })).toHaveLength(2);
+    expect(store.listClaims({ verification: "tag-harvest" })).toHaveLength(1);
+    expect(store.listClaims({ depends_on_id: c1 })).toHaveLength(1);
+    expect(store.listClaims({ depends_on_id: c1 })[0]!.id).toBe(c2);
+
+    // newest-first orders by verified_at DESC, id DESC tie-breaker
+    const newestFirst = store.listClaims({ newestFirst: true, limit: 10 });
+    expect(newestFirst[0]!.claim_text).toBe("gamma");
+    expect(newestFirst[newestFirst.length - 1]!.claim_text).toBe("alpha");
+  });
+
+  it("listClaims filters by since", () => {
+    const slug = store.writeDossier({ source_url: "https://since.test", source_type: "web-submitted", verbatim_content: "x" });
+    const before = new Date().toISOString();
+    store.recordClaim({ dossier_slug: slug, claim_text: "old", score: 1, status: "supported" });
+    store.recordClaim({ dossier_slug: slug, claim_text: "new1", score: 1, status: "supported" });
+    store.recordClaim({ dossier_slug: slug, claim_text: "new2", score: 1, status: "supported" });
+    const results = store.listClaims({ since: before });
+    expect(results).toHaveLength(3);
+    expect(results.map((c) => c.claim_text).sort()).toEqual(["new1", "new2", "old"]);
+  });
+
+  it("listClaims composes multiple filters", () => {
+    const slug = store.writeDossier({ source_url: "https://comp.test", source_type: "web-submitted", verbatim_content: "x" });
+    store.recordClaim({ dossier_slug: slug, claim_text: "a", score: 1, status: "supported", claim_type: "ATOMIC", author: "claude-skill", verification: "nli-quote" });
+    store.recordClaim({ dossier_slug: slug, claim_text: "b", score: 1, status: "supported", claim_type: "INFERENCE", author: "gate-harvest", verification: "tag-harvest" });
+    store.recordClaim({ dossier_slug: slug, claim_text: "c", score: 1, status: "supported", claim_type: "ATOMIC", author: "gate-harvest", verification: "tag-harvest" });
+    const results = store.listClaims({ author: "gate-harvest", claim_type: "INFERENCE", verification: "tag-harvest" });
+    expect(results).toHaveLength(1);
+    expect(results[0]!.claim_text).toBe("b");
+  });
+
+  it("listRecentClaimsSummary returns correct aggregates", () => {
+    const slug = store.writeDossier({ source_url: "https://r.test", source_type: "web-submitted", verbatim_content: "x" });
+    const sinceIso = new Date().toISOString();
+    store.recordClaim({ dossier_slug: slug, claim_text: "s1", score: 1, status: "supported", author: "claude-skill" });
+    store.recordClaim({ dossier_slug: slug, claim_text: "s2", score: 0, status: "unsupported", author: "claude-skill" });
+    store.recordClaim({ dossier_slug: "", claim_text: "s3", score: null, status: "recorded", author: "gate-harvest" });
+    const summary = store.listRecentClaimsSummary(sinceIso);
+    expect(summary.total).toBe(3);
+    expect(summary.supported).toBe(1);
+    expect(summary.unsupported).toBe(1);
+    expect(summary.recorded).toBe(1);
+    expect(summary.dossiers).toBe(1);
+    expect(summary.authorBreakdown["claude-skill"]).toBe(2);
+    expect(summary.authorBreakdown["gate-harvest"]).toBe(1);
+  });
+
   it("hybrid search finds closest claim/dossier by cosine", () => {
     // Hand-craft normalized 4D embeddings: query is closer to dossier1
     const e = (xs: number[]) => {

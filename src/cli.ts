@@ -47,6 +47,24 @@ function fail(msg: string, code = 1): never {
   process.exit(code);
 }
 
+/** Parse `--since` values: relative (`1h`, `12h`, `1d`, `3d`, `1w`) or absolute
+ *  (`2026-05-11`, `2026-05-11T05:00`). Returns an ISO string. Throws on
+ *  unparseable input so the caller can fail loudly. */
+function parseSince(input: string): string {
+  const rel = input.match(/^(\d+)([hdw])$/i);
+  if (rel) {
+    const n = parseInt(rel[1]!, 10);
+    const unit = rel[2]!.toLowerCase();
+    const ms = unit === "h" ? n * 3600_000 : unit === "d" ? n * 86400_000 : n * 7 * 86400_000;
+    return new Date(Date.now() - ms).toISOString();
+  }
+  const abs = new Date(input);
+  if (Number.isNaN(abs.getTime())) {
+    throw new Error(`unrecognized --since value "${input}". Use relative (1h, 12h, 1d, 3d, 1w) or absolute (YYYY-MM-DD, YYYY-MM-DDTHH:mm).`);
+  }
+  return abs.toISOString();
+}
+
 // ---------- fetch ----------
 program
   .command("fetch <url>")
@@ -263,8 +281,21 @@ program
   .option("--dossier-slug <slug>")
   .option("--claim-type <type>")
   .option("--contains <substring>", "LIKE substring match on claim_text")
+  .option("--author <name>", "filter by author (e.g. claude-skill, gate-harvest)")
+  .option("--verification <kind>", "filter by verification tag (e.g. tag-harvest, nli-session)")
+  .option("--depends-on <id>", "claims whose dependency graph includes this claim id")
+  .option("--since <when>", "relative (1h, 12h, 1d, 3d, 1w) or absolute (2026-05-11, 2026-05-11T05:00)")
+  .option("--newest-first", "order by verified_at DESC instead of id DESC")
   .option("--limit <n>", "default 50", (v) => parseInt(v, 10), 50)
   .action((opts: any) => {
+    let sinceIso: string | undefined;
+    if (opts.since) {
+      try {
+        sinceIso = parseSince(opts.since);
+      } catch (e: any) {
+        fail(e.message);
+      }
+    }
     emit(
       store.listClaims({
         topic: opts.topic,
@@ -272,9 +303,35 @@ program
         dossier_slug: opts.dossierSlug,
         claim_type: opts.claimType,
         contains: opts.contains,
+        author: opts.author,
+        verification: opts.verification,
+        depends_on_id: opts.dependsOn ? parseInt(opts.dependsOn, 10) : undefined,
+        since: sinceIso,
+        newestFirst: opts.newestFirst,
         limit: opts.limit,
       }),
     );
+  });
+
+// ---------- recent ----------
+program
+  .command("recent")
+  .description("Recency-ordered view of claims with a summary header (convenience wrapper around list-claims --since --newest-first)")
+  .option("--since <when>", "default 1d; relative (1h, 12h, 1d, 3d, 1w) or absolute")
+  .option("--limit <n>", "default 20", (v) => parseInt(v, 10), 20)
+  .action((opts: any) => {
+    const sinceRaw = opts.since || "1d";
+    let sinceIso: string;
+    try {
+      sinceIso = parseSince(sinceRaw);
+    } catch (e: any) {
+      fail(e.message);
+    }
+    const claims = store.listClaims({ since: sinceIso, newestFirst: true, limit: opts.limit });
+    const summary = store.listRecentClaimsSummary(sinceIso);
+    const authorParts = Object.entries(summary.authorBreakdown).map(([a, n]) => `${a}=${n}`);
+    const header = `${summary.total} new (${summary.supported} supported / ${summary.unsupported} unsupported / ${summary.recorded} recorded-derived) across ${summary.dossiers} dossier(s) — author breakdown: ${authorParts.join(" ")}`;
+    emit({ summary: { ...summary, header }, claims });
   });
 
 // ---------- get-claim ----------
