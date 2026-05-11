@@ -1243,7 +1243,7 @@ function formatDeltaMessage(
     `${delta.dossiersSnapshotted} dossier(s) snapshotted`,
   ];
   return (
-    `[vouch-gate] turn Δ: ${kbParts.join(" / ")} · ${unsupportedSkipped} unsupported attempt${unsupportedSkipped === 1 ? "" : "s"} skipped · ${advisories} advisory${advisories === 1 ? "" : "s"}\n`
+    `[vouch-gate] turn Δ: ${kbParts.join(" / ")} · ${unsupportedSkipped} unsupported attempt${unsupportedSkipped === 1 ? "" : "s"} skipped · ${advisories} ${advisories === 1 ? "advisory" : "advisories"}\n`
   );
 }
 
