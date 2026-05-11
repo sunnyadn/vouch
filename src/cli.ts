@@ -121,8 +121,8 @@ program
   .option("--attribution <attribution>", "Override the dossier-derived attribution, e.g. 'Guo et al. 2024'")
   .option("--author <author>", "claude-skill | user-edit | etc", "claude-skill")
   .option("--dossier <slug>", "ATOMIC/QUOTATION: slug from prior `vouch fetch`")
-  .option("--source-quote <quote>", "ATOMIC/QUOTATION: verbatim 1-3 sentence quote (must appear in the dossier)")
-  .option("--auto-quote", "ATOMIC only: vouch picks the best supporting passage from the dossier instead of requiring --source-quote")
+  .option("--source-quote <quote>", "ATOMIC/QUOTATION: verbatim 1-3 sentence quote (must appear in the dossier). If omitted, vouch auto-selects the best supporting passage.")
+  .option("--auto-quote", "[deprecated] no-op; auto-selection is now the default when --source-quote is omitted")
   .option(
     "--sources <json>",
     'SYNTHESIS multi-source JSON: \'[{"dossier_slug":"...","quote":"..."}, ...]\' (≥2 entries; dossiers must be pre-fetched)',

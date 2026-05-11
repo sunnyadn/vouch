@@ -86,7 +86,11 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
     offsetStart = match.start;
     offsetEnd = match.end;
     matchType = match.matchType;
-  } else if (req.auto_quote) {
+  } else {
+    // No --source-quote → auto-select. The --auto-quote flag is retained as a
+    // no-op for backwards-compatible scripts. Friction reduction per #18: the
+    // common case (claim text already entailed by the dossier) should not
+    // require the caller to re-paste a contiguous slice of the dossier.
     const auto = await autoSelectQuote(req.text, content);
     if (!auto) {
       return errOut(
@@ -135,11 +139,6 @@ async function submitAtomic(req: SubmitClaimRequest): Promise<any> {
       matchType = passageMatch.matchType;
     }
     autoSelected = true;
-  } else {
-    return errOut(
-      `${req.claim_type} requires --source-quote (the verbatim 1–3 sentences supporting the claim).`,
-      "missing-source",
-    );
   }
 
   const result = await verifyClaim(req.text, req.dossier_slug, {
