@@ -227,7 +227,9 @@ each with the cited claim ids as `depends_on`. These are the agent's own
 deductions / paraphrases, not source-entailments, so there is no NLI step —
 they record with `status: recorded` and `verification: tag-harvest`, and are
 deduped on `(claim_text, claim_type, depends_on)` so re-emitting a draft after
-a block doesn't double-file. `[verified: <id>]` never files anything new; a
+a block doesn't double-file. Tags that appear inside code fences, backticks,
+or blockquotes are *not* harvested — they are prose *about* the syntax, not
+assertions using it. `[verified: <id>]` never files anything new; a
 dangling or non-`supported` id is flagged. The agent no longer runs
 `vouch claim --type INFERENCE …` by hand for tagged segments — tagging is
 enough; the bookkeeping is the hook's job.

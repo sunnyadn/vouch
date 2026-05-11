@@ -37,6 +37,8 @@ vouch sits behind them as a Stop-hook that does two passes on every draft:
    / `[interpretation:]` / `[hypothesis]` segment is filed as the matching
    claim type with the cited ids as `depends_on`. You do NOT run `vouch claim
    --type INFERENCE …` by hand for these — tag and write self-contained.
+   Tags inside code fences / backticks / blockquotes are ignored (they are
+   prose *about* the syntax, not assertions using it).
 
 `vouch search` is for **reusing the KB** ("do I already have a dossier/claim?").
 Use your native `WebSearch` to discover *new* URLs; settle on one with

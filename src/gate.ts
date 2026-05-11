@@ -792,15 +792,88 @@ function cleanSegment(s: string): string {
   return t.trim();
 }
 
+interface CharRange { start: number; end: number; }
+
+/** Compute character ranges that should be skipped during harvest: inline code,
+ *  code fences, blockquotes, and indented code blocks. */
+export function computeProtectedRanges(draft: string): CharRange[] {
+  const ranges: CharRange[] = [];
+  const lines = draft.split("\n");
+  let offset = 0;
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i]!;
+    const lineEnd = offset + line.length;
+    const fenceMatch = line.match(/^(```+|~~~+)/);
+    if (fenceMatch) {
+      const fenceLen = fenceMatch[1]!.length;
+      const fenceStart = offset;
+      i++;
+      offset = lineEnd + 1;
+      while (i < lines.length) {
+        const closeLine = lines[i]!;
+        const closeMatch = closeLine.match(/^(```+|~~~+)/);
+        if (closeMatch && closeMatch[1]!.length >= fenceLen) {
+          ranges.push({ start: fenceStart, end: offset + closeLine.length });
+          i++;
+          offset += closeLine.length + 1;
+          break;
+        }
+        offset += closeLine.length + 1;
+        i++;
+      }
+      continue;
+    }
+    if (line.startsWith("> ")) {
+      ranges.push({ start: offset, end: lineEnd });
+    }
+    if (/^\s{4,}/.test(line) && !/^\s{4,}[-*•\d]/.test(line)) {
+      ranges.push({ start: offset, end: lineEnd });
+    }
+    // Inline code spans on this line
+    let j = 0;
+    while (j < line.length) {
+      if (line[j] !== "`") { j++; continue; }
+      let runLen = 0;
+      const openStart = j;
+      while (j < line.length && line[j] === "`") { runLen++; j++; }
+      let k = j;
+      let found = false;
+      while (k < line.length) {
+        if (line[k] !== "`") { k++; continue; }
+        let closeLen = 0;
+        while (k < line.length && line[k] === "`") { closeLen++; k++; }
+        if (closeLen === runLen) {
+          ranges.push({ start: offset + openStart, end: offset + k });
+          found = true;
+          break;
+        }
+      }
+      if (!found) break;
+      j = k;
+    }
+    i++;
+    offset = lineEnd + 1;
+  }
+  return ranges;
+}
+
 /** Parse `[verified|inference-from|synthesis-of|interpretation|hypothesis ...]`
- *  tags out of a draft, pairing each with the verbatim segment it annotates. */
-export function parseDerivedTags(draft: string): DerivedTag[] {
+ *  tags out of a draft, pairing each with the verbatim segment it annotates.
+ *  `skipRanges` excludes matches whose start falls inside a code/quote region. */
+export function parseDerivedTags(draft: string, skipRanges?: CharRange[]): DerivedTag[] {
   const out: DerivedTag[] = [];
   if (!draft) return out;
   DERIVED_TAG_RE.lastIndex = 0;
   let prevEnd = 0;
   let m: RegExpExecArray | null;
   while ((m = DERIVED_TAG_RE.exec(draft))) {
+    const matchStart = m.index;
+    const matchEnd = matchStart + m[0].length;
+    if (skipRanges?.some((r) => matchStart >= r.start && matchStart < r.end)) {
+      prevEnd = matchEnd;
+      continue;
+    }
     const raw = m[1]!.toLowerCase();
     const kind = (TAG_ALIAS[raw] ?? raw) as DerivedTagKind;
     const args = m[2] ?? "";
@@ -814,9 +887,9 @@ export function parseDerivedTags(draft: string): DerivedTag[] {
       idText = args.slice(0, si) + args.slice(si + scoreM[0].length);
     }
     const ids = (idText.match(/\d+/g) ?? []).map((n) => parseInt(n, 10));
-    const segment = cleanSegment(draft.slice(prevEnd, m.index));
+    const segment = cleanSegment(draft.slice(prevEnd, matchStart));
     out.push({ kind, ids, softScore, segment });
-    prevEnd = m.index + m[0].length;
+    prevEnd = matchEnd;
   }
   return out;
 }
@@ -831,8 +904,9 @@ export async function harvestDerivedClaims(
 ): Promise<HarvestResult> {
   const result: HarvestResult = { filed: [], skipped: [], flags: [] };
   const attribution = opts.attribution ?? "claude-skill";
+  const skipRanges = computeProtectedRanges(draft);
 
-  for (const tag of parseDerivedTags(draft)) {
+  for (const tag of parseDerivedTags(draft, skipRanges)) {
     if (result.filed.length >= HARVEST_MAX) {
       result.flags.push(`harvest cap (${HARVEST_MAX}) reached — remaining tagged segments not filed`);
       break;
@@ -884,6 +958,10 @@ export async function harvestDerivedClaims(
     const text = tag.segment;
     if (!text) {
       result.flags.push(`[${tag.kind}] tag has no annotated text — not filed`);
+      continue;
+    }
+    if (!/[A-Za-z\p{L}]/u.test(text)) {
+      result.flags.push(`[${tag.kind}] segment has no alphabetic content — not filed`);
       continue;
     }
     if (text.length > SEGMENT_LONG_CHARS) {

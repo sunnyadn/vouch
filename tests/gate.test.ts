@@ -1502,6 +1502,59 @@ describe("parseDerivedTags", () => {
   it("returns [] for untagged prose", () => {
     expect(gate.parseDerivedTags("Just a normal sentence with no tags at all.")).toEqual([]);
   });
+
+  it("skipRanges excludes matches inside protected regions", () => {
+    const draft = "Skip this [inference-from: 1] but keep [inference-from: 2].";
+    const skipRanges = [{ start: 0, end: 25 }];
+    const tags = gate.parseDerivedTags(draft, skipRanges);
+    expect(tags.length).toBe(1);
+    expect(tags[0]!.ids).toEqual([2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeProtectedRanges (issue #30)
+// ---------------------------------------------------------------------------
+
+describe("computeProtectedRanges", () => {
+  it("protects inline code spans", () => {
+    const ranges = gate.computeProtectedRanges("Some `inline code` here");
+    expect(ranges.length).toBe(1);
+    expect(ranges[0]!).toEqual({ start: 5, end: 18 });
+  });
+
+  it("protects triple-backtick code fences", () => {
+    const draft = "before\n```js\nconst x = 1;\n```\nafter";
+    const ranges = gate.computeProtectedRanges(draft);
+    expect(ranges.length).toBe(1);
+    expect(ranges[0]!.start).toBe(7);
+    expect(ranges[0]!.end).toBe(29);
+  });
+
+  it("protects tilde code fences", () => {
+    const draft = "before\n~~~\nconst x = 1;\n~~~\nafter";
+    const ranges = gate.computeProtectedRanges(draft);
+    expect(ranges.length).toBe(1);
+    expect(ranges[0]!.start).toBe(7);
+    expect(ranges[0]!.end).toBe(27);
+  });
+
+  it("protects blockquote lines", () => {
+    const ranges = gate.computeProtectedRanges("> quoted [inference-from: 1]");
+    expect(ranges.some((r) => r.start === 0 && r.end === 28)).toBe(true);
+  });
+
+  it("protects 4-space-indented lines", () => {
+    const ranges = gate.computeProtectedRanges("    code [hypothesis]");
+    expect(ranges.some((r) => r.start === 0 && r.end === 21)).toBe(true);
+  });
+
+  it("does not protect list-continuation indents (heuristic)", () => {
+    // List items themselves start with non-space markers; we only indent
+    // lines that begin with 4+ spaces and no marker.
+    const ranges = gate.computeProtectedRanges("    - list item [inference-from: 1]");
+    expect(ranges.length).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1610,6 +1663,57 @@ describe("runGate tagged-derived-claim harvest", () => {
     const v = await gate.runGate({ draft: "Looking at the vault now. Nothing to ground here.", model: "t" });
     expect(v.blocked).toBe(false);
     expect(v.harvest).toBeUndefined();
+  });
+
+  it("does not harvest tags inside inline-code backticks", async () => {
+    const c1 = atomic("Upstream claim");
+    const v = await gate.runGate({
+      draft: `Here is \`[inference-from: ${c1}]\` in code. Nothing else.`,
+      model: "t",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest).toBeUndefined();
+  });
+
+  it("does not harvest tags inside triple-backtick code fences", async () => {
+    const c1 = atomic("Upstream claim");
+    const v = await gate.runGate({
+      draft: `Example:\n\`\`\`\n[inference-from: ${c1}]\n\`\`\`\nDone.`,
+      model: "t",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest).toBeUndefined();
+  });
+
+  it("does not harvest tags inside blockquote lines", async () => {
+    const c1 = atomic("Upstream claim");
+    const v = await gate.runGate({
+      draft: `> Quote with [inference-from: ${c1}].\nReal text here.`,
+      model: "t",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest).toBeUndefined();
+  });
+
+  it("harvests only the plain-prose tag when the same tag also appears inside backticks", async () => {
+    const c1 = atomic("Upstream claim");
+    const v = await gate.runGate({
+      draft: `Inline code \`[inference-from: ${c1}]\` shows syntax. Plain prose says X [inference-from: ${c1}].`,
+      model: "t",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest!.filed.length).toBe(1);
+    expect(v.harvest!.filed[0]!.claim_text).toBe("Plain prose says X");
+  });
+
+  it("does not file a harvest when the segment is punctuation-only (alphabetic guard)", async () => {
+    const v = await gate.runGate({
+      draft: "` / ` [hypothesis]",
+      model: "t",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.harvest!.filed.length).toBe(0);
+    expect(v.harvest!.flags.some((f) => f.includes("no alphabetic content"))).toBe(true);
   });
 });
 
