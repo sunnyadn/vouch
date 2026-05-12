@@ -1750,3 +1750,139 @@ describe("runGateCli harvest integration", () => {
     expect(filedClaim.depends_on[0]!.depends_on_id).toBe(c1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Agent-action WORKSPACE carve-out (issue #33)
+// ---------------------------------------------------------------------------
+
+describe("agent-action WORKSPACE carve-out", () => {
+  it("'I closed GitHub issue #32.' → extractor returns no pairs → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [] } } as any),
+    );
+    const v = await gate.runGate({
+      draft: "I closed GitHub issue #32.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(0);
+  });
+
+  it("'I pushed commit 5d12335 to sunnyadn/vouch.' → extractor returns no pairs → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [] } } as any),
+    );
+    const v = await gate.runGate({
+      draft: "I pushed commit 5d12335 to sunnyadn/vouch.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(0);
+  });
+
+  it("'I ran `bun test` and it passed 223/0.' → extractor returns no pairs → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [] } } as any),
+    );
+    const v = await gate.runGate({
+      draft: "I ran `bun test` and it passed 223/0.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(0);
+  });
+
+  it("'I filed Linear issue SUN-73 and bumped it to High.' → extractor returns no pairs → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [] } } as any),
+    );
+    const v = await gate.runGate({
+      draft: "I filed Linear issue SUN-73 and bumped it to High.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(0);
+  });
+
+  it("'I dispatched the task to kimi-task and audited the result.' → extractor returns no pairs → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [] } } as any),
+    );
+    const v = await gate.runGate({
+      draft: "I dispatched the task to kimi-task and audited the result.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Agent-action counter-tests — recall not regressed (issue #33)
+// ---------------------------------------------------------------------------
+
+describe("agent-action counter-tests", () => {
+  it("'GitHub was acquired by Microsoft in 2018.' → still extracts a triple → blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "GitHub", stance: "ASSERT", proposition: "GitHub was acquired by Microsoft in 2018." }] },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "GitHub was acquired by Microsoft in 2018.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.entity).toBe("GitHub");
+    expect(v.pairs[0]!.stance).toBe("ASSERT");
+  });
+
+  it("'The `gh` CLI's `issue close` command accepts a `--reason` flag.' → still extracts a triple → blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "gh CLI", stance: "ASSERT", proposition: "The gh CLI's issue close command accepts a --reason flag." }] },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "The `gh` CLI's `issue close` command accepts a `--reason` flag.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.entity).toBe("gh CLI");
+    expect(v.pairs[0]!.stance).toBe("ASSERT");
+  });
+
+  it("'fastcmprsk supports SCAD and MCP penalties.' → still extracts a triple → blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "fastcmprsk", stance: "ASSERT", proposition: "fastcmprsk supports SCAD and MCP penalties." }] },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "fastcmprsk supports SCAD and MCP penalties.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.entity).toBe("fastcmprsk");
+    expect(v.pairs[0]!.stance).toBe("ASSERT");
+  });
+
+  it("'scikit-survival's `CoxnetSurvivalAnalysis` has no `sample_weight` parameter.' → still extracts a triple → blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "CoxnetSurvivalAnalysis", stance: "ASSERT", proposition: "scikit-survival's CoxnetSurvivalAnalysis has no sample_weight parameter." }] },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "scikit-survival's `CoxnetSurvivalAnalysis` has no `sample_weight` parameter.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.entity).toBe("CoxnetSurvivalAnalysis");
+    expect(v.pairs[0]!.stance).toBe("ASSERT");
+  });
+});
