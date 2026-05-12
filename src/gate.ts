@@ -71,7 +71,7 @@ import { z } from "zod";
 import { DB_PATH, MAX_SOURCE_CHARS } from "./config.ts";
 import { getLanguageModel } from "./providers.ts";
 import { embedOne } from "./embedder.ts";
-import { classifyError, verifyClaimAgainstSource } from "./verifier.ts";
+import { classifyError, verifyClaimAgainstSource, verifyClaimsBatch } from "./verifier.ts";
 import * as store from "./store.ts";
 import type { ClaimType } from "./types.ts";
 
@@ -310,6 +310,148 @@ export async function checkGrounding(
       ? `${hits.length} candidate(s) found but none entailed the proposition`
       : "no candidate claim in KB",
   };
+}
+
+/** Run up to `limit` async tasks concurrently, returning results in order. */
+async function concurrencyLimit<T>(tasks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let index = 0;
+  async function worker() {
+    while (index < tasks.length) {
+      const i = index++;
+      results[i] = await tasks[i]!();
+    }
+  }
+  const workers = Array(Math.min(limit, tasks.length))
+    .fill(0)
+    .map(worker);
+  await Promise.all(workers);
+  return results;
+}
+
+interface NliCandidate {
+  pairIdx: number;
+  claimId: number;
+  proposition: string;
+  source: string;
+}
+
+/** Batch-capable grounding for multiple ASSERT propositions.
+ *
+ *  Pipeline:
+ *    1. Parallel embed+search+lexical-fast-path for all propositions.
+ *    2. Collect candidates that need NLI into a flat list.
+ *    3. Run one (or a few token-budget-sized) `verifyClaimsBatch` call(s).
+ *    4. Map results back. A proposition is grounded if ANY candidate is supported.
+ *
+ *  Abort handling: checks `abortRef.aborted` before the NLI batch. If already
+ *  aborted, returns existing lexical matches and leaves remaining propositions
+ *  ungrounded — caller sets `incomplete`.
+ */
+async function batchGroundAssertions(
+  pairs: ExtractedPair[],
+  topK: number,
+  abortRef?: { aborted: boolean },
+): Promise<{ results: GroundedPair[]; incomplete: boolean }> {
+  const results: GroundedPair[] = pairs.map((p) => ({
+    ...p,
+    grounded: false,
+    matched_claim_id: null,
+    reason: "no candidate claim in KB",
+  }));
+  if (!pairs.length) return { results, incomplete: false };
+
+  const candidates: NliCandidate[] = [];
+
+  // Phase 1: parallel embed + search + lexical fast-path
+  await Promise.all(
+    pairs.map(async (pair, idx) => {
+      let queryEmb: Float32Array;
+      try {
+        queryEmb = await embedOne(`${pair.entity}. ${pair.proposition}`);
+      } catch (e: any) {
+        results[idx]!.reason = `embed-failed: ${(e?.message || String(e)).slice(0, 200)}`;
+        return;
+      }
+
+      const hits = store.searchHybrid(queryEmb, topK).filter((h) => h.kind === "claim");
+      const propTokens = tokenSet(pair.proposition);
+
+      for (const h of hits) {
+        if (h.id == null) continue;
+        const claim = store.getClaim(h.id);
+        if (!claim) continue;
+        if (claim.status !== "supported") continue;
+        if (claim.superseded_by != null) continue;
+
+        if (jaccard(propTokens, tokenSet(claim.claim_text)) >= 0.8) {
+          results[idx] = {
+            ...pair,
+            grounded: true,
+            matched_claim_id: claim.id,
+            reason: `restates supported claim ${claim.id} (lexical overlap)`,
+          };
+          return; // pair resolved — no NLI needed
+        }
+
+        let quote = "";
+        if (claim.dossier_slug) {
+          const dossier = store.getDossier(claim.dossier_slug);
+          if (dossier) {
+            const content = dossier.content || "";
+            if (
+              claim.source_offset_start != null &&
+              claim.source_offset_end != null &&
+              claim.source_offset_end > claim.source_offset_start
+            ) {
+              quote = content.slice(claim.source_offset_start, claim.source_offset_end);
+            }
+          }
+        }
+
+        const source = quote ? `${claim.claim_text}\n\n${quote}` : claim.claim_text;
+        candidates.push({
+          pairIdx: idx,
+          claimId: claim.id,
+          proposition: pair.proposition,
+          source,
+        });
+      }
+
+      if (hits.length && !results[idx]!.grounded) {
+        results[idx]!.reason = `${hits.length} candidate(s) found but none entailed the proposition`;
+      }
+    }),
+  );
+
+  // Phase 2: batched NLI for remaining candidates
+  if (candidates.length && !abortRef?.aborted) {
+    const batchItems = candidates.map((c) => ({
+      claim_text: c.proposition,
+      source_passage: c.source,
+    }));
+
+    try {
+      const batchResults = await verifyClaimsBatch(batchItems);
+      for (let i = 0; i < candidates.length; i++) {
+        const c = candidates[i]!;
+        const r = batchResults[i]!;
+        if (r.status === "supported" && !results[c.pairIdx]!.grounded) {
+          results[c.pairIdx] = {
+            ...pairs[c.pairIdx]!,
+            grounded: true,
+            matched_claim_id: c.claimId,
+            reason: `entailed by claim ${c.claimId} (score=${r.score.toFixed(2)})`,
+          };
+        }
+      }
+    } catch (e) {
+      // Transient/system error on the batch — re-throw so runGate can fail-open.
+      throw e;
+    }
+  }
+
+  return { results, incomplete: !!abortRef?.aborted };
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,28 +1208,39 @@ export async function runGate(opts: {
   if (extracted === null) {
     classifierError = "extractor failed";
   } else if (extracted.length) {
-    const checked: GroundedPair[] = [];
+    const checked: GroundedPair[] = new Array(extracted.length);
     let errored = false;
-    for (const p of extracted) {
-      if (opts.abortRef?.aborted) {
-        incomplete = true;
-        break;
-      }
+
+    // Separate ASSERT from non-ASSERT to preserve output ordering.
+    const assertIndices: number[] = [];
+    for (let i = 0; i < extracted.length; i++) {
+      const p = extracted[i]!;
       if (p.stance !== "ASSERT") {
-        checked.push({
+        checked[i] = {
           ...p,
           grounded: true,
           matched_claim_id: null,
           reason: `stance=${p.stance} — no fact to ground`,
-        });
-        continue;
+        };
+      } else {
+        assertIndices.push(i);
       }
+    }
+
+    if (opts.abortRef?.aborted) {
+      incomplete = true;
+    } else if (assertIndices.length) {
       try {
-        checked.push(await checkGrounding(p, opts.topK));
+        const assertPairs = assertIndices.map((i) => extracted[i]!);
+        const { results: groundedAssertions, incomplete: batchIncomplete } =
+          await batchGroundAssertions(assertPairs, opts.topK ?? 3, opts.abortRef);
+        if (batchIncomplete) incomplete = true;
+        for (let j = 0; j < assertIndices.length; j++) {
+          checked[assertIndices[j]!] = groundedAssertions[j]!;
+        }
       } catch (e) {
         classifierError = classifierErrorMessage(e);
         errored = true;
-        break;
       }
     }
 
@@ -1103,30 +1256,40 @@ export async function runGate(opts: {
           sources = [];
         }
         if (sources.length) {
-          for (const i of ungroundedIdx) {
+          const tasks = ungroundedIdx.map((i) => async () => {
             if (opts.abortRef?.aborted) {
-              incomplete = true;
-              break;
+              return { aborted: true as const, idx: i };
             }
             try {
               const res = await autoGroundPair(checked[i]!, sources);
-              checked[i] = res.grounded
-                ? res.pair
-                : { ...checked[i]!, session_sources_checked: res.checked };
+              return { res, idx: i };
             } catch (e) {
-              classifierError = classifierErrorMessage(e);
+              return { error: e as unknown, idx: i };
+            }
+          });
+          const agResults = await concurrencyLimit(tasks, 6);
+          for (const r of agResults) {
+            if ("aborted" in r) {
+              incomplete = true;
+              continue;
+            }
+            if ("error" in r) {
+              classifierError = classifierErrorMessage(r.error);
               errored = true;
               break;
             }
+            checked[r.idx] = r.res.grounded
+              ? r.res.pair
+              : { ...checked[r.idx]!, session_sources_checked: r.res.checked };
           }
         }
       }
     }
 
-    pairs = checked;
+    pairs = checked.filter((p): p is GroundedPair => !!p);
     // A verifier error fails the gate OPEN (blocked stays false) — a transient
     // system fault carries no signal about the (claim, source) pair.
-    if (!errored && !incomplete) blocked = checked.some((p) => !p.grounded);
+    if (!errored && !incomplete) blocked = pairs.some((p) => !p.grounded);
   }
   // extracted.length === 0 → nothing to ground → blocked stays false.
 

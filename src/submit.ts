@@ -387,20 +387,21 @@ export async function submitClaimBatch(items: BatchSubmissionItem[]): Promise<an
 
   const results = await verifyClaimsBatch(batchItems);
 
-  // Step 3: persist each claim
+  // Step 3: embed all claim texts in one call
+  let allEmbeddings: Float32Array[] = [];
+  try {
+    allEmbeddings = await embedBatch(validated.map((v) => v.text));
+  } catch {
+    // Embedding failure is non-fatal — claims still record, just won't be searchable
+  }
+
+  // Step 4: persist each claim
   const out: any[] = [];
   for (let i = 0; i < validated.length; i++) {
     const v = validated[i]!;
     const r = results[i]!;
     const attribution = v.attribution || v.dossier?.author_attribution || null;
-
-    let claimEmbedding: Float32Array | null = null;
-    try {
-      const embs = await embedBatch([v.text]);
-      claimEmbedding = embs[0] || null;
-    } catch {
-      // Embedding failure is non-fatal
-    }
+    const claimEmbedding = allEmbeddings[i] || null;
 
     const cid = store.recordClaim({
       dossier_slug: v.dossier_slug,

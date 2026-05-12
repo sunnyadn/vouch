@@ -248,6 +248,110 @@ describe("runGate grounding", () => {
     expect(v.blocked).toBe(true);
     expect(v.pairs[0]!.grounded).toBe(false);
   });
+
+  it("batched grounding makes ≤ 1 verifier call for a proposition with 3 candidates", async () => {
+    // Seed 3 supported claims with wording different enough to miss the lexical
+    // fast-path, so each falls through to NLI.
+    for (let i = 0; i < 3; i++) {
+      const slug = store.writeDossier({
+        source_url: `https://example.com/${i}`,
+        source_type: "test",
+        verbatim_content: `X possesses ${i + 1} features.`,
+      });
+      store.recordClaim({
+        dossier_slug: slug,
+        claim_text: `X possesses ${i + 1} features.`,
+        score: 0.9,
+        status: "supported",
+        claim_type: "ATOMIC",
+        embedding: queryVec,
+      });
+    }
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [{ entity: "X", stance: "ASSERT", proposition: "X has 2 features." }],
+        },
+      } as any),
+    );
+
+    // One batch verdict call for all 3 candidates
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: false, score: 0.1, reason: "no" },
+            { idx: 1, supported: true, score: 0.95, reason: "yes" },
+            { idx: 2, supported: false, score: 0.1, reason: "no" },
+          ],
+        },
+      } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "X has 2 features.",
+      model: "vertex_ai/test",
+      topK: 3,
+    });
+
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    // 1 extractor + 1 batch verifier = 2 calls total
+    expect(generateObjectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("batched path produces the same grounded/ungrounded set as sequential for a fixed scenario", async () => {
+    const slug = store.writeDossier({
+      source_url: "https://a",
+      source_type: "test",
+      verbatim_content: "Alpha possesses exactly ten distinct features.",
+    });
+    store.recordClaim({
+      dossier_slug: slug,
+      claim_text: "Alpha possesses exactly ten distinct features.",
+      score: 0.9,
+      status: "supported",
+      claim_type: "ATOMIC",
+      embedding: queryVec,
+    });
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [{ entity: "Alpha", stance: "ASSERT", proposition: "Alpha has 10 features." }],
+        },
+      } as any),
+    );
+
+    // Single candidate falls back to verifyClaimAgainstSource (not batch schema)
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { supported: true, score: 0.95, reason: "matches" },
+      } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "Alpha has 10 features.",
+      model: "vertex_ai/test",
+      topK: 3,
+    });
+
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+
+    // Cross-check with the sequential helper (queue a fresh mock for it)
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { supported: true, score: 0.95, reason: "matches" },
+      } as any),
+    );
+    const seq = await gate.checkGrounding(
+      { entity: "Alpha", stance: "ASSERT", proposition: "Alpha has 10 features." },
+      3,
+    );
+    expect(seq.grounded).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

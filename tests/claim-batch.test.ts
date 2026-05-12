@@ -118,7 +118,7 @@ describe("claim-batch error paths", () => {
     const { stdout, stderr, exitCode } = await run(["claim-batch", jsonlPath]);
     expect(exitCode).toBe(1);
     const out = stdout || stderr;
-    expect(out).toContain("claim-batch only supports ATOMIC and QUOTATION");
+    expect(out).toContain("claim-batch only supports ATOMIC");
   });
 
   it("invalid json → error", async () => {

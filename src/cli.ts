@@ -519,7 +519,6 @@ program
 
     const items: Array<{
       text: string;
-      claim_type: string;
       dossier_slug: string;
       source_quote: string;
       topic?: string;
@@ -538,12 +537,11 @@ program
       if (!parsed.dossier_slug) fail(`line ${i + 1}: missing "dossier_slug"`);
       if (!parsed.source_quote?.trim()) fail(`line ${i + 1}: missing "source_quote"`);
       const ct = parsed.claim_type || "ATOMIC";
-      if (ct !== "ATOMIC" && ct !== "QUOTATION") {
-        fail(`line ${i + 1}: claim-batch only supports ATOMIC and QUOTATION, got "${ct}"`);
+      if (ct !== "ATOMIC") {
+        fail(`line ${i + 1}: claim-batch only supports ATOMIC, got "${ct}"`);
       }
       items.push({
         text: parsed.text,
-        claim_type: ct,
         dossier_slug: parsed.dossier_slug,
         source_quote: parsed.source_quote,
         topic: parsed.topic,
@@ -887,7 +885,7 @@ program
   .option("--advisory", "exit 0 + stderr warning only; never block")
   .option("--bypass-env <name>", "env var that disables the gate when set to '1'", "VOUCH_GATE_BYPASS")
   .option("--model <id>", "extractor model (LiteLLM-style)", DEFAULT_GATE_MODEL)
-  .option("--top-k <n>", "candidate claims fetched per proposition", (v) => parseInt(v, 10), 8)
+  .option("--top-k <n>", "candidate claims fetched per proposition (gate defaults to 3 for latency; override with care)", (v) => parseInt(v, 10), 3)
   .action(async (opts: any) => {
     let transcriptPath: string | undefined = opts.transcriptPath;
     let hookPayload: any | undefined;
