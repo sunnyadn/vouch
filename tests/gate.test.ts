@@ -1,6 +1,6 @@
 /** Gate logic tests — mocks LLM + embedder, uses real SQLite store. */
 import { afterEach, beforeAll, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1884,5 +1884,99 @@ describe("agent-action counter-tests", () => {
     expect(v.pairs.length).toBe(1);
     expect(v.pairs[0]!.entity).toBe("CoxnetSurvivalAnalysis");
     expect(v.pairs[0]!.stance).toBe("ASSERT");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGateCli — run-audit log (fix C)
+// ---------------------------------------------------------------------------
+
+describe("runGateCli run-audit log", () => {
+  it("writes exactly one JSONL line with expected keys and sane verdict", async () => {
+    const logPath = join(tmp, "audit.log");
+    const prevLog = process.env.VOUCH_GATE_LOG;
+    process.env.VOUCH_GATE_LOG = logPath;
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "X", stance: "ASSERT", proposition: "X has 100 features." }] },
+      } as any),
+    );
+
+    try {
+      const r = await gate.runGateCli({
+        draft: "X has 100 features.",
+        model: "test",
+        strict: true,
+        bypassEnv: "VOUCH_GATE_BYPASS",
+      });
+
+      expect(r.exitCode).toBe(2);
+
+      const logContent = readFileSync(logPath, "utf8").trim();
+      const lines = logContent.split("\n");
+      expect(lines.length).toBe(1);
+
+      const entry = JSON.parse(lines[0]!);
+      expect(entry.ts).toBeDefined();
+      expect(entry.pid).toBe(process.pid);
+      expect(entry.draft_sha256).toBeDefined();
+      expect(entry.draft_sha256.length).toBe(12);
+      expect(entry.n_propositions).toBe(1);
+      expect(entry.n_checked).toBe(1);
+      expect(entry.n_grounded).toBe(0);
+      expect(entry.n_ungrounded).toBe(1);
+      expect(entry.verdict).toBe("block");
+      expect(entry.wall_ms).toBeGreaterThanOrEqual(0);
+      expect(entry.exit_code).toBe(2);
+      expect(entry.mode).toBe("strict");
+    } finally {
+      process.env.VOUCH_GATE_LOG = prevLog;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGateCli — watchdog / budget exceeded (fix B)
+// ---------------------------------------------------------------------------
+
+describe("runGateCli watchdog", () => {
+  it("budget exceeded → incomplete verdict + stderr warning + exit 0", async () => {
+    const prevBudget = process.env.VOUCH_GATE_BUDGET_MS;
+    process.env.VOUCH_GATE_BUDGET_MS = "1";
+    const logPath = join(tmp, "watchdog.log");
+    const prevLog = process.env.VOUCH_GATE_LOG;
+    process.env.VOUCH_GATE_LOG = logPath;
+
+    // Delay the extractor so the 1 ms budget fires before it resolves.
+    generateObjectMock.mockImplementationOnce(() =>
+      new Promise((resolve) =>
+        setTimeout(() => resolve({ object: { pairs: [{ entity: "X", stance: "ASSERT", proposition: "X has 100 features." }] } }), 20),
+      ),
+    );
+
+    try {
+      const r = await gate.runGateCli({
+        draft: "X has 100 features.",
+        model: "test",
+        strict: true,
+        bypassEnv: "VOUCH_GATE_BYPASS",
+      });
+
+      expect(r.exitCode).toBe(0); // default failmode=warn
+      expect(r.incomplete).toBe(true);
+
+      const logLines = readFileSync(logPath, "utf8").trim().split("\n");
+      expect(logLines.length).toBe(1);
+      const entry = JSON.parse(logLines[0]!);
+      expect(entry.verdict).toBe("incomplete");
+      expect(entry.n_propositions).toBe(1);
+      expect(entry.n_checked).toBe(0); // aborted before any checked
+      expect(entry.exit_code).toBe(0);
+      expect(entry.mode).toBe("strict");
+    } finally {
+      process.env.VOUCH_GATE_BUDGET_MS = prevBudget;
+      process.env.VOUCH_GATE_LOG = prevLog;
+    }
   });
 });

@@ -61,13 +61,14 @@
  *   as evidence. Dedup on (claim_text, claim_type, depends_on-set) — re-emitting
  *   a draft after a block doesn't double-file. Untagged prose is never touched.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, appendFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { generateObject } from "ai";
 import { z } from "zod";
 
-import { MAX_SOURCE_CHARS } from "./config.ts";
+import { DB_PATH, MAX_SOURCE_CHARS } from "./config.ts";
 import { getLanguageModel } from "./providers.ts";
 import { embedOne } from "./embedder.ts";
 import { classifyError, verifyClaimAgainstSource } from "./verifier.ts";
@@ -182,6 +183,10 @@ export interface GateVerdict {
    *  PASSING draft (block-check first; if passing, harvest) and only when there
    *  was something to report. See `harvestDerivedClaims`. */
   harvest?: HarvestResult;
+  /** True when the watchdog budget was exceeded before all propositions could
+   *  be checked. The pairs array contains only the propositions processed so
+   *  far; remaining propositions were not checked. */
+  incomplete?: boolean;
 }
 
 export async function extractPairs(
@@ -1045,18 +1050,29 @@ export async function runGate(opts: {
   /** Claude Code transcript path; if present and the gate fires, session-
    *  retrieved sources are scanned for auto-grounding before blocking. */
   sessionTranscriptPath?: string;
-}): Promise<GateVerdict> {
+  /** Pre-extracted pairs (runGateCli calls extractPairs itself to print the
+   *  extraction breadcrumb). If omitted, runGate extracts itself. */
+  extractedPairs?: ExtractedPair[] | null;
+  /** Shared abort flag; when true, runGate stops further work and marks the
+   *  verdict as incomplete. */
+  abortRef?: { aborted: boolean };
+}): Promise<GateVerdict & { incomplete?: boolean }> {
   let pairs: GroundedPair[] = [];
   let classifierError: string | undefined;
   let blocked = false;
+  let incomplete = false;
 
-  const extracted = await extractPairs(opts.draft, opts.model);
+  const extracted = opts.extractedPairs !== undefined ? opts.extractedPairs : await extractPairs(opts.draft, opts.model);
   if (extracted === null) {
     classifierError = "extractor failed";
   } else if (extracted.length) {
     const checked: GroundedPair[] = [];
     let errored = false;
     for (const p of extracted) {
+      if (opts.abortRef?.aborted) {
+        incomplete = true;
+        break;
+      }
       if (p.stance !== "ASSERT") {
         checked.push({
           ...p,
@@ -1077,7 +1093,7 @@ export async function runGate(opts: {
 
     // Lazy: only parse the transcript / run session NLI when the gate would
     // otherwise fire on something.
-    if (!errored) {
+    if (!errored && !incomplete) {
       const ungroundedIdx = checked.flatMap((p, i) => (p.grounded ? [] : [i]));
       if (ungroundedIdx.length && opts.sessionTranscriptPath) {
         let sources: SessionSource[] = [];
@@ -1088,6 +1104,10 @@ export async function runGate(opts: {
         }
         if (sources.length) {
           for (const i of ungroundedIdx) {
+            if (opts.abortRef?.aborted) {
+              incomplete = true;
+              break;
+            }
             try {
               const res = await autoGroundPair(checked[i]!, sources);
               checked[i] = res.grounded
@@ -1106,18 +1126,19 @@ export async function runGate(opts: {
     pairs = checked;
     // A verifier error fails the gate OPEN (blocked stays false) — a transient
     // system fault carries no signal about the (claim, source) pair.
-    if (!errored) blocked = checked.some((p) => !p.grounded);
+    if (!errored && !incomplete) blocked = checked.some((p) => !p.grounded);
   }
   // extracted.length === 0 → nothing to ground → blocked stays false.
 
   // Second pass: a passing draft gets its tagged derived claims harvested.
-  const harvest = blocked ? undefined : await safeHarvest(opts.draft);
+  const harvest = (!blocked && !incomplete) ? await safeHarvest(opts.draft) : undefined;
 
   return {
     blocked,
     pairs,
     ...(classifierError ? { classifier_error: classifierError } : {}),
     ...(harvest ? { harvest } : {}),
+    ...(incomplete ? { incomplete: true } : {}),
   };
 }
 
@@ -1333,6 +1354,37 @@ export interface GateRunResult {
   exitCode: 0 | 2;
   /** Human-readable block message, written to stderr by the CLI. */
   message?: string;
+  /** True when the gate exited early due to budget exceeded or uncaught error. */
+  incomplete?: boolean;
+}
+
+function sha256Prefix(text: string, len = 12): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, len);
+}
+
+interface AuditEntry {
+  ts: string;
+  pid: number;
+  draft_sha256: string;
+  n_propositions: number;
+  n_checked: number;
+  n_grounded: number;
+  n_ungrounded: number;
+  verdict: "pass" | "block" | "incomplete" | "error";
+  wall_ms: number;
+  exit_code: number;
+  mode: "strict" | "advisory";
+  error?: string;
+}
+
+function writeGateLog(entry: AuditEntry) {
+  const path = process.env.VOUCH_GATE_LOG || join(dirname(DB_PATH), "gate.log");
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, JSON.stringify(entry) + "\n");
+  } catch (e: any) {
+    process.stderr.write(`[vouch-gate] (could not write gate.log: ${e?.message || String(e)})\n`);
+  }
 }
 
 function formatDeltaMessage(
@@ -1354,79 +1406,161 @@ function formatDeltaMessage(
   );
 }
 
-export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult> {
-  const gateStart = new Date().toISOString();
-  let turnAnchor = gateStart;
-
-  if (opts.bypassEnv && process.env[opts.bypassEnv] === "1") {
-    const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
-    return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
-  }
+export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & { incomplete?: boolean }> {
+  // Default 25 s so the watchdog wins the race against Claude Code's 30 s
+  // Stop-hook timeout. If you raise this, raise the hook timeout too.
+  const budgetMs = parseInt(process.env.VOUCH_GATE_BUDGET_MS || "25000", 10);
+  const failMode = process.env.VOUCH_GATE_FAILMODE || "warn";
+  const mode = opts.strict ? "strict" : "advisory";
+  const wallStart = Date.now();
 
   let draft = opts.draft;
   let transcriptPath = opts.transcriptPath;
-  if (!draft && !transcriptPath && opts.hookPayload) {
-    if (typeof opts.hookPayload.transcript_path === "string") {
-      transcriptPath = opts.hookPayload.transcript_path;
-    }
-  }
+  let turnAnchor = new Date().toISOString();
+  let extractedPairs: ExtractedPair[] | null = null;
+  let verdict: GateVerdict & { incomplete?: boolean } = { blocked: false, pairs: [] };
+  let exitCode: 0 | 2 = 0;
+  let message: string | undefined;
+  let errorMessage: string | undefined;
+  let incomplete = false;
 
-  const transcriptAvailable = !!transcriptPath && existsSync(transcriptPath);
-  if (!draft && transcriptPath) {
-    if (!transcriptAvailable) {
-      const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
-      return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
-    }
-    try {
-      const turn = await readLatestAssistantTurn(transcriptPath);
-      if (!turn.isFresh) {
-        // Transcript-flush race: the just-finished turn is not yet in the
-        // file (or no recent turn exists). Fail-open rather than block on
-        // potentially-stale prior-turn content.
-        const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
-        return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
+  process.stderr.write(`[vouch-gate] start pid=${process.pid} budget=${budgetMs / 1000}s\n`);
+
+  const abortRef = { aborted: false };
+  const timer = setTimeout(() => {
+    abortRef.aborted = true;
+  }, budgetMs);
+
+  try {
+    if (opts.bypassEnv && process.env[opts.bypassEnv] === "1") {
+      message = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+    } else {
+      if (!draft && !transcriptPath && opts.hookPayload) {
+        if (typeof opts.hookPayload.transcript_path === "string") {
+          transcriptPath = opts.hookPayload.transcript_path;
+        }
       }
-      draft = turn.text;
-      if (turn.timestamp) turnAnchor = turn.timestamp;
-    } catch {
-      const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
-      return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
+
+      const transcriptAvailable = !!transcriptPath && existsSync(transcriptPath);
+      if (!draft && transcriptPath) {
+        if (!transcriptAvailable) {
+          message = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+        } else {
+          try {
+            const turn = await readLatestAssistantTurn(transcriptPath);
+            if (!turn.isFresh) {
+              // Transcript-flush race: the just-finished turn is not yet in the
+              // file (or no recent turn exists). Fail-open rather than block on
+              // potentially-stale prior-turn content.
+              message = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+            } else {
+              draft = turn.text;
+              if (turn.timestamp) turnAnchor = turn.timestamp;
+            }
+          } catch {
+            message = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+          }
+        }
+      }
+
+      if (!message && !draft?.trim()) {
+        message = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
+      }
+
+      if (!message) {
+        extractedPairs = await extractPairs(draft!, opts.model);
+        if (extractedPairs !== null) {
+          process.stderr.write(`[vouch-gate] extracted ${extractedPairs.length} proposition(s); grounding…\n`);
+        }
+
+        verdict = await runGate({
+          draft: draft!,
+          model: opts.model,
+          topK: opts.topK,
+          sessionTranscriptPath: transcriptAvailable ? transcriptPath : undefined,
+          extractedPairs,
+          abortRef,
+        });
+
+        if (verdict.incomplete) {
+          const elapsedS = (Date.now() - wallStart) / 1000;
+          const nPropositions = extractedPairs?.length ?? 0;
+          const nChecked = verdict.pairs.length;
+          const nUnchecked = nPropositions - nChecked;
+          process.stderr.write(
+            `⚠ [vouch-gate] BUDGET EXCEEDED after ${elapsedS.toFixed(1)}s — ${nUnchecked} of ${nPropositions} proposition(s) unchecked; turn NOT fully gated\n`,
+          );
+          exitCode = failMode === "block" ? 2 : 0;
+          incomplete = true;
+        } else {
+          const delta = store.getKbDelta(turnAnchor);
+          const unsupportedSkipped = verdict.pairs.filter(
+            (p) => p.stance === "ASSERT" && !p.grounded && !p.auto_grounded && (p.session_sources_checked ?? 0) > 0,
+          ).length;
+          const advisories = verdict.harvest?.flags.length ?? 0;
+          const deltaMsg = formatDeltaMessage(delta, unsupportedSkipped, advisories);
+
+          if (!verdict.blocked) {
+            const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
+            const msgs: string[] = [deltaMsg];
+            if (autoGrounded.length) msgs.push(formatAutoGroundMessage(autoGrounded));
+            if (verdict.harvest) {
+              const hm = formatHarvestMessage(verdict.harvest);
+              if (hm) msgs.push(hm);
+            }
+            message = msgs.join("");
+            exitCode = 0;
+          } else if (!opts.strict) {
+            message = formatBlockMessage(verdict, true) + deltaMsg;
+            exitCode = 0;
+          } else {
+            message = formatBlockMessage(verdict, false) + deltaMsg;
+            exitCode = 2;
+          }
+        }
+      }
     }
+  } catch (e) {
+    errorMessage = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`⚠ [vouch-gate] ERROR: ${errorMessage} — turn NOT gated\n`);
+    exitCode = failMode === "block" ? 2 : 0;
+    incomplete = true;
+    verdict = { blocked: false, pairs: [] };
+  } finally {
+    clearTimeout(timer);
   }
 
-  if (!draft?.trim()) {
-    const msg = formatDeltaMessage({ atomicSupported: 0, derivedHarvested: 0, dossiersSnapshotted: 0 }, 0, 0);
-    return { verdict: { blocked: false, pairs: [] }, exitCode: 0, message: msg };
-  }
+  const nPropositions = extractedPairs?.length ?? verdict.pairs.length;
+  const nChecked = verdict.pairs.length;
+  const nGrounded = verdict.pairs.filter((p) => p.grounded).length;
+  const nUngrounded = nChecked - nGrounded;
 
-  const verdict = await runGate({
-    draft,
-    model: opts.model,
-    topK: opts.topK,
-    sessionTranscriptPath: transcriptAvailable ? transcriptPath : undefined,
-  });
+  let verdictStr: "pass" | "block" | "incomplete" | "error";
+  if (errorMessage) verdictStr = "error";
+  else if (incomplete) verdictStr = "incomplete";
+  else if (verdict.blocked && opts.strict) verdictStr = "block";
+  else verdictStr = "pass";
 
-  const delta = store.getKbDelta(turnAnchor);
-  const unsupportedSkipped = verdict.pairs.filter(
-    (p) => p.stance === "ASSERT" && !p.grounded && !p.auto_grounded && (p.session_sources_checked ?? 0) > 0,
-  ).length;
-  const advisories = verdict.harvest?.flags.length ?? 0;
-  const deltaMsg = formatDeltaMessage(delta, unsupportedSkipped, advisories);
+  const auditEntry: AuditEntry = {
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    draft_sha256: sha256Prefix(draft || ""),
+    n_propositions: nPropositions,
+    n_checked: nChecked,
+    n_grounded: nGrounded,
+    n_ungrounded: nUngrounded,
+    verdict: verdictStr,
+    wall_ms: Date.now() - wallStart,
+    exit_code: exitCode,
+    mode,
+    ...(errorMessage ? { error: errorMessage } : {}),
+  };
 
-  if (!verdict.blocked) {
-    const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
-    const msgs: string[] = [deltaMsg];
-    if (autoGrounded.length) msgs.push(formatAutoGroundMessage(autoGrounded));
-    if (verdict.harvest) {
-      const hm = formatHarvestMessage(verdict.harvest);
-      if (hm) msgs.push(hm);
-    }
-    return { verdict, exitCode: 0, message: msgs.join("") };
-  }
-  if (!opts.strict) {
-    return { verdict, exitCode: 0, message: formatBlockMessage(verdict, true) + deltaMsg };
-  }
-  return { verdict, exitCode: 2, message: formatBlockMessage(verdict, false) + deltaMsg };
+  writeGateLog(auditEntry);
+
+  const result: GateRunResult & { incomplete?: boolean } = { verdict, exitCode, message };
+  if (incomplete) result.incomplete = true;
+  return result;
 }
 
 function formatAutoGroundMessage(autoGrounded: GroundedPair[]): string {

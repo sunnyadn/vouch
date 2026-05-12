@@ -782,7 +782,10 @@ program
   .description(
     "Stop-hook gate: scan the last assistant message in a transcript for ungrounded " +
       "named-entity factual claims and block (exit 2) if any aren't entailed by a " +
-      "supported vouch claim. Designed for Claude Code Stop hook integration.",
+      "supported vouch claim. Designed for Claude Code Stop hook integration. " +
+      "Env: VOUCH_GATE_BUDGET_MS=ms (default 25000, keep below hook timeout), " +
+      "VOUCH_GATE_FAILMODE=warn|block (default warn), " +
+      "VOUCH_GATE_LOG=path (default <db-dir>/gate.log).",
   )
   .option("--transcript-stdin", "Read Stop-hook payload JSON from stdin and derive transcript_path from it")
   .option("--transcript-path <path>", "Read the transcript directly from this path (overrides stdin)")
