@@ -13,7 +13,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import * as store from "./store.ts";
-import { submitClaim } from "./submit.ts";
+import { submitClaim, submitClaimBatch } from "./submit.ts";
 import { embedOne } from "./embedder.ts";
 import { fetchAndStore } from "./fetch.ts";
 import { attestAndStore } from "./attest.ts";
@@ -257,6 +257,21 @@ function renderClaimResult(r: any): string {
   return JSON.stringify(r, null, 2);
 }
 
+function renderClaimBatch(obj: any): string {
+  if (obj.error) {
+    return `✗ batch NOT recorded — ${obj.error}`;
+  }
+  const lines: string[] = [];
+  for (let i = 0; i < obj.results.length; i++) {
+    const r = obj.results[i];
+    const status = r.supported ? "supported" : "unsupported";
+    const score = r.score != null ? r.score.toFixed(2) : "—";
+    lines.push(`${i} → claim #${r.claim_id} — ${status} (${score})`);
+  }
+  lines.push(`${obj.results.length} claim${obj.results.length === 1 ? "" : "s"} recorded`);
+  return lines.join("\n");
+}
+
 function renderAttestResult(r: any): string {
   return `✓ attested ${r.dossier_slug} (${r.content_chars} chars) — ${r.attribution}`;
 }
@@ -483,6 +498,84 @@ program
         process.exit(2);
       }
       throw e;
+    }
+  });
+
+// ---------- claim-batch ----------
+program
+  .command("claim-batch <jsonlPath>")
+  .description(
+    "Submit multiple ATOMIC claims in one LLM round-trip. " +
+      "JSONL lines: {\"text\":\"...\",\"claim_type\":\"ATOMIC\",\"dossier_slug\":\"...\",\"source_quote\":\"...\",\"topic\":\"...\",\"attribution\":\"...\"}",
+  )
+  .action(async (jsonlPath: string) => {
+    let lines: string[];
+    try {
+      const text = await Bun.file(jsonlPath).text();
+      lines = text.split("\n").filter((l) => l.trim());
+    } catch (e: any) {
+      fail(`cannot read ${jsonlPath}: ${e?.message || String(e)}`);
+    }
+
+    const items: Array<{
+      text: string;
+      claim_type: string;
+      dossier_slug: string;
+      source_quote: string;
+      topic?: string;
+      attribution?: string;
+      author?: string;
+    }> = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      let parsed: any;
+      try {
+        parsed = JSON.parse(lines[i]!);
+      } catch {
+        fail(`line ${i + 1}: invalid JSON`);
+      }
+      if (!parsed.text?.trim()) fail(`line ${i + 1}: missing "text"`);
+      if (!parsed.dossier_slug) fail(`line ${i + 1}: missing "dossier_slug"`);
+      if (!parsed.source_quote?.trim()) fail(`line ${i + 1}: missing "source_quote"`);
+      const ct = parsed.claim_type || "ATOMIC";
+      if (ct !== "ATOMIC" && ct !== "QUOTATION") {
+        fail(`line ${i + 1}: claim-batch only supports ATOMIC and QUOTATION, got "${ct}"`);
+      }
+      items.push({
+        text: parsed.text,
+        claim_type: ct,
+        dossier_slug: parsed.dossier_slug,
+        source_quote: parsed.source_quote,
+        topic: parsed.topic,
+        attribution: parsed.attribution,
+        author: parsed.author || "claude-skill",
+      });
+    }
+
+    try {
+      const results = await submitClaimBatch(items);
+      const out = {
+        results: results.map((r, idx) => ({
+          idx,
+          claim_id: r.claim_id,
+          supported: r.status === "supported",
+          score: r.score,
+          reason: r.source_passage,
+        })),
+      };
+      emit(out, renderClaimBatch);
+    } catch (e: any) {
+      if (e instanceof TransientVerifierError) {
+        emit({
+          error: e.message,
+          kind: e.kind,
+          hint: e.hint,
+          recorded: false,
+        }, renderClaimBatch);
+        process.exit(2);
+      }
+      emit({ error: e?.message || String(e) }, renderClaimBatch);
+      process.exit(1);
     }
   });
 

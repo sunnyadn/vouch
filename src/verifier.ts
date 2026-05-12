@@ -1,7 +1,7 @@
 import { generateObject } from "ai";
 import { z } from "zod";
 
-import { MAX_SOURCE_CHARS, VERIFIER_MODEL } from "./config.ts";
+import { BATCH_MAX_PROMPT_CHARS, MAX_SOURCE_CHARS, VERIFIER_MODEL } from "./config.ts";
 import { getLanguageModel } from "./providers.ts";
 import { embedBatch } from "./embedder.ts";
 import * as store from "./store.ts";
@@ -229,6 +229,124 @@ export async function verifyClaimAgainstSource(
       source_passage: `verifier error: ${e?.message || String(e)}`.slice(0, 300),
       verifier: `${VERIFIER_MODEL}-error`,
     };
+  }
+}
+
+const BatchVerifySchema = z.object({
+  verdicts: z.array(
+    z.object({
+      idx: z.number().int(),
+      supported: z.boolean(),
+      score: z.number().min(0).max(1),
+      reason: z.string().max(500),
+    }),
+  ),
+});
+
+const BATCH_VERIFIER_PROMPT_TEMPLATE = `You verify factual claims against source text.
+
+For each item below, determine whether the SOURCE genuinely supports the CLAIM.
+
+{ITEMS_BLOCK}
+
+Rules:
+- Be LENIENT on phrasing — same factual content with different words IS supported.
+- Be STRICT on facts — every entity, number, dataset, baseline, or causal relationship in the claim must trace to the source.
+- ABSENCE CLAIMS ("source does not mention X" / "X is missing from the paper"):
+    supported = source genuinely lacks X.
+    unsupported = source actually contains X (claim is wrong about absence).
+- TABLE-LOOKUP CLAIMS ("system A scored Y% on dataset Z"):
+    supported requires the cell at the right row × column.
+    A correct number at the wrong position FAILS.
+- Reject "almost-true" claims that overstate, generalize, or paraphrase beyond what the source says.
+
+Return your verdicts as JSON: { verdicts: [{ idx (0-based), supported (boolean), score (0..1 confidence), reason (one sentence) }] }.`;
+
+export interface BatchVerifyItem {
+  claim_text: string;
+  source_passage: string;
+}
+
+/** Verify multiple claims in a single LLM round-trip.
+ *
+ *  - idx integrity: rejects the whole batch if the model returns wrong/missing/duplicate idx.
+ *  - All-or-nothing on LLM error: any generateObject failure (transient or not) throws.
+ *  - Token budget: falls back to sequential verifyClaimAgainstSource if the estimated
+ *    prompt size exceeds BATCH_MAX_PROMPT_CHARS.
+ *  - Results are returned in submission order.
+ */
+export async function verifyClaimsBatch(items: BatchVerifyItem[]): Promise<VerifyResult[]> {
+  if (items.length === 0) return [];
+  if (items.length === 1) {
+    return [await verifyClaimAgainstSource(items[0]!.claim_text, items[0]!.source_passage)];
+  }
+
+  // Token budget guard — rough char estimate
+  const scaffoldChars = 2500;
+  const estimatedChars =
+    items.reduce(
+      (sum, item) =>
+        sum + item.claim_text.length + item.source_passage.slice(0, MAX_SOURCE_CHARS).length,
+      0,
+    ) + scaffoldChars;
+
+  if (estimatedChars > BATCH_MAX_PROMPT_CHARS) {
+    const results: VerifyResult[] = [];
+    for (const item of items) {
+      results.push(await verifyClaimAgainstSource(item.claim_text, item.source_passage));
+    }
+    return results;
+  }
+
+  const itemsBlock = items
+    .map((item, idx) => {
+      const truncated = item.source_passage.slice(0, MAX_SOURCE_CHARS);
+      return `[${idx}] CLAIM: "${item.claim_text}"\n\nSOURCE:\n---\n${truncated}\n---`;
+    })
+    .join("\n\n");
+
+  const prompt = BATCH_VERIFIER_PROMPT_TEMPLATE.replace("{ITEMS_BLOCK}", itemsBlock);
+
+  try {
+    const { object } = await generateObject({
+      model: getLanguageModel(VERIFIER_MODEL),
+      schema: BatchVerifySchema,
+      prompt,
+      temperature: 0.0,
+    });
+
+    // idx integrity check
+    if (object.verdicts.length !== items.length) {
+      throw new TransientVerifierError(
+        "unknown",
+        `Batch verifier returned ${object.verdicts.length} verdicts for ${items.length} claims`,
+      );
+    }
+
+    const sorted = [...object.verdicts].sort((a, b) => a.idx - b.idx);
+    for (let i = 0; i < sorted.length; i++) {
+      if (sorted[i]!.idx !== i) {
+        throw new TransientVerifierError(
+          "unknown",
+          `Batch verifier idx mismatch at position ${i}: got idx ${sorted[i]!.idx}`,
+        );
+      }
+    }
+
+    return sorted.map((v) => ({
+      status: v.supported ? "supported" : "unsupported",
+      score: v.score,
+      source_passage: v.reason,
+      verifier: VERIFIER_MODEL,
+    }));
+  } catch (e: any) {
+    const transient = classifyError(e);
+    if (transient) throw transient;
+    // All-or-nothing for batch: even non-transient errors fail the whole batch
+    throw new TransientVerifierError(
+      "unknown",
+      `batch verifier error: ${e?.message || String(e)}`,
+    );
   }
 }
 

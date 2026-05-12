@@ -11,10 +11,11 @@
  * HYPOTHESIS is recorded as-is (explicitly unverified speculation).
  */
 import * as store from "./store.ts";
-import { embedOne } from "./embedder.ts";
+import { embedBatch, embedOne } from "./embedder.ts";
 import {
   TransientVerifierError,
   verifyClaim,
+  verifyClaimsBatch,
   verifyInferenceClaim,
   verifyInterpretationClaim,
   autoSelectQuote,
@@ -320,6 +321,112 @@ async function embedClaim(text: string): Promise<Float32Array | null> {
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Batch ATOMIC submission
+// ---------------------------------------------------------------------------
+
+export interface BatchSubmissionItem {
+  text: string;
+  dossier_slug: string;
+  source_quote: string;
+  topic?: string;
+  attribution?: string;
+  author?: string;
+}
+
+export async function submitClaimBatch(items: BatchSubmissionItem[]): Promise<any[]> {
+  if (items.length === 0) return [];
+
+  // Step 1: validate all quotes (fail fast)
+  const validated: Array<{
+    text: string;
+    dossier_slug: string;
+    source_passage: string;
+    topic?: string;
+    attribution?: string;
+    author?: string;
+    offsetStart: number | null;
+    offsetEnd: number | null;
+    matchType: "exact" | "normalized" | "fuzzy";
+    dossier: ReturnType<typeof store.getDossier>;
+  }> = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    const dossier = store.getDossier(item.dossier_slug);
+    if (!dossier) {
+      throw new Error(`line ${i + 1}: dossier not found: ${item.dossier_slug}`);
+    }
+    const match = findQuoteInContent(item.source_quote, dossier.content || "");
+    if (!match.found) {
+      throw new Error(
+        `line ${i + 1}: quote not found in dossier "${item.dossier_slug}"`,
+      );
+    }
+    validated.push({
+      text: item.text,
+      dossier_slug: item.dossier_slug,
+      source_passage: item.source_quote,
+      topic: item.topic,
+      attribution: item.attribution,
+      author: item.author,
+      offsetStart: match.start,
+      offsetEnd: match.end,
+      matchType: match.matchType as "exact" | "normalized" | "fuzzy",
+      dossier,
+    });
+  }
+
+  // Step 2: batch NLI (all-or-nothing — throws on any LLM error)
+  const batchItems = validated.map((v) => ({
+    claim_text: v.text,
+    source_passage: v.source_passage,
+  }));
+
+  const results = await verifyClaimsBatch(batchItems);
+
+  // Step 3: persist each claim
+  const out: any[] = [];
+  for (let i = 0; i < validated.length; i++) {
+    const v = validated[i]!;
+    const r = results[i]!;
+    const attribution = v.attribution || v.dossier?.author_attribution || null;
+
+    let claimEmbedding: Float32Array | null = null;
+    try {
+      const embs = await embedBatch([v.text]);
+      claimEmbedding = embs[0] || null;
+    } catch {
+      // Embedding failure is non-fatal
+    }
+
+    const cid = store.recordClaim({
+      dossier_slug: v.dossier_slug,
+      claim_text: v.text,
+      score: r.score,
+      status: r.status,
+      source_passage: r.source_passage,
+      claim_type: "ATOMIC",
+      topic: v.topic ?? null,
+      author: v.author ?? null,
+      attribution,
+      source_offset_start: v.offsetStart,
+      source_offset_end: v.offsetEnd,
+      embedding: claimEmbedding,
+      verification: "nli-quote",
+    });
+
+    out.push({
+      ...r,
+      claim_id: cid,
+      dossier_slug: v.dossier_slug,
+      quote_match: v.matchType,
+    });
+  }
+
+  return out;
 }
 
 function errOut(message: string, reason: RejectedSubmission["reason"], detail?: unknown) {

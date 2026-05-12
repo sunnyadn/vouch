@@ -46,6 +46,11 @@ export const SUPPORT_THRESHOLD = parseFloat(
 
 export const MAX_SOURCE_CHARS = 60_000;
 
+/** Rough char ceiling for batched-verify prompts. ~100 k tokens ≈ 300 k chars
+ *  (conservative 3 chars/token). Fallback to sequential if the estimate exceeds
+ *  this. */
+export const BATCH_MAX_PROMPT_CHARS = 300_000;
+
 export const VERTEX_PROJECT =
   process.env.GOOGLE_VERTEX_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "";
 export const VERTEX_LOCATION =

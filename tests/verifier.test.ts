@@ -427,3 +427,240 @@ describe("verifyClaim temporal qualifier", () => {
     expect(stored!.claim_text).toBe("x/y has 4 stars as of 2025-01-01");
   });
 });
+
+// ---------------------------------------------------------------------------
+// verifyClaimsBatch (SUN-7)
+// ---------------------------------------------------------------------------
+
+describe("verifyClaimsBatch", () => {
+  it("happy path: returns results in submission order", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: true, score: 0.95, reason: "direct match" },
+            { idx: 1, supported: false, score: 0.2, reason: "no evidence" },
+          ],
+        },
+      } as any),
+    );
+
+    const results = await verifier.verifyClaimsBatch([
+      { claim_text: "A", source_passage: "A is true." },
+      { claim_text: "B", source_passage: "B is false." },
+    ]);
+
+    expect(results).toHaveLength(2);
+    expect(results[0]!.status).toBe("supported");
+    expect(results[0]!.score).toBe(0.95);
+    expect(results[1]!.status).toBe("unsupported");
+    expect(results[1]!.score).toBe(0.2);
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+    const callArgs = (generateObjectMock.mock.calls[0] as any)[0];
+    expect(callArgs.schema).toBeDefined();
+    expect(callArgs.prompt).toContain("[0] CLAIM");
+    expect(callArgs.prompt).toContain("[1] CLAIM");
+  });
+
+  it("single item delegates to verifyClaimAgainstSource", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({ object: { supported: true, score: 0.9, reason: "ok" } }),
+    );
+
+    const results = await verifier.verifyClaimsBatch([
+      { claim_text: "Only one", source_passage: "Only one source." },
+    ]);
+
+    expect(results).toHaveLength(1);
+    expect(results[0]!.status).toBe("supported");
+    // verifyClaimAgainstSource uses the single-item VerifySchema
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+    const callArgs = (generateObjectMock.mock.calls[0] as any)[0];
+    expect(callArgs.prompt).not.toContain("verdicts");
+  });
+
+  it("empty array returns empty", async () => {
+    const results = await verifier.verifyClaimsBatch([]);
+    expect(results).toHaveLength(0);
+    expect(generateObjectMock).toHaveBeenCalledTimes(0);
+  });
+
+  it("idx drift (missing idx) rejects the whole batch", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: true, score: 0.9, reason: "ok" },
+            // missing idx 1
+          ],
+        },
+      } as any),
+    );
+
+    await expect(
+      verifier.verifyClaimsBatch([
+        { claim_text: "A", source_passage: "A." },
+        { claim_text: "B", source_passage: "B." },
+      ]),
+    ).rejects.toThrow("Batch verifier returned 1 verdicts for 2 claims");
+  });
+
+  it("idx drift (wrong idx) rejects the whole batch", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: true, score: 0.9, reason: "ok" },
+            { idx: 5, supported: false, score: 0.1, reason: "bad" },
+          ],
+        },
+      } as any),
+    );
+
+    await expect(
+      verifier.verifyClaimsBatch([
+        { claim_text: "A", source_passage: "A." },
+        { claim_text: "B", source_passage: "B." },
+      ]),
+    ).rejects.toThrow("idx mismatch at position 1: got idx 5");
+  });
+
+  it("idx drift (duplicate idx) rejects the whole batch", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: true, score: 0.9, reason: "ok" },
+            { idx: 0, supported: false, score: 0.1, reason: "dup" },
+          ],
+        },
+      } as any),
+    );
+
+    await expect(
+      verifier.verifyClaimsBatch([
+        { claim_text: "A", source_passage: "A." },
+        { claim_text: "B", source_passage: "B." },
+      ]),
+    ).rejects.toThrow("idx mismatch at position 1: got idx 0");
+  });
+
+  it("falls back to sequential when prompt exceeds token budget", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: { supported: true, score: 0.9, reason: "ok" },
+      }),
+    );
+
+    // 6 items × 55 k chars = 330 k chars > BATCH_MAX_PROMPT_CHARS (300 k)
+    const big = "x".repeat(55_000);
+    const items = Array.from({ length: 6 }, (_, i) => ({
+      claim_text: `Claim ${i}`,
+      source_passage: big,
+    }));
+
+    const results = await verifier.verifyClaimsBatch(items);
+
+    expect(results).toHaveLength(6);
+    // Fallback calls verifyClaimAgainstSource individually (single-item schema)
+    expect(generateObjectMock).toHaveBeenCalledTimes(6);
+    for (let i = 0; i < 6; i++) {
+      expect((generateObjectMock.mock.calls[i] as any)[0].prompt).not.toContain("verdicts");
+    }
+  });
+
+  it("throws TransientVerifierError on generateObject failure", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.reject(new Error("rate limit exceeded")),
+    );
+
+    await expect(
+      verifier.verifyClaimsBatch([
+        { claim_text: "A", source_passage: "A." },
+        { claim_text: "B", source_passage: "B." },
+      ]),
+    ).rejects.toBeInstanceOf(verifier.TransientVerifierError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// submitClaimBatch (SUN-7 integration)
+// ---------------------------------------------------------------------------
+
+const submit = await import("../src/submit.ts");
+
+describe("submitClaimBatch", () => {
+  it("happy path: 2 valid items → 2 claims persisted", async () => {
+    const slug = store.writeDossier({
+      source_url: "https://example.com/batch",
+      source_type: "test",
+      verbatim_content: "Alpha is first. Beta is second.",
+    });
+
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: true, score: 0.95, reason: "direct" },
+            { idx: 1, supported: false, score: 0.1, reason: "no match" },
+          ],
+        },
+      } as any),
+    );
+
+    const results = await submit.submitClaimBatch([
+      {
+        text: "Alpha is first",
+        dossier_slug: slug,
+        source_quote: "Alpha is first.",
+      },
+      {
+        text: "Gamma is third",
+        dossier_slug: slug,
+        source_quote: "Beta is second.",
+      },
+    ]);
+
+    expect(results).toHaveLength(2);
+    expect(results[0]!.status).toBe("supported");
+    expect(results[0]!.claim_id).toBeGreaterThan(0);
+    expect(results[1]!.status).toBe("unsupported");
+
+    // Verify DB state
+    const c1 = store.getClaim(results[0]!.claim_id);
+    expect(c1).not.toBeNull();
+    expect(c1!.claim_text).toBe("Alpha is first");
+    const c2 = store.getClaim(results[1]!.claim_id);
+    expect(c2).not.toBeNull();
+    expect(c2!.claim_text).toBe("Gamma is third");
+  });
+
+  it("bad quote on item 2 → throws, nothing persisted", async () => {
+    const slug = store.writeDossier({
+      source_url: "https://example.com/batch2",
+      source_type: "test",
+      verbatim_content: "Only this content.",
+    });
+
+    // Pre-seed a claim so we can verify count after failure
+    const beforeCount = store.listClaims({ dossier_slug: slug }).length;
+
+    await expect(
+      submit.submitClaimBatch([
+        {
+          text: "Only this content",
+          dossier_slug: slug,
+          source_quote: "Only this content.",
+        },
+        {
+          text: "Fake claim",
+          dossier_slug: slug,
+          source_quote: "this quote does not exist",
+        },
+      ]),
+    ).rejects.toThrow("quote not found");
+
+    const afterCount = store.listClaims({ dossier_slug: slug }).length;
+    expect(afterCount).toBe(beforeCount);
+  });
+});
