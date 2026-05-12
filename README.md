@@ -241,21 +241,23 @@ supersede semantics, output tagging conventions, and anti-patterns.
 ## CLI reference
 
 vouch is agent-driven by design, but the CLI is fully usable from a shell
-for one-off claims, debugging, or KB inspection.
+for one-off claims, debugging, or KB inspection. All commands print
+human-readable output by default; pass `--json` when you need structured
+output for scripting (`| jq`, `ops/` automation, etc.). The vouch skill
+(`~/.claude/skills/vouch/SKILL.md`) gets a one-line follow-up from the
+maintainer: "vouch prints human-readable output; pass `--json` only if you
+need to parse a field programmatically (you usually don't)."
 
 ```bash
 # Find a source (KB-first: reuses dossiers/claims you already have; falls
 # through to a web search when the KB has no strong match)
 vouch search "nginx rate limiting limit_req_zone burst"
-# → {"kb_sufficient":false,"kb":[...],"web":[{"title":"...","url":"https://...","snippet":"..."}],
-#     "web_provider":"ddg",...}
 vouch search "Fine Gray 1999 subdistribution hazard" --provider openalex   # academic index
 vouch search "ALCE citation benchmark" --kb-only                            # never web-search
 
 # Fetch — vouch performs the HTTP request itself (the trust boundary) AND
 # returns the readable content, so this is a drop-in for a web-fetch tool
 vouch fetch https://arxiv.org/abs/2410.05779
-# → {"dossier_slug":"evidence/arxiv/...","content":"<first ~8000 chars>","content_chars":68151,...}
 vouch fetch <url> --full                # entire content
 vouch get-dossier <slug> --offset 8000 --limit 4000   # paged re-read later
 
@@ -265,7 +267,6 @@ vouch claim "<text>" --type ATOMIC \
   --dossier <slug> \
   [--source-quote "<verbatim 1–3 sentences from the dossier>"] \
   --topic <topic> --attribution "<authors / org>"
-# → {"status":"supported","score":1,"claim_id":1,"quote_match":"exact"}
 
 # Build derived claims (no source step — depends on existing KB claim_ids)
 vouch claim "<text>" --type INFERENCE --depends-on 1,2 --topic <topic> --soft-score 0.8
@@ -285,7 +286,8 @@ vouch supersede <old_id> <new_id> --reason "<why>"
 vouch doctor
 ```
 
-See `vouch <command> --help` for full flags.
+See `vouch <command> --help` for full flags. Set `VOUCH_OUTPUT=json` in the
+environment to force JSON globally without passing `--json` on every command.
 
 Default DB at `~/.vouch/store.db` (SQLite). Override with `VOUCH_DB_PATH`.
 

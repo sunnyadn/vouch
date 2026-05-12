@@ -4,7 +4,8 @@
  * No daemon, no HTTP. Each command opens SQLite directly and calls the
  * configured LiteLLM-style provider for verification + embedding.
  *
- * Output: JSON by default (parseable by Claude). --pretty for human inspection.
+ * Output: human-readable by default. --json for machine-parseable output.
+ * (vouch gate always prints prose for the Stop hook.)
  */
 import { Command } from "commander";
 import { mkdirSync, appendFileSync } from "node:fs";
@@ -37,12 +38,17 @@ const program = new Command()
       "Submit claims with sources, get NLI verification, build a queryable provenance graph.",
   )
   .version("0.3.0")
-  .option("--pretty", "Pretty-print JSON output");
+  .option("--json", "Emit machine-parseable JSON output");
 
-function emit(obj: unknown) {
-  const pretty = program.opts().pretty;
-  if (pretty) console.log(JSON.stringify(obj, null, 2));
-  else console.log(JSON.stringify(obj));
+function emit(obj: unknown, humanRenderer?: (obj: any) => string) {
+  const jsonMode = program.opts().json || process.env.VOUCH_OUTPUT === "json";
+  if (jsonMode) {
+    console.log(JSON.stringify(obj));
+  } else if (humanRenderer) {
+    console.log(humanRenderer(obj));
+  } else {
+    console.log(JSON.stringify(obj, null, 2));
+  }
 }
 
 function fail(msg: string, code = 1): never {
@@ -68,6 +74,226 @@ function parseSince(input: string): string {
   return abs.toISOString();
 }
 
+// ---------------------------------------------------------------------------
+// Human-render helpers
+// ---------------------------------------------------------------------------
+
+function truncate(s: string | null | undefined, n: number): string {
+  if (!s || s.length <= n) return s || "";
+  return s.slice(0, n - 1) + "…";
+}
+
+function renderClaimsTable(claims: any[]): string {
+  if (!claims.length) return "(no claims)";
+  const wId = Math.max(3, ...claims.map((c) => String(c.id).length));
+  const wType = Math.max(4, ...claims.map((c) => (c.claim_type || "—").length));
+  const wStatus = Math.max(6, ...claims.map((c) => (c.status || "—").length));
+  const wAuthor = Math.max(6, ...claims.map((c) => (c.author || "—").length));
+  const wDate = 20;
+  const header = `${"#".padStart(wId)}  ${"TYPE".padEnd(wType)}  ${"STATUS".padEnd(wStatus)}  SCORE  ${"AUTHOR".padEnd(wAuthor)}  ${"VERIFIED_AT".padEnd(wDate)}  CLAIM`;
+  const lines = claims.map((c) => {
+    const id = String(c.id).padStart(wId);
+    const type = (c.claim_type || "—").padEnd(wType);
+    const status = (c.status || "—").padEnd(wStatus);
+    const score = c.nli_score != null ? c.nli_score.toFixed(2).padStart(5) : "  —  ";
+    const author = (c.author || "—").padEnd(wAuthor);
+    const date = (c.verified_at || "—").slice(0, 20).padEnd(wDate);
+    const text = truncate(c.claim_text, 70);
+    return `${id}  ${type}  ${status}  ${score}  ${author}  ${date}  ${text}`;
+  });
+  return [header, ...lines].join("\n");
+}
+
+function renderRecent(obj: any): string {
+  if (!obj.claims?.length) return obj.summary?.header || "(no recent claims)";
+  return `${obj.summary.header}\n${renderClaimsTable(obj.claims)}`;
+}
+
+function renderListClaims(claims: any[]): string {
+  if (!claims.length) return "(no claims match the filters)";
+  return renderClaimsTable(claims);
+}
+
+function renderListDossiers(dossiers: any[]): string {
+  if (!dossiers.length) return "(no dossiers)";
+  const wSlug = Math.max(4, ...dossiers.map((d) => d.slug.length));
+  const wType = Math.max(11, ...dossiers.map((d) => (d.source_type || "—").length));
+  const header = `${"SLUG".padEnd(wSlug)}  ${"SOURCE_TYPE".padEnd(wType)}  CAPTURE_DATE  CHARS`;
+  const lines = dossiers.map((d) => {
+    const slug = d.slug.padEnd(wSlug);
+    const type = (d.source_type || "—").padEnd(wType);
+    const date = (d.capture_date || "—").slice(0, 10);
+    const chars = String(d.content_len ?? d.content_chars ?? d.content_total_chars ?? 0);
+    return `${slug}  ${type}  ${date}  ${chars}`;
+  });
+  return [header, ...lines].join("\n");
+}
+
+function renderListTopics(topics: any[]): string {
+  if (!topics.length) return "(no topics)";
+  const sorted = [...topics].sort((a, b) => b.n_claims - a.n_claims);
+  return sorted.map((t) => `${t.topic}  (${t.n_claims} claim${t.n_claims === 1 ? "" : "s"})`).join("\n");
+}
+
+function renderGetClaim(c: any): string {
+  const lines: string[] = [];
+  const nli = c.nli_score != null ? `NLI ${c.nli_score.toFixed(2)}` : "NLI —";
+  const verif = c.verification ? `, ${c.verification}` : "";
+  lines.push(`#${c.id}  ${c.claim_type || "UNKNOWN"}  ${c.status}${c.nli_score != null ? ` (${nli}${verif})` : ""}`);
+  lines.push(`  "${c.claim_text}"`);
+  lines.push(`  author:   ${c.author || "—"}        verified: ${c.verified_at || "—"}`);
+  if (c.dossier_slug) {
+    lines.push(`  dossier:  ${c.dossier_slug}`);
+  }
+  if (c.source_passage) {
+    lines.push(`  quote:    "${truncate(c.source_passage, 200)}"`);
+  }
+  if (c.depends_on?.length) {
+    const deps = c.depends_on.map((d: any) => {
+      const depClaim = store.getClaim(d.depends_on_id);
+      const depText = depClaim ? `("${truncate(depClaim.claim_text, 60)}")` : "";
+      return `#${d.depends_on_id} ${depText}`;
+    });
+    lines.push(`  depends on: ${deps.join(", ")}`);
+  }
+  if (c.superseded_by) {
+    lines.push(`  superseded by: #${c.superseded_by}  ("${truncate(c.supersede_reason || "no reason given", 60)}")`);
+  }
+  return lines.join("\n");
+}
+
+function renderGetDossier(d: any): string {
+  const lines: string[] = [];
+  lines.push(`${d.slug}`);
+  lines.push(`  source:   ${d.source_url || "—"}`);
+  lines.push(`  type:     ${d.source_type || "—"}`);
+  lines.push(`  captured: ${d.capture_date || "—"}`);
+  lines.push(`  chars:    ${d.content_total_chars}`);
+  const previewLen = 600;
+  const content = d.content || "";
+  if (content.length > previewLen) {
+    lines.push(`\n${content.slice(0, previewLen)}… [+${content.length - previewLen} more chars — vouch get-dossier ${d.slug} --full]`);
+  } else {
+    lines.push(`\n${content}`);
+  }
+  const citing = store.listClaims({ dossier_slug: d.slug, limit: 20 });
+  if (citing.length) {
+    lines.push(`\nCited by ${citing.length} claim(s):`);
+    for (const c of citing) {
+      lines.push(`  #${c.id}  ${truncate(c.claim_text, 70)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function renderChain(obj: any): string {
+  const { root, nodes, edges } = obj;
+  if (!nodes[root]) return `(claim #${root} not found)`;
+  const adj = new Map<number, number[]>();
+  for (const e of edges) {
+    if (!adj.has(e.from)) adj.set(e.from, []);
+    adj.get(e.from)!.push(e.to);
+  }
+  const lines: string[] = [];
+  const visited = new Set<number>();
+  function dfs(id: number, prefix: string) {
+    if (visited.has(id)) {
+      lines.push(`${prefix}#${id}  (already shown above)`);
+      return;
+    }
+    visited.add(id);
+    const node = nodes[id];
+    const type = node?.claim_type || "UNKNOWN";
+    const text = truncate(node?.claim_text || "", 70);
+    const dossier = node?.dossier_slug ? `  (dossier ${node.dossier_slug})` : "";
+    lines.push(`${prefix}#${id}  ${type}  "${text}"${dossier}`);
+    const children = adj.get(id) || [];
+    for (let i = 0; i < children.length; i++) {
+      const isLast = i === children.length - 1;
+      const nextPrefix = prefix + (isLast ? "   " : "│  ");
+      dfs(children[i]!, nextPrefix);
+    }
+  }
+  dfs(root, "");
+  return lines.join("\n");
+}
+
+function renderSearch(obj: any): string {
+  const lines: string[] = [];
+  lines.push(`query: ${obj.query}`);
+  lines.push(`kb_sufficient: ${obj.kb_sufficient ? "yes" : "no"}`);
+  if (obj.web_provider) lines.push(`web_provider: ${obj.web_provider}`);
+  let rank = 1;
+  for (const hit of obj.kb || []) {
+    const id = hit.kind === "claim" ? `#${hit.id}` : hit.slug;
+    const text = truncate(hit.text, 120);
+    lines.push(`${rank}. [kb]  ${id}  — ${text}`);
+    rank++;
+  }
+  for (const w of obj.web || []) {
+    const title = (w as any).title || "—";
+    const snippet = truncate((w as any).snippet || "", 120);
+    const url = (w as any).url || "";
+    lines.push(`${rank}. [web]  ${title}  — ${snippet}  (${url})`);
+    rank++;
+  }
+  if (obj.web_error) lines.push(`web error: ${obj.web_error}`);
+  if (obj.hint) lines.push(`hint: ${obj.hint}`);
+  return lines.join("\n");
+}
+
+function renderClaimResult(r: any): string {
+  if (r.error) {
+    return `✗ claim NOT recorded — ${r.reason}: ${r.error}`;
+  }
+  if (r.claim_id) {
+    const type = r.claim_type || "ATOMIC";
+    const score = r.nli_score != null ? r.nli_score.toFixed(2) : r.score != null ? r.score.toFixed(2) : "—";
+    const verifier = r.verification || r.verifier || "—";
+    const dossier = r.dossier_slug ? `, dossier ${r.dossier_slug}` : "";
+    const quote = r.source_passage ? `, quote "${truncate(r.source_passage, 80)}"` : "";
+    return `✓ claim #${r.claim_id} recorded — ${type}, NLI ${score} (${verifier})${dossier}${quote}`;
+  }
+  return JSON.stringify(r, null, 2);
+}
+
+function renderAttestResult(r: any): string {
+  return `✓ attested ${r.dossier_slug} (${r.content_chars} chars) — ${r.attribution}`;
+}
+
+function renderAttestWithClaim(r: any): string {
+  const attestLine = `✓ attested ${r.dossier_slug} (${r.content_chars} chars) — ${r.attribution}`;
+  const claimLine = renderClaimResult(r);
+  return `${attestLine}\n${claimLine}`;
+}
+
+function renderFetchResult(r: any): string {
+  const cached = r.cached ? " [cached]" : "";
+  return `✓ fetched ${r.source_url} → dossier ${r.dossier_slug} (${r.content_chars} chars)${cached}`;
+}
+
+function renderSupersede(oldId: number, newId: number, reason: string): (r: any) => string {
+  return () => `✓ #${oldId} superseded by #${newId} — "${truncate(reason, 80)}"`;
+}
+
+function renderDoctor(report: any): string {
+  const lines = report.checks.map((c: any) => {
+    const status = c.status.toUpperCase();
+    const fix = c.fix ? `  → ${c.fix}` : "";
+    return `[${status}] ${c.name}: ${c.detail}${fix}`;
+  });
+  if (!report.ok) lines.push("\nSome checks failed. Fix the FAIL items above.");
+  return lines.join("\n");
+}
+
+function renderDigest(obj: any): string {
+  const md = store.formatDigestMarkdown(obj);
+  if (obj.written_to) {
+    return `✓ digest appended to ${obj.written_to}\n\n${md}`;
+  }
+  return md;
+}
+
 // ---------- fetch ----------
 program
   .command("fetch <url>")
@@ -89,7 +315,7 @@ program
         full: opts.full,
         contentLimit: opts.contentLimit,
       });
-      emit(result);
+      emit(result, renderFetchResult);
     } catch (e: any) {
       fail(`fetch failed: ${e?.message || String(e)}`);
     }
@@ -131,9 +357,6 @@ program
       process.exit(2);
     }
 
-    // Validate --claim-type up front so we don't attest and then bail. Only the
-    // dossier-backed types make sense here — SYNTHESIS needs --sources,
-    // INFERENCE/INTERPRETATION need --depends-on, HYPOTHESIS ignores dossiers.
     if (opts.claim) {
       const allowed = ["ATOMIC", "QUOTATION"];
       if (!allowed.includes(opts.claimType)) {
@@ -163,15 +386,10 @@ program
     }
 
     if (!opts.claim) {
-      emit(attestResult);
+      emit(attestResult, renderAttestResult);
       return;
     }
 
-    // Attestation persisted; now file the representative claim against it.
-    // Auto-quote (no --source-quote) is the default — most attest-and-claim
-    // cases have the claim text already entailed by the content. If NLI says
-    // unsupported, the response still carries the dossier_slug so the caller
-    // can retry with reworded text without re-attesting.
     try {
       const claimResult = await submitClaim({
         text: opts.claim,
@@ -180,21 +398,16 @@ program
         author: "claude-skill",
         dossier_slug: attestResult.dossier_slug,
       });
-      // Flat-merge: attest's dossier_slug/source_url match the claim's
-      // (same dossier), so no field collisions. Claim fields are the
-      // additive payload (claim_id, status, score, ...).
-      emit({ ...attestResult, ...claimResult });
+      emit({ ...attestResult, ...claimResult }, renderAttestWithClaim);
     } catch (e: any) {
       if (e instanceof TransientVerifierError) {
-        // Attestation succeeded, verifier was transiently unreachable. Carry
-        // dossier_slug so the caller can retry the claim without re-attesting.
         emit({
           error: e.message,
           kind: e.kind,
           hint: e.hint,
           recorded: false,
           dossier_slug: attestResult.dossier_slug,
-        });
+        }, renderClaimResult);
         process.exit(2);
       }
       throw e;
@@ -258,17 +471,15 @@ program
         depends_on_ids: dependsOn,
         soft_score: opts.softScore,
       });
-      emit(result);
+      emit(result, renderClaimResult);
     } catch (e: any) {
       if (e instanceof TransientVerifierError) {
-        // Surface transient/system errors clearly. NOT recorded in the KB —
-        // these don't carry information about the (claim, source) pair.
         emit({
           error: e.message,
           kind: e.kind,
           hint: e.hint,
           recorded: false,
-        });
+        }, renderClaimResult);
         process.exit(2);
       }
       throw e;
@@ -313,6 +524,7 @@ program
         newestFirst: opts.newestFirst,
         limit: opts.limit,
       }),
+      renderListClaims,
     );
   });
 
@@ -334,7 +546,7 @@ program
     const summary = store.listRecentClaimsSummary(sinceIso);
     const authorParts = Object.entries(summary.authorBreakdown).map(([a, n]) => `${a}=${n}`);
     const header = `${summary.total} new (${summary.supported} supported / ${summary.unsupported} unsupported / ${summary.recorded} recorded-derived) across ${summary.dossiers} dossier(s) — author breakdown: ${authorParts.join(" ")}`;
-    emit({ summary: { ...summary, header }, claims });
+    emit({ summary: { ...summary, header }, claims }, renderRecent);
   });
 
 // ---------- digest ----------
@@ -398,9 +610,9 @@ program
       const outPath = typeof opts.write === "string" && opts.write ? opts.write : defaultPath;
       mkdirSync(dirname(outPath), { recursive: true });
       appendFileSync(outPath, md + "\n");
-      emit({ ...out, written_to: outPath });
+      emit({ ...out, written_to: outPath }, renderDigest);
     } else {
-      emit(out);
+      emit(out, renderDigest);
     }
   });
 
@@ -411,7 +623,7 @@ program
   .action((id: string) => {
     const c = store.getClaim(parseInt(id, 10));
     if (!c) fail(`claim ${id} not found`);
-    emit(c);
+    emit(c, renderGetClaim);
   });
 
 // ---------- chain ----------
@@ -420,14 +632,14 @@ program
   .description("Walk dependency DAG from a claim")
   .option("--max-depth <n>", "default 6", (v) => parseInt(v, 10), 6)
   .action((id: string, opts: any) => {
-    emit(store.getClaimChain(parseInt(id, 10), opts.maxDepth));
+    emit(store.getClaimChain(parseInt(id, 10), opts.maxDepth), renderChain);
   });
 
 // ---------- list-topics ----------
 program
   .command("list-topics")
   .description("Distinct topics with claim counts")
-  .action(() => emit(store.listTopics()));
+  .action(() => emit(store.listTopics(), renderListTopics));
 
 // ---------- supersede ----------
 program
@@ -440,7 +652,7 @@ program
       parseInt(newId, 10),
       opts.reason,
     );
-    emit({ ok });
+    emit({ ok }, renderSupersede(parseInt(oldId, 10), parseInt(newId, 10), opts.reason));
   });
 
 // ---------- list-dossiers ----------
@@ -450,7 +662,7 @@ program
   .option("--source-type <type>")
   .option("--limit <n>", "default 50", (v) => parseInt(v, 10), 50)
   .action((opts: any) => {
-    emit(store.listDossiers({ source_type: opts.sourceType, limit: opts.limit }));
+    emit(store.listDossiers({ source_type: opts.sourceType, limit: opts.limit }), renderListDossiers);
   });
 
 // ---------- get-dossier ----------
@@ -485,7 +697,7 @@ program
       content,
       content_total_chars: fullContent.length,
     };
-    emit(out);
+    emit(out, renderGetDossier);
   });
 
 // ---------- search ----------
@@ -506,7 +718,7 @@ program
   .option("--limit <n>", "web candidates to return", (v) => parseInt(v, 10), 5)
   .option(
     "--kb-threshold <f>",
-    "top-KB-hit similarity at/above which the KB is 'sufficient' (skip web)",
+      "top-KB-hit similarity at/above which the KB is 'sufficient' (skip web)",
     parseFloat,
     0.7,
   )
@@ -525,7 +737,6 @@ program
         const qEmb = await embedOne(query);
         kb = store.searchHybrid(qEmb, opts.topK);
       } catch (e: any) {
-        // embed failure shouldn't sink the whole search — fall through to web
         kb = [];
       }
       const top = kb[0];
@@ -562,7 +773,7 @@ program
               "KB had no strong match and --kb-only suppressed web search. Drop --kb-only (auto-uses DuckDuckGo) or pass --provider <openalex|pubmed|arxiv|google-scholar> for scholarly sources, then `vouch fetch <url>` the right hit.",
           }
         : {}),
-    });
+    }, renderSearch);
   });
 
 // ---------- gate ----------
@@ -598,14 +809,15 @@ program
       bypassEnv: opts.bypassEnv,
     });
     if (result.message) process.stderr.write(result.message);
-    emit({
+    // Gate output is intentionally untouched — byte-identical compact JSON for Stop-hook consumers.
+    console.log(JSON.stringify({
       blocked: result.verdict.blocked,
       pairs: result.verdict.pairs,
       ...(result.verdict.harvest ? { harvest: result.verdict.harvest } : {}),
       ...(result.verdict.classifier_error
         ? { classifier_error: result.verdict.classifier_error }
         : {}),
-    });
+    }));
     process.exit(result.exitCode);
   });
 
@@ -618,7 +830,7 @@ program
   )
   .action(async () => {
     const report = runDoctor();
-    emit(report);
+    emit(report, renderDoctor);
     if (!report.ok) process.exit(1);
   });
 
