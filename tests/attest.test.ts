@@ -1,6 +1,6 @@
 /** Attestation tests — mocks LLM calls, uses real SQLite store. */
 import { afterEach, beforeAll, describe, expect, it, mock } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +25,7 @@ mock.module("../src/embedder.ts", () => ({
 const store = await import("../src/store.ts");
 const attest = await import("../src/attest.ts");
 const submit = await import("../src/submit.ts");
+const gate = await import("../src/gate.ts");
 
 afterEach(() => {
   const db = store.getDb();
@@ -332,5 +333,97 @@ describe("list-dossiers includes attestations", () => {
     expect(attestations.length).toBe(1);
     expect(attestations[0]!.slug).toBe("evidence/attestations/listable");
     expect(attestations[0]!.source_type).toBe("user-statement");
+  });
+});
+
+describe("attest --from-session-tool", () => {
+  it("creates a dossier from a session tool_result with derived source_url/type/scope", async () => {
+    const path = join(tmp, "attest-session.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_git", name: "Bash", input: { command: "git log --oneline -3" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_git", content: "abc123 Fix the flux capacitor\ndef456 Update docs" }] } }),
+      ].join("\n"),
+    );
+    const src = gate.findSessionSourceByToolUseId(path, "tu_git");
+    expect(src).not.toBeNull();
+
+    const result = await attest.attestAndStore({
+      slug: "session-bash-test",
+      content: src!.content,
+      attribution: "session-bash",
+      source_url: src!.uri,
+      source_type: "session-bash",
+      scope: "workspace",
+    });
+
+    expect(result.source_type).toBe("session-bash");
+    expect(result.source_url).toContain("git log");
+    const d = store.getDossier(result.dossier_slug);
+    expect(d!.source_type).toBe("session-bash");
+    expect(d!.scope).toBe("workspace");
+  });
+
+  it("ATOMIC claim against a session-bash dossier succeeds", async () => {
+    const attestation = await attest.attestAndStore({
+      slug: "session-claimable",
+      content: "Commit abc123 is titled 'Fix the flux capacitor'.",
+      attribution: "session-bash",
+      source_url: "session-bash: git log --oneline -3",
+      source_type: "session-bash",
+      scope: "workspace",
+    });
+
+    const claimResult = await submit.submitClaim({
+      text: "Commit abc123 fixes the flux capacitor.",
+      claim_type: "ATOMIC",
+      dossier_slug: attestation.dossier_slug,
+      source_quote: "Commit abc123 is titled 'Fix the flux capacitor'.",
+    });
+
+    expect(claimResult.error).toBeUndefined();
+    expect(claimResult.status).toBe("supported");
+  });
+
+  it("INFERENCE claim against session dossier requires depends_on", async () => {
+    const base = await attest.attestAndStore({
+      slug: "session-base",
+      content: "All tests passed.",
+      attribution: "session-bash",
+      source_url: "session-bash: bun test",
+      source_type: "session-bash",
+      scope: "workspace",
+    });
+    const atomic = await submit.submitClaim({
+      text: "All tests passed.",
+      claim_type: "ATOMIC",
+      dossier_slug: base.dossier_slug,
+      source_quote: "All tests passed.",
+    });
+
+    const inferenceAttestation = await attest.attestAndStore({
+      slug: "session-inference",
+      content: "Therefore the build is green.",
+      attribution: "session-bash",
+      source_url: "session-bash: inference",
+      source_type: "session-bash",
+      scope: "workspace",
+    });
+
+    const inferenceResult = await submit.submitClaim({
+      text: "Therefore the build is green.",
+      claim_type: "INFERENCE",
+      dossier_slug: inferenceAttestation.dossier_slug,
+      depends_on_ids: [atomic.claim_id],
+    });
+    expect(inferenceResult.error).toBeUndefined();
+    expect(inferenceResult.status).toBe("supported");
+  });
+
+  it("rejects unknown tool_use_id", () => {
+    const path = join(tmp, "attest-missing.jsonl");
+    writeFileSync(path, "[]\n"); // not a real transcript
+    expect(gate.findSessionSourceByToolUseId(path, "tu_missing")).toBeNull();
   });
 });

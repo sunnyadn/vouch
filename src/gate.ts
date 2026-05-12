@@ -182,6 +182,10 @@ export interface GroundedPair extends ExtractedPair {
   /** True when this pair was resolved by auto-grounding against a source the
    *  agent retrieved this session (Read / WebFetch / WebSearch / Bash cat). */
   auto_grounded?: boolean;
+  /** When the gate fired and a session source had lexical overlap with the
+   *  proposition but did NOT entail it, this carries the best-matching source
+   *  so the CLI can suggest `vouch attest --from-session-tool`. */
+  hint?: { tool_use_id: string; uri: string; overlap: number };
 }
 
 export interface GateVerdict {
@@ -541,6 +545,8 @@ export interface SessionSource {
    *  for other Bash commands, URL (WebFetch), or `websearch:<query>`. */
   uri: string;
   content: string;
+  /** The `tool_use_id` from the transcript's `tool_result` block. */
+  tool_use_id?: string;
 }
 
 const SESSION_SOURCE_TOOLS = new Set(["Read", "WebFetch", "WebSearch", "Bash"]);
@@ -843,13 +849,98 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
       if (!uri || uri === "websearch:") continue;
       if (tu.name === "Read") text = stripLineNumbers(text); // Bash output is raw — no `cat -n` to strip
       if (text.length > MAX_SOURCE_CHARS) text = text.slice(0, MAX_SOURCE_CHARS);
-      out.push({ tool: tu.name as SessionSource["tool"], uri, content: text });
+      out.push({ tool: tu.name as SessionSource["tool"], uri, content: text, tool_use_id: b.tool_use_id });
     }
   }
   // Dedup by (tool|uri), keeping the freshest occurrence; cap total.
   const byKey = new Map<string, SessionSource>();
   for (const s of out) byKey.set(`${s.tool}|${s.uri}`, s);
   return [...byKey.values()].slice(-SESSION_SOURCES_MAX);
+}
+
+/** Look up a single session source by its `tool_use_id` without deduping.
+ *  Returns `null` if the transcript is unreadable or the id is not found. */
+export function findSessionSourceByToolUseId(
+  transcriptPath: string,
+  toolUseId: string,
+): SessionSource | null {
+  let raw: string;
+  try {
+    raw = readFileSync(transcriptPath, "utf8");
+  } catch {
+    return null;
+  }
+  const lines = raw.split("\n").filter((l) => l.trim());
+  if (!lines.length) return null;
+
+  const toolUseById = new Map<string, { name: string; input: any }>();
+  const events: any[] = [];
+  for (const line of lines) {
+    let ev: any;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    events.push(ev);
+    if (ev?.type !== "assistant") continue;
+    const c = ev?.message?.content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (b?.type === "tool_use" && typeof b.id === "string") {
+        toolUseById.set(b.id, { name: String(b.name ?? ""), input: b.input ?? {} });
+      }
+    }
+  }
+  if (!events.some((e) => typeof e?.type === "string")) return null;
+
+  for (const ev of events) {
+    if (ev?.type !== "user") continue;
+    const c = ev?.message?.content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (b?.type !== "tool_result" || b.tool_use_id !== toolUseId || b.is_error) continue;
+      const tu = toolUseById.get(b.tool_use_id);
+      if (!tu || !SESSION_SOURCE_TOOLS.has(tu.name)) continue;
+      let bashPath: string | null = null;
+      let bashCmd = "";
+      if (tu.name === "Bash") {
+        bashCmd = String(tu.input?.command ?? "");
+        if (isModelAuthoredOutputCommand(bashCmd)) continue;
+        bashPath = safeFileReadCommand(bashCmd);
+        if (!bashPath) {
+          const primary = bashCmd.split(/&&|;\s*/)[0]!.trim();
+          if (primary !== bashCmd) {
+            bashPath = safeFileReadCommand(primary);
+          }
+        }
+      }
+      let text = toolResultText(b.content).trim();
+      if (!text && ev.toolUseResult) {
+        const r = ev.toolUseResult;
+        if (tu.name === "Read") text = String(r?.file?.content ?? "").trim();
+        else if (tu.name === "WebFetch") text = String(r?.result ?? "").trim();
+        else if (tu.name === "Bash") text = String(r?.stdout ?? "").trim();
+      }
+      if (!text) continue;
+      let uri = "";
+      if (tu.name === "Read") uri = String(tu.input?.file_path ?? "");
+      else if (tu.name === "WebFetch") uri = String(tu.input?.url ?? "");
+      else if (tu.name === "WebSearch") uri = "websearch:" + String(tu.input?.query ?? "");
+      else if (tu.name === "Bash") {
+        if (bashPath) {
+          uri = bashPath;
+        } else {
+          uri = "session-bash: " + bashCmd.replace(/\s+/g, " ").slice(0, 200);
+        }
+      }
+      if (!uri || uri === "websearch:") continue;
+      if (tu.name === "Read") text = stripLineNumbers(text);
+      if (text.length > MAX_SOURCE_CHARS) text = text.slice(0, MAX_SOURCE_CHARS);
+      return { tool: tu.name as SessionSource["tool"], uri, content: text, tool_use_id: b.tool_use_id };
+    }
+  }
+  return null;
 }
 
 function sessionSourceTitle(src: SessionSource): string {
@@ -932,7 +1023,7 @@ function selectRelevantSlice(src: SessionSource, pair: ExtractedPair): { slice: 
 
 type AutoGroundOutcome =
   | { grounded: true; pair: GroundedPair }
-  | { grounded: false; checked: number };
+  | { grounded: false; checked: number; hint?: { tool_use_id: string; uri: string; overlap: number } };
 
 /** Try to ground `pair` against one of the session sources. May throw a
  *  TransientVerifierError (caller fail-opens, as with the KB check). */
@@ -1009,7 +1100,24 @@ async function autoGroundPair(
       },
     };
   }
-  return { grounded: false, checked: n };
+
+  // Compute the best lexical overlap among ALL sources for the breadcrumb hint.
+  const propTokens = tokenSet(pair.proposition);
+  let bestHint: { tool_use_id: string; uri: string; overlap: number } | undefined;
+  for (const s of sources) {
+    const overlap = jaccard(propTokens, tokenSet(s.content));
+    if (!bestHint || overlap > bestHint.overlap) {
+      bestHint = { tool_use_id: s.tool_use_id!, uri: s.uri, overlap };
+    }
+  }
+  if (bestHint) {
+    const entMentioned = bestHint.uri.toLowerCase().includes(pair.entity.toLowerCase()) ||
+      sources.find((s) => s.tool_use_id === bestHint!.tool_use_id)?.content.toLowerCase().includes(pair.entity.toLowerCase());
+    if (bestHint.overlap < 0.15 && !entMentioned) {
+      bestHint = undefined;
+    }
+  }
+  return { grounded: false, checked: n, ...(bestHint ? { hint: bestHint } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,7 +1580,7 @@ export async function runGate(opts: {
             }
             checked[r.idx] = r.res.grounded
               ? r.res.pair
-              : { ...checked[r.idx]!, session_sources_checked: r.res.checked };
+              : { ...checked[r.idx]!, session_sources_checked: r.res.checked, ...(r.res.hint ? { hint: r.res.hint } : {}) };
           }
         }
       }
@@ -1958,13 +2066,21 @@ function formatHarvestMessage(h: HarvestResult): string {
 
 function formatBlockMessage(verdict: GateVerdict, advisory: boolean): string {
   const ungrounded = verdict.pairs.filter((p) => !p.grounded);
-  const lines = ungrounded.map((p) => {
+  const lines: string[] = [];
+  for (const p of ungrounded) {
     const checked =
       p.session_sources_checked && p.session_sources_checked > 0
         ? ` — checked ${p.session_sources_checked} session source(s), none entailed`
         : "";
-    return `  • ${p.entity}: "${p.proposition.slice(0, 200)}" (${p.reason})${checked}`;
-  });
+    lines.push(`  • ${p.entity}: "${p.proposition.slice(0, 200)}" (${p.reason})${checked}`);
+    if (p.hint) {
+      const safeProp = p.proposition.replace(/"/g, '\\"');
+      lines.push(
+        `      — looks like a session observation (you ran \`${p.hint.uri}\` this session): ` +
+          `\`vouch attest --from-session-tool ${p.hint.tool_use_id} --stance observation --claim "${safeProp}"\` to record it`,
+      );
+    }
+  }
   const anySessionChecked = ungrounded.some((p) => (p.session_sources_checked ?? 0) > 0);
   const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
   const agNote = autoGrounded.length

@@ -22,6 +22,12 @@ export async function attestAndStore(opts: {
   date?: string;
   topic?: string;
   forceOverwrite?: boolean;
+  /** Override the default `attestation://<slug>` source_url. */
+  source_url?: string;
+  /** Override the default `user-statement` source_type. */
+  source_type?: string;
+  /** Override the default `attested` scope. */
+  scope?: string;
 }): Promise<AttestResult> {
   // 1. Validate slug format
   if (!/^[a-z0-9_-]+$/.test(opts.slug)) {
@@ -64,21 +70,24 @@ export async function attestAndStore(opts: {
 
   // 5. Persist via store.writeDossier (same primitive as fetched)
   const date = opts.date || new Date().toISOString().slice(0, 10);
+  const sourceUrl = opts.source_url ?? `attestation://${opts.slug}`;
+  const sourceType = opts.source_type ?? "user-statement";
   const slug = store.writeDossier({
-    source_url: `attestation://${opts.slug}`,
-    source_type: "user-statement",
+    source_url: sourceUrl,
+    source_type: sourceType,
     title: opts.slug,
     verbatim_content: content,
     embedding,
     publication_date: date,
     author_attribution: opts.attribution,
     slug: fullSlug,
+    scope: opts.scope ?? "attested",
   });
 
   return {
     dossier_slug: slug,
-    source_type: "user-statement",
-    source_url: `attestation://${opts.slug}`,
+    source_type: sourceType,
+    source_url: sourceUrl,
     attribution: opts.attribution,
     attestation_date: date,
     content_chars: content.length,

@@ -1349,9 +1349,12 @@ describe("parseSessionSources", () => {
     const byTool = Object.fromEntries(got.map((s) => [s.tool, s]));
     expect(byTool.Read!.uri).toBe("/repo/notes.md");
     expect(byTool.Read!.content).toBe("# Notes\nFoo benchmark has 42 tasks.");
+    expect(byTool.Read!.tool_use_id).toBe("tu_read");
     expect(byTool.WebFetch!.uri).toBe("https://example.com/foo");
     expect(byTool.WebFetch!.content).toContain("42 tasks total");
+    expect(byTool.WebFetch!.tool_use_id).toBe("tu_fetch");
     expect(byTool.WebSearch!.uri).toBe("websearch:foo benchmark size");
+    expect(byTool.WebSearch!.tool_use_id).toBe("tu_search");
   });
 
   it("ignores non-source tools, error results, and model-authored Bash — includes sidechain sources", () => {
@@ -1453,6 +1456,25 @@ describe("parseSessionSources", () => {
     const got = gate.parseSessionSources(path);
     expect(got.length).toBe(1);
     expect(got[0]!.content).toBe("new version");
+  });
+
+  it("findSessionSourceByToolUseId returns the exact source without dedup side effects", () => {
+    const path = join(tmp, "ps-find.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_old", name: "Read", input: { file_path: "/repo/x.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_old", content: "old version" }] } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_new", name: "Read", input: { file_path: "/repo/x.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_new", content: "new version" }] } }),
+      ].join("\n"),
+    );
+    const found = gate.findSessionSourceByToolUseId(path, "tu_old");
+    expect(found).not.toBeNull();
+    expect(found!.content).toBe("old version");
+    expect(found!.tool_use_id).toBe("tu_old");
+    expect(gate.findSessionSourceByToolUseId(path, "tu_missing")).toBeNull();
+    expect(gate.findSessionSourceByToolUseId(join(tmp, "no-such-file.jsonl"), "tu_old")).toBeNull();
   });
 });
 
@@ -1662,6 +1684,21 @@ describe("runGate session-evidence auto-grounding", () => {
     expect(v.pairs[0]!.auto_grounded).toBeUndefined();
     // No dossier/claim should have been recorded for a non-entailing source.
     expect(store.listDossiers().length).toBe(0);
+  });
+
+  it("session source overlaps lexically but does not entail → hint is returned for breadcrumb", async () => {
+    const path = join(tmp, "ag-hint.jsonl");
+    writeFileSync(path, transcriptWithSource("Bash", "tu_bash", { command: "git log --oneline -3" }, "abc123 Fix the flux capacitor\ndef456 Update README\nghi789 Bump version"));
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "flux capacitor", stance: "ASSERT", proposition: "The flux capacitor bug was fixed in commit abc123." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: false, score: 0.1, reason: "not explicitly stated" } } as any));
+    const v = await gate.runGate({ draft: "The flux capacitor bug was fixed in commit abc123.", model: "t", sessionTranscriptPath: path });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.hint).toBeDefined();
+    expect(v.pairs[0]!.hint!.tool_use_id).toBe("tu_bash");
+    expect(v.pairs[0]!.hint!.uri).toContain("git log");
+    expect(v.pairs[0]!.hint!.overlap).toBeGreaterThanOrEqual(0.15);
   });
 
   it("no session source mentions the entity → no NLI attempt, blocked with session_sources_checked=0", async () => {

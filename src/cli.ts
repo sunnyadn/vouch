@@ -18,7 +18,7 @@ import { embedOne } from "./embedder.ts";
 import { fetchAndStore } from "./fetch.ts";
 import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
-import { DEFAULT_GATE_MODEL, getFirstEventTimestamp, readStdinJson, runGateCli } from "./gate.ts";
+import { DEFAULT_GATE_MODEL, findSessionSourceByToolUseId, getFirstEventTimestamp, readStdinJson, runGateCli } from "./gate.ts";
 import { runDoctor } from "./doctor.ts";
 import {
   SEARCH_PROVIDERS,
@@ -343,55 +343,162 @@ program
     "Create a user-attested dossier. The user takes responsibility for the content; " +
       "vouch does not fetch or independently verify it. Downstream claims still verify " +
       "via quote-in-dossier + NLI. Pass --claim to file a representative claim against " +
-      "the new dossier in the same call (auto-quote, defaults to ATOMIC).",
+      "the new dossier in the same call (auto-quote, defaults to ATOMIC). " +
+      "Use --from-session-tool to record a session tool_result as a dossier.",
   )
-  .requiredOption("--slug <slug>", "stable slug; lowercase + dashes/underscores only")
+  .option("--slug <slug>", "stable slug; lowercase + dashes/underscores only (auto-derived with --from-session-tool)")
   .option("--content <text>", "attested content (inline)")
   .option("--content-file <path>", "attested content (from file)")
-  .requiredOption("--attribution <name>", "who attests (e.g., 'sunny')")
+  .option("--attribution <name>", "who attests (e.g., 'sunny'); defaults to session-<tool> with --from-session-tool")
   .option("--date <YYYY-MM-DD>", "attestation date; defaults to today UTC")
   .option("--topic <topic>", "searchability tag")
   .option("--force-overwrite", "replace existing attestation at same slug")
+  .option("--from-session-tool <id>", "use a session tool_result as the attested content (requires --session-context or --transcript-stdin)")
+  .option("--transcript-stdin", "read Stop-hook payload JSON from stdin to derive transcript path (used with --from-session-tool)")
+  .option("--session-context <path>", "Claude Code transcript JSONL to read tool_results from (used with --from-session-tool)")
+  .option("--stance <stance>", "observation | inference | hypothesis | placeholder (default observation; only with --from-session-tool)", "observation")
+  .option("--depends-on <ids>", "upstream claim IDs for --stance inference, comma-separated")
   .option(
     "--claim <text>",
     "file a representative claim against the new dossier in the same call (auto-quotes from content)",
   )
   .option("--claim-type <type>", "claim type when --claim is set: ATOMIC (default) | QUOTATION", "ATOMIC")
   .action(async (opts: any) => {
-    let content = opts.content;
-    if (!content && opts.contentFile) {
-      content = await Bun.file(opts.contentFile).text();
-    }
-    if (!content) {
-      console.error(
-        JSON.stringify({
-          error: "--content or --content-file required",
-          reason: "missing-content",
-        }),
-      );
-      process.exit(2);
+    let content: string | undefined;
+    let slug: string;
+    let attribution: string;
+    let sourceUrl: string | undefined;
+    let sourceType: string | undefined;
+    let scope: string | undefined;
+
+    if (opts.fromSessionTool) {
+      let transcriptPath: string | undefined = opts.sessionContext;
+      if (!transcriptPath && opts.transcriptStdin) {
+        const payload = readStdinJson();
+        if (typeof payload?.transcript_path === "string") {
+          transcriptPath = payload.transcript_path;
+        }
+      }
+      if (!transcriptPath) {
+        fail("--from-session-tool requires --session-context or --transcript-stdin");
+      }
+
+      const src = findSessionSourceByToolUseId(transcriptPath, opts.fromSessionTool);
+      if (!src) {
+        fail(`tool_result with tool_use_id "${opts.fromSessionTool}" not found in transcript`);
+      }
+
+      content = src.content;
+      const toolLower = src.tool.toLowerCase();
+      sourceUrl = src.uri;
+      sourceType = `session-${toolLower}`;
+      scope = src.tool === "Read" || src.tool === "Bash" ? "workspace" : "third-party";
+      attribution = opts.attribution || `session-${toolLower}`;
+
+      if (!opts.slug) {
+        const sanitized = src.uri
+          .toLowerCase()
+          .replace(/^https?:\/\//, "")
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 50);
+        const date = new Date().toISOString().slice(0, 10);
+        slug = `session-${toolLower}-${sanitized}-${date}`;
+      } else {
+        slug = opts.slug;
+      }
+    } else {
+      if (opts.stance && opts.stance !== "observation") {
+        process.stderr.write("warning: --stance is only meaningful with --from-session-tool; ignoring\n");
+      }
+      content = opts.content;
+      if (!content && opts.contentFile) {
+        content = await Bun.file(opts.contentFile).text();
+      }
+      if (!content) {
+        console.error(
+          JSON.stringify({
+            error: "--content or --content-file required",
+            reason: "missing-content",
+          }),
+        );
+        process.exit(2);
+      }
+      if (!opts.slug) {
+        fail("--slug is required");
+      }
+      if (!opts.attribution) {
+        fail("--attribution is required");
+      }
+      slug = opts.slug;
+      attribution = opts.attribution;
     }
 
+    let claimType: ClaimType | undefined;
     if (opts.claim) {
-      const allowed = ["ATOMIC", "QUOTATION"];
-      if (!allowed.includes(opts.claimType)) {
-        fail(
-          `invalid --claim-type "${opts.claimType}" for attest --claim. ` +
-            `Use one of: ${allowed.join(", ")}. (SYNTHESIS/INFERENCE/INTERPRETATION/HYPOTHESIS ` +
-            `don't fit the attest-and-claim shape — file them separately with \`vouch claim\`.)`,
-        );
+      if (opts.fromSessionTool) {
+        if (opts.stance === "placeholder") {
+          console.error(
+            JSON.stringify({
+              error: "a placeholder / TODO isn't a claim — file it once it's measured",
+              reason: "placeholder-refused",
+            }),
+          );
+          process.exit(1);
+        }
+        if (opts.stance === "qualified-inference") {
+          console.error(
+            JSON.stringify({
+              error: "not yet supported — use --stance observation then `vouch claim --type INTERPRETATION --depends-on <id>` separately",
+              reason: "qualified-inference-deferred",
+            }),
+          );
+          process.exit(1);
+        }
+        const stanceMap: Record<string, ClaimType> = {
+          observation: "ATOMIC",
+          inference: "INFERENCE",
+          hypothesis: "HYPOTHESIS",
+        };
+        claimType = stanceMap[opts.stance];
+        if (!claimType) {
+          fail(`invalid --stance "${opts.stance}"`);
+        }
+        if (claimType === "INFERENCE" && !opts.dependsOn) {
+          fail("--stance inference requires --depends-on");
+        }
+        if (opts.claimType && opts.claimType !== claimType) {
+          process.stderr.write(
+            `warning: --claim-type (${opts.claimType}) conflicts with --stance (${opts.stance}); --stance wins\n`,
+          );
+        }
+      } else {
+        const allowed = ["ATOMIC", "QUOTATION"];
+        if (!allowed.includes(opts.claimType)) {
+          fail(
+            `invalid --claim-type "${opts.claimType}" for attest --claim. ` +
+              `Use one of: ${allowed.join(", ")}. (SYNTHESIS/INFERENCE/INTERPRETATION/HYPOTHESIS ` +
+              `don't fit the attest-and-claim shape — file them separately with \`vouch claim\`.)`,
+          );
+        }
+        claimType = opts.claimType;
       }
+    } else if (opts.fromSessionTool && opts.stance !== "observation") {
+      process.stderr.write("note: --stance is ignored when --claim is not set\n");
     }
 
     let attestResult: Awaited<ReturnType<typeof attestAndStore>>;
     try {
       attestResult = await attestAndStore({
-        slug: opts.slug,
-        content,
-        attribution: opts.attribution,
+        slug,
+        content: content!,
+        attribution,
         date: opts.date,
         topic: opts.topic,
         forceOverwrite: opts.forceOverwrite,
+        source_url: sourceUrl,
+        source_type: sourceType,
+        scope,
       });
     } catch (e: any) {
       console.error(
@@ -406,12 +513,19 @@ program
     }
 
     try {
+      const dependsOn: number[] | undefined = opts.dependsOn
+        ? String(opts.dependsOn)
+            .split(",")
+            .map((s: string) => parseInt(s.trim(), 10))
+            .filter((n: number) => !isNaN(n))
+        : undefined;
       const claimResult = await submitClaim({
         text: opts.claim,
-        claim_type: opts.claimType as ClaimType,
+        claim_type: claimType!,
         topic: opts.topic,
         author: "claude-skill",
         dossier_slug: attestResult.dossier_slug,
+        depends_on_ids: dependsOn,
       });
       emit({ ...attestResult, ...claimResult }, renderAttestWithClaim);
     } catch (e: any) {
