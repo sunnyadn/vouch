@@ -7,6 +7,9 @@
  * Output: JSON by default (parseable by Claude). --pretty for human inspection.
  */
 import { Command } from "commander";
+import { mkdirSync, appendFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 import * as store from "./store.ts";
 import { submitClaim } from "./submit.ts";
@@ -14,7 +17,7 @@ import { embedOne } from "./embedder.ts";
 import { fetchAndStore } from "./fetch.ts";
 import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
-import { DEFAULT_GATE_MODEL, readStdinJson, runGateCli } from "./gate.ts";
+import { DEFAULT_GATE_MODEL, getFirstEventTimestamp, readStdinJson, runGateCli } from "./gate.ts";
 import { runDoctor } from "./doctor.ts";
 import {
   SEARCH_PROVIDERS,
@@ -332,6 +335,73 @@ program
     const authorParts = Object.entries(summary.authorBreakdown).map(([a, n]) => `${a}=${n}`);
     const header = `${summary.total} new (${summary.supported} supported / ${summary.unsupported} unsupported / ${summary.recorded} recorded-derived) across ${summary.dossiers} dossier(s) — author breakdown: ${authorParts.join(" ")}`;
     emit({ summary: { ...summary, header }, claims });
+  });
+
+// ---------- digest ----------
+program
+  .command("digest")
+  .description(
+    "Content-bearing summary of KB mutations in a time window (the session-level complement to the per-turn turn Δ line)",
+  )
+  .option("--since <when>", "relative (1h, 12h, 1d, 3d, 1w), absolute ISO, or 'session'")
+  .option("--transcript-path <path>", "Transcript path (used with --since session)")
+  .option("--transcript-stdin", "Read Stop-hook payload from stdin (used with --since session)")
+  .option("--write [path]", "Append digest as Markdown to path (default ~/.vouch/sessions/<date>.md)")
+  .action(async (opts: any) => {
+    const gapHours = parseInt(process.env.VOUCH_SESSION_GAP_HOURS || "2", 10);
+    let since: string;
+
+    if (!opts.since) {
+      since = store.getSessionStart(gapHours);
+    } else if (opts.since === "session") {
+      let transcriptPath: string | undefined = opts.transcriptPath;
+      if (!transcriptPath && opts.transcriptStdin) {
+        const payload = readStdinJson();
+        if (typeof payload?.transcript_path === "string") {
+          transcriptPath = payload.transcript_path;
+        }
+      }
+      if (transcriptPath) {
+        const ts = getFirstEventTimestamp(transcriptPath);
+        if (ts) {
+          since = ts;
+        } else {
+          since = store.getSessionStart(gapHours);
+        }
+      } else {
+        since = store.getSessionStart(gapHours);
+      }
+    } else {
+      try {
+        since = parseSince(opts.since);
+      } catch (e: any) {
+        fail(e.message);
+      }
+    }
+
+    const digest = store.getDigest(since);
+    const isEmpty =
+      digest.claims.length === 0 &&
+      digest.derived_claims.length === 0 &&
+      digest.supersedes.length === 0 &&
+      digest.dossiers.length === 0 &&
+      digest.dependencies.length === 0;
+
+    let out: any = digest;
+    if (isEmpty) {
+      out = { ...digest, message: "(nothing entered the KB in this window)" };
+    }
+
+    if (opts.write !== undefined) {
+      const md = store.formatDigestMarkdown(digest);
+      const defaultPath = join(homedir(), ".vouch", "sessions", `${new Date().toISOString().slice(0, 10)}.md`);
+      const outPath = typeof opts.write === "string" && opts.write ? opts.write : defaultPath;
+      mkdirSync(dirname(outPath), { recursive: true });
+      appendFileSync(outPath, md + "\n");
+      emit({ ...out, written_to: outPath });
+    } else {
+      emit(out);
+    }
   });
 
 // ---------- get-claim ----------

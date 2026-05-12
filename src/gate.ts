@@ -1277,6 +1277,34 @@ export async function readLatestAssistantTurn(
   return { ...last, isFresh: false };
 }
 
+/** Derive the session start timestamp from a Claude Code transcript's first
+ *  event. Returns `null` if the file is unreadable or contains no timestamped
+ *  events. */
+export function getFirstEventTimestamp(transcriptPath: string): string | null {
+  try {
+    const raw = readFileSync(transcriptPath, "utf8").trim();
+    if (!raw) return null;
+    let firstTs: string | null = null;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let ev: any;
+      try {
+        ev = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (typeof ev?.timestamp === "string") {
+        if (!firstTs || ev.timestamp < firstTs) {
+          firstTs = ev.timestamp;
+        }
+      }
+    }
+    return firstTs;
+  } catch {
+    return null;
+  }
+}
+
 export function readStdinJson(): any {
   try {
     return JSON.parse(readFileSync(0, "utf8"));

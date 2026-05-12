@@ -454,6 +454,264 @@ export interface RecentSummary {
   authorBreakdown: Record<string, number>;
 }
 
+// ---------------------------------------------------------------------------
+// Digest — content-bearing KB mutation summary
+// ---------------------------------------------------------------------------
+
+const CLAIM_TYPE_TO_KIND: Record<string, string> = {
+  INFERENCE: "inference-from",
+  SYNTHESIS: "synthesis-of",
+  INTERPRETATION: "interpretation",
+  HYPOTHESIS: "hypothesis",
+};
+
+export interface DigestEntry {
+  since: string;
+  claims: {
+    id: number;
+    claim_type: string | null;
+    claim_text: string;
+    nli_score: number | null;
+    status: string;
+    dossier_slug: string | null;
+    source_passage: string | null;
+    dossier_source_url: string | null;
+    verified_at: string;
+    author: string | null;
+    verification: string | null;
+  }[];
+  derived_claims: {
+    id: number;
+    kind: string;
+    claim_text: string;
+    upstream_ids: number[];
+    soft_score: number | null;
+    verified_at: string;
+  }[];
+  supersedes: {
+    old_id: number;
+    new_id: number;
+    reason: string | null;
+  }[];
+  dossiers: {
+    slug: string;
+    source_url: string;
+    source_type: string;
+    capture_date: string;
+    scope: string | null;
+  }[];
+  dependencies: {
+    claim_id: number;
+    depends_on_ids: number[];
+  }[];
+}
+
+export function getDigest(since: string): DigestEntry {
+  const db = getDb();
+
+  const claimRows = db
+    .prepare(
+      `SELECT c.id, c.claim_type, c.claim_text, c.nli_score, c.status,
+              c.dossier_slug, c.source_passage, c.verified_at, c.author, c.verification, c.soft_score,
+              d.source_url as dossier_source_url
+       FROM claims c
+       LEFT JOIN dossiers d ON c.dossier_slug = d.slug
+       WHERE c.verified_at >= ?
+       ORDER BY c.verified_at DESC`,
+    )
+    .all(since) as any[];
+
+  const claims: DigestEntry["claims"] = [];
+  const derived_claims: DigestEntry["derived_claims"] = [];
+
+  for (const c of claimRows) {
+    if (c.verification === "tag-harvest") {
+      const deps = db
+        .prepare("SELECT depends_on_id FROM claim_dependencies WHERE claim_id = ? ORDER BY depends_on_id")
+        .all(c.id) as { depends_on_id: number }[];
+      derived_claims.push({
+        id: c.id,
+        kind: CLAIM_TYPE_TO_KIND[c.claim_type] || c.claim_type || "UNKNOWN",
+        claim_text: c.claim_text,
+        upstream_ids: deps.map((d) => d.depends_on_id),
+        soft_score: c.soft_score,
+        verified_at: c.verified_at,
+      });
+    } else {
+      claims.push({
+        id: c.id,
+        claim_type: c.claim_type,
+        claim_text: c.claim_text,
+        nli_score: c.nli_score,
+        status: c.status,
+        dossier_slug: c.dossier_slug,
+        source_passage: c.source_passage,
+        dossier_source_url: c.dossier_source_url,
+        verified_at: c.verified_at,
+        author: c.author,
+        verification: c.verification,
+      });
+    }
+  }
+
+  const supersedes = db
+    .prepare(
+      `SELECT old.id as old_id, old.superseded_by as new_id, old.supersede_reason as reason
+       FROM claims old
+       JOIN claims new ON old.superseded_by = new.id
+       WHERE new.verified_at >= ? AND old.superseded_by IS NOT NULL`,
+    )
+    .all(since) as any[];
+
+  const dossiers = db
+    .prepare(
+      `SELECT slug, source_url, source_type, capture_date, scope
+       FROM dossiers
+       WHERE capture_date >= ?
+       ORDER BY capture_date DESC`,
+    )
+    .all(since) as any[];
+
+  const depRows = db
+    .prepare(
+      `SELECT cd.claim_id, cd.depends_on_id
+       FROM claim_dependencies cd
+       JOIN claims c ON cd.claim_id = c.id
+       WHERE c.verified_at >= ?
+       ORDER BY cd.claim_id, cd.depends_on_id`,
+    )
+    .all(since) as { claim_id: number; depends_on_id: number }[];
+
+  const depMap = new Map<number, number[]>();
+  for (const d of depRows) {
+    if (!depMap.has(d.claim_id)) depMap.set(d.claim_id, []);
+    depMap.get(d.claim_id)!.push(d.depends_on_id);
+  }
+  const dependencies = [...depMap.entries()].map(([claim_id, depends_on_ids]) => ({
+    claim_id,
+    depends_on_ids,
+  }));
+
+  return { since, claims, derived_claims, supersedes, dossiers, dependencies };
+}
+
+export function getSessionStart(gapHours = 2): string {
+  const db = getDb();
+  const gapMs = gapHours * 3600 * 1000;
+
+  const claimRows = db
+    .prepare(
+      "SELECT verified_at FROM claims WHERE verified_at IS NOT NULL ORDER BY verified_at DESC LIMIT 200",
+    )
+    .all() as { verified_at: string }[];
+
+  const dossierRows = db
+    .prepare(
+      "SELECT capture_date AS verified_at FROM dossiers WHERE capture_date IS NOT NULL ORDER BY capture_date DESC LIMIT 200",
+    )
+    .all() as { verified_at: string }[];
+
+  const allTimestamps = [...claimRows, ...dossierRows]
+    .map((r) => new Date(r.verified_at).getTime())
+    .filter((t) => !isNaN(t))
+    .sort((a, b) => b - a);
+
+  if (allTimestamps.length === 0) {
+    return new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  }
+
+  for (let i = 0; i < allTimestamps.length - 1; i++) {
+    const gap = allTimestamps[i]! - allTimestamps[i + 1]!;
+    if (gap > gapMs) {
+      return new Date(allTimestamps[i]!).toISOString();
+    }
+  }
+
+  if (allTimestamps.length < 3) {
+    return new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  }
+
+  return new Date(allTimestamps[allTimestamps.length - 1]!).toISOString();
+}
+
+export function formatDigestMarkdown(digest: DigestEntry): string {
+  const lines: string[] = [];
+  const date = new Date().toISOString().slice(0, 10);
+  lines.push(`# KB Digest — ${date}`);
+  lines.push("");
+  lines.push(`*Window: ${digest.since} → now*`);
+  lines.push("");
+
+  const isEmpty =
+    digest.claims.length === 0 &&
+    digest.derived_claims.length === 0 &&
+    digest.supersedes.length === 0 &&
+    digest.dossiers.length === 0 &&
+    digest.dependencies.length === 0;
+
+  if (isEmpty) {
+    lines.push("(nothing entered the KB in this window)");
+    lines.push("");
+    return lines.join("\n");
+  }
+
+  if (digest.claims.length) {
+    lines.push(`## New verified claims (${digest.claims.length})`);
+    lines.push("");
+    for (const c of digest.claims) {
+      const quote = c.source_passage
+        ? ` · "${c.source_passage.slice(0, 160)}${c.source_passage.length > 160 ? "…" : ""}"`
+        : "";
+      const dossier = c.dossier_slug ? ` · Dossier: \`${c.dossier_slug}\`` : "";
+      lines.push(
+        `- **#${c.id}** · ${c.claim_type || "UNKNOWN"} · score ${c.nli_score ?? "—"} · "${c.claim_text.slice(0, 200)}${c.claim_text.length > 200 ? "…" : ""}"${dossier}${quote}`,
+      );
+    }
+    lines.push("");
+  }
+
+  if (digest.derived_claims.length) {
+    lines.push(`## Harvested derived claims (${digest.derived_claims.length})`);
+    lines.push("");
+    for (const d of digest.derived_claims) {
+      const upstream = d.upstream_ids.length ? ` · Upstream: ${d.upstream_ids.map((id) => `#${id}`).join(", ")}` : "";
+      lines.push(
+        `- **#${d.id}** · ${d.kind} · "${d.claim_text.slice(0, 200)}${d.claim_text.length > 200 ? "…" : ""}"${upstream}`,
+      );
+    }
+    lines.push("");
+  }
+
+  if (digest.supersedes.length) {
+    lines.push(`## Supersedes (${digest.supersedes.length})`);
+    lines.push("");
+    for (const s of digest.supersedes) {
+      lines.push(`- #${s.old_id} → #${s.new_id} · ${s.reason || "no reason given"}`);
+    }
+    lines.push("");
+  }
+
+  if (digest.dossiers.length) {
+    lines.push(`## New dossiers (${digest.dossiers.length})`);
+    lines.push("");
+    for (const d of digest.dossiers) {
+      lines.push(`- \`${d.slug}\` · ${d.source_url} · ${d.capture_date.slice(0, 10)} · ${d.source_type}`);
+    }
+    lines.push("");
+  }
+
+  if (digest.dependencies.length) {
+    lines.push(`## New dependency edges (${digest.dependencies.length})`);
+    lines.push("");
+    for (const dep of digest.dependencies) {
+      lines.push(`- #${dep.claim_id} → depends on ${dep.depends_on_ids.map((id) => `#${id}`).join(", ")}`);
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
 export function listRecentClaimsSummary(since: string): RecentSummary {
   const db = getDb();
   const statusRow = db

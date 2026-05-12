@@ -289,6 +289,33 @@ See `vouch <command> --help` for full flags.
 
 Default DB at `~/.vouch/store.db` (SQLite). Override with `VOUCH_DB_PATH`.
 
+## Seeing what your KB learned
+
+As the gate auto-grounds, auto-harvests, and folds attestations, claims enter the
+KB silently. `vouch digest` shows you what accumulated in a session (or any
+time window) — the actual claims, their scores, and their provenance.
+
+```bash
+vouch digest                          # "this session" heuristic (gap-based)
+vouch digest --since 2h               # explicit relative window
+vouch digest --since 2026-05-11T10:00 # explicit absolute window
+vouch digest --since session          # derive window from transcript start
+vouch digest --write                  # append Markdown to ~/.vouch/sessions/<date>.md
+vouch digest --write ~/notes/today.md # append to custom path
+```
+
+Output groups:
+
+- **New verified claims** — id, type, NLI score, claim text, dossier slug + matched quote
+- **Harvested derived claims** — id, kind (inference-from / synthesis-of / interpretation / hypothesis), text, upstream claim ids
+- **Supersedes** — old id → new id with reason
+- **New dossiers** — slug, source URL, capture date, source type
+- **New dependency edges** — claim id → depends-on id(s)
+
+The per-turn `[vouch-gate] turn Δ:` line gives counts; `vouch digest` gives the
+content. A `SessionEnd` hook that auto-runs `vouch digest --write` at session
+wrap lives in `~/.claude/skills/vouch/` and is set up outside this repo.
+
 ## The research loop
 
 vouch is meant to *be* the agent's research tools, so the dossier a claim
