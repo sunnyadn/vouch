@@ -12,3 +12,8 @@ web-articles/
 bench/phase0/.minicheck_cache/
 bench/phase0/__pycache__/
 *.pyc
+
+# bench/gate-recall — PRIVATE: contains extracts of sunny's own Claude Code conversation
+# transcripts (corpus/cc-*.md and the frozen_extractions/labels that embed them). Never commit.
+# A publishable benchmark (synthetic-only) gets reconstructed separately.
+bench/gate-recall/
