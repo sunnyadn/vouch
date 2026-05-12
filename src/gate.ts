@@ -516,28 +516,29 @@ async function batchGroundAssertions(
 }
 
 // ---------------------------------------------------------------------------
-// Session-evidence auto-grounding (issues #21, #22)
+// Session-evidence auto-grounding (issues #21, #22, #39)
 //
 // Before the gate blocks an ungrounded ASSERT, it checks whether the agent
 // already retrieved a source supporting the proposition THIS SESSION — via a
 // `Read` (local file), `WebFetch` (page content), `WebSearch` (result
-// snippets), or a `Bash` single-file read (`cat`/`head`/`tail`/`< F`). Those
-// live in the transcript's `tool_result` events. If one entity-mentioning
-// result NLI-entails the proposition, we snapshot it as a dossier, file the
-// claim against it, and pass.
+// snippets), or a `Bash` command whose output is NOT model-authored (denylist:
+// `echo`, `printf`, `yes`, `:`, `true`, heredocs, and scripting one-liners
+// with quoted literal args). Those live in the transcript's `tool_result`
+// events. If one entity-mentioning result NLI-entails the proposition, we
+// snapshot it as a dossier, file the claim against it, and pass.
 //
 // We trust ONLY content that came back from a tool — never the assistant's own
 // asserted prose. WebFetch content is model-extracted (not raw HTML), so a
-// failed NLI there is the cue to do a real `vouch fetch <url>`. Bash output is
-// unstructured, so only the narrow set of commands whose output IS a file's
-// content verbatim counts (see `safeFileReadCommand`) — anything that pipes,
-// globs, merges files, or runs another program is opaque and ignored.
+// failed NLI there is the cue to do a real `vouch fetch <url>`. Bash output
+// that is a verbatim file read (`cat`/`head`/`tail`) gets the file path as its
+// URI; everything else gets an honest `session-bash:<cmd>` provenance.
 // ---------------------------------------------------------------------------
 
 export interface SessionSource {
-  /** `Bash` = a recognized single-file read (`cat`/`head`/`tail`/`< F`). */
+  /** `Bash` = any non-model-authored command (denylist, not allowlist). */
   tool: "Read" | "WebFetch" | "WebSearch" | "Bash";
-  /** Source identifier: a file path (Read / Bash), URL (WebFetch), or `websearch:<query>`. */
+  /** Source identifier: a file path (Read / Bash cat-head-tail), `session-bash:<cmd>`
+   *  for other Bash commands, URL (WebFetch), or `websearch:<query>`. */
   uri: string;
   content: string;
 }
@@ -688,6 +689,49 @@ export function safeFileReadCommand(cmd: string): string | null {
   return expandTilde(path);
 }
 
+/** True when a Bash command's PRIMARY output is text the model typed, not bytes
+ *  a system produced. We look only at the command up to the first `&&`, `;`, `|`,
+ *  or `>` — a trailing model-authored command (`cat realfile && echo done`) does
+ *  not poison a source whose primary output is a real file read. */
+function isModelAuthoredOutputCommand(cmd: string): boolean {
+  const trimmed = (cmd || "").trim();
+  if (!trimmed) return false;
+
+  // Primary command: up to the first control operator.
+  const controlRe = /&&|;|\||>/;
+  const primary = trimmed.split(controlRe)[0]!.trim();
+  if (!primary) return false;
+
+  // First token (strip leading path)
+  let firstToken = primary.match(/^(\S+)/)?.[1] ?? "";
+  const slash = Math.max(firstToken.lastIndexOf("/"), firstToken.lastIndexOf("\\"));
+  if (slash >= 0) firstToken = firstToken.slice(slash + 1);
+
+  // Direct model-authored output commands
+  if (["echo", "printf", "yes", ":", "true"].includes(firstToken)) return true;
+
+  // Scripting one-liners with a quoted -c / -e / -pe arg
+  if (["python", "python3", "node", "ruby", "perl", "bun", "deno"].includes(firstToken)) {
+    const args = primary.split(/\s+/).slice(1);
+    for (let i = 0; i < args.length; i++) {
+      if (args[i]!.match(/^-[ce]$/) || args[i] === "-pe") {
+        const next = args[i + 1];
+        if (next && (next.startsWith("'") || next.startsWith('"'))) return true;
+      }
+    }
+  }
+
+  // Heredoc with a closing delimiter — the body is model-authored text
+  const heredocMatch = trimmed.match(/<<['"](\w+)['"]/) || trimmed.match(/<<(\w+)/);
+  if (heredocMatch) {
+    const delimiter = heredocMatch[1]!;
+    const endPattern = new RegExp(`\\n${delimiter}(?:\\s|$)`);
+    if (endPattern.test(trimmed)) return true;
+  }
+
+  return false;
+}
+
 function toolResultText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -758,11 +802,22 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
       if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string" || b.is_error) continue;
       const tu = toolUseById.get(b.tool_use_id);
       if (!tu || !SESSION_SOURCE_TOOLS.has(tu.name)) continue;
-      // Bash only counts when the command is an unambiguous single-file read.
       let bashPath: string | null = null;
+      let bashCmd = "";
       if (tu.name === "Bash") {
-        bashPath = safeFileReadCommand(String(tu.input?.command ?? ""));
-        if (!bashPath) continue;
+        bashCmd = String(tu.input?.command ?? "");
+        if (isModelAuthoredOutputCommand(bashCmd)) continue;
+        bashPath = safeFileReadCommand(bashCmd);
+        // If the full command fails safeFileReadCommand but the primary portion
+        // (before && or ;) is a clean read, trust the primary (e.g.
+        // `cat file && echo done`). We do NOT do this for pipes or redirects,
+        // because the output is transformed, not verbatim file content.
+        if (!bashPath) {
+          const primary = bashCmd.split(/&&|;\s*/)[0]!.trim();
+          if (primary !== bashCmd) {
+            bashPath = safeFileReadCommand(primary);
+          }
+        }
       }
       let text = toolResultText(b.content).trim();
       if (!text && ev.toolUseResult) {
@@ -776,7 +831,13 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
       if (tu.name === "Read") uri = String(tu.input?.file_path ?? "");
       else if (tu.name === "WebFetch") uri = String(tu.input?.url ?? "");
       else if (tu.name === "WebSearch") uri = "websearch:" + String(tu.input?.query ?? "");
-      else if (tu.name === "Bash") uri = bashPath!;
+      else if (tu.name === "Bash") {
+        if (bashPath) {
+          uri = bashPath;
+        } else {
+          uri = "session-bash: " + bashCmd.replace(/\s+/g, " ").slice(0, 200);
+        }
+      }
       if (!uri || uri === "websearch:") continue;
       if (tu.name === "Read") text = stripLineNumbers(text); // Bash output is raw — no `cat -n` to strip
       if (text.length > MAX_SOURCE_CHARS) text = text.slice(0, MAX_SOURCE_CHARS);
@@ -797,6 +858,74 @@ function sessionSourceTitle(src: SessionSource): string {
   }
   if (src.tool === "WebSearch") return src.uri.replace(/^websearch:/, "web search: ");
   return src.uri;
+}
+
+// ---------------------------------------------------------------------------
+// Relevant-chunk slicing for large session sources (issue #39)
+// ---------------------------------------------------------------------------
+
+const SESSION_CHUNK_THRESHOLD = 8000;
+const SESSION_CHUNK_MAX_SIZE = 2000;
+const SESSION_CHUNK_OVERLAP = 300;
+const SESSION_LEXICAL_TOPK = 5;
+const SESSION_NLI_TOPK = 3;
+const SESSION_NLI_MAX_CHARS = 6000;
+
+function splitIntoChunks(text: string): string[] {
+  const paragraphs = text.split(/\n\s*\n/);
+  const chunks: string[] = [];
+  for (const p of paragraphs) {
+    if (!p.trim()) continue;
+    if (p.length <= SESSION_CHUNK_MAX_SIZE) {
+      chunks.push(p);
+    } else {
+      const step = SESSION_CHUNK_MAX_SIZE - SESSION_CHUNK_OVERLAP;
+      for (let i = 0; i < p.length; i += step) {
+        chunks.push(p.slice(i, i + SESSION_CHUNK_MAX_SIZE));
+      }
+    }
+  }
+  return chunks;
+}
+
+function rankChunksLexical(chunks: string[], proposition: string, entity: string): string[] {
+  const propTokens = tokenSet(proposition);
+  const ent = entity.toLowerCase().trim();
+  const scored = chunks.map((chunk) => ({
+    chunk,
+    score: jaccard(propTokens, tokenSet(chunk)) + (ent && chunk.toLowerCase().includes(ent) ? 0.3 : 0),
+  }));
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, SESSION_LEXICAL_TOPK).map((s) => s.chunk);
+}
+
+function selectRelevantSlice(src: SessionSource, pair: ExtractedPair): { slice: string; reason: string } {
+  if (src.content.length <= SESSION_CHUNK_THRESHOLD) {
+    return { slice: src.content, reason: "full content" };
+  }
+
+  const chunks = splitIntoChunks(src.content);
+  if (chunks.length === 0) {
+    return { slice: src.content.slice(0, MAX_SOURCE_CHARS), reason: "head" };
+  }
+
+  const topChunks = rankChunksLexical(chunks, pair.proposition, pair.entity);
+  if (topChunks.length === 0) {
+    return { slice: src.content.slice(0, MAX_SOURCE_CHARS), reason: "head" };
+  }
+
+  const selected: string[] = [];
+  let total = 0;
+  for (const c of topChunks.slice(0, SESSION_NLI_TOPK)) {
+    if (total + c.length + 5 > SESSION_NLI_MAX_CHARS) break;
+    selected.push(c);
+    total += c.length + 5;
+  }
+  if (selected.length === 0) {
+    selected.push(topChunks[0]!.slice(0, SESSION_NLI_MAX_CHARS));
+  }
+
+  return { slice: selected.join("\n---\n"), reason: `chunked top-${selected.length}` };
 }
 
 type AutoGroundOutcome =
@@ -824,7 +953,7 @@ async function autoGroundPair(
   let n = 0;
   for (const src of matching) {
     n++;
-    const slice = src.content.slice(0, MAX_SOURCE_CHARS);
+    const { slice, reason: sliceReason } = selectRelevantSlice(src, pair);
     const verdict = await verifyClaimAgainstSource(pair.proposition, slice);
     if (verdict.status !== "supported") continue;
 
@@ -874,7 +1003,7 @@ async function autoGroundPair(
         matched_claim_id: cid,
         auto_grounded: true,
         session_sources_checked: n,
-        reason: `auto-grounded from session ${src.tool} of ${src.uri} (claim ${cid}, score=${verdict.score.toFixed(2)})`,
+        reason: `auto-grounded from session ${src.tool} of ${src.uri} (${sliceReason}, score=${verdict.score.toFixed(2)})`,
       },
     };
   }

@@ -1354,7 +1354,7 @@ describe("parseSessionSources", () => {
     expect(byTool.WebSearch!.uri).toBe("websearch:foo benchmark size");
   });
 
-  it("ignores non-source tools, error results, and sidechain events", () => {
+  it("ignores non-source tools, error results, sidechain events, and model-authored Bash", () => {
     const path = join(tmp, "ps2.jsonl");
     writeFileSync(
       path,
@@ -1363,7 +1363,7 @@ describe("parseSessionSources", () => {
           type: "assistant",
           message: {
             content: [
-              { type: "tool_use", id: "tu_bash", name: "Bash", input: { command: "ls" } },
+              { type: "tool_use", id: "tu_bash", name: "Bash", input: { command: "echo 'a.txt b.txt'" } },
               { type: "tool_use", id: "tu_read_err", name: "Read", input: { file_path: "/missing" } },
             ],
           },
@@ -1399,7 +1399,7 @@ describe("parseSessionSources", () => {
     expect(gate.parseSessionSources(join(tmp, "no-such-file.jsonl"))).toEqual([]);
   });
 
-  it("picks up Bash single-file reads (cat/head); ignores pipes/multi-file/other commands; no cat -n stripping", () => {
+  it("picks up Bash single-file reads AND non-model-authored commands; ignores model-authored output; no cat -n stripping", () => {
     const path = join(tmp, "ps5.jsonl");
     writeFileSync(
       path,
@@ -1410,23 +1410,29 @@ describe("parseSessionSources", () => {
         // head -n N F → picked up
         JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_head", name: "Bash", input: { command: "head -n 5 ./config.yaml" } }] } }),
         JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_head", content: "model: test" }] } }),
-        // pipe → not a session source
+        // pipe → now a session source (primary command is cat, not model-authored)
         JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_pipe", name: "Bash", input: { command: "cat /repo/big.md | grep Foo" } }] } }),
         JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_pipe", content: "Foo benchmark line" }] } }),
-        // multi-file → not a session source
+        // multi-file → still rejected by safeFileReadCommand
         JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_multi", name: "Bash", input: { command: "cat a.md b.md" } }] } }),
         JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_multi", content: "merged content" }] } }),
-        // git log → not a session source
+        // git log → now a session source (denylist inversion)
         JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_git", name: "Bash", input: { command: "git log --oneline -5" } }] } }),
         JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_git", content: "abc123 commit" }] } }),
+        // echo → model-authored, skipped
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_echo", name: "Bash", input: { command: "echo 'X is Y'" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_echo", content: "X is Y" }] } }),
       ].join("\n"),
     );
     const got = gate.parseSessionSources(path);
-    expect(got.length).toBe(2);
-    expect(got.every((s) => s.tool === "Bash")).toBe(true);
+    expect(got.length).toBe(5);
     const byUri = Object.fromEntries(got.map((s) => [s.uri, s]));
     expect(byUri["/repo/META.md"]!.content).toBe("Foo benchmark has 42 tasks.\n     1\tnot a line-number prefix");
     expect(byUri["./config.yaml"]!.content).toBe("model: test");
+    expect(byUri["session-bash: cat /repo/big.md | grep Foo"]!.content).toBe("Foo benchmark line");
+    expect(byUri["session-bash: git log --oneline -5"]!.content).toBe("abc123 commit");
+    expect(byUri["session-bash: cat a.md b.md"]!.content).toBe("merged content");
+    expect(byUri["echo 'X is Y'"]).toBeUndefined();
   });
 
   it("dedups by (tool|uri), keeping the freshest content", () => {
@@ -1443,6 +1449,93 @@ describe("parseSessionSources", () => {
     const got = gate.parseSessionSources(path);
     expect(got.length).toBe(1);
     expect(got[0]!.content).toBe("new version");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSessionSources — Bash denylist inversion (issue #39)
+// ---------------------------------------------------------------------------
+
+describe("parseSessionSources Bash denylist", () => {
+  function makeTranscript(cmd: string, content: string): string {
+    const id = `tu_${Math.random().toString(36).slice(2, 8)}`;
+    return [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name: "Bash", input: { command: cmd } }] } }),
+      JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content }] } }),
+    ].join("\n");
+  }
+
+  it("accepts non-model-authored commands: git log, sed, grep, sqlite3, ls, ./bin", () => {
+    const path = join(tmp, "dl-accept.jsonl");
+    writeFileSync(
+      path,
+      [
+        makeTranscript("git log --oneline -10", "abc123 fix thing\ndef456 add feature"),
+        makeTranscript("sed -n '10,50p' src/foo.ts", "const x = 1;"),
+        makeTranscript("grep -n pattern src/foo.ts", "42:pattern match"),
+        makeTranscript('sqlite3 db "SELECT * FROM t"', "1|a\n2|b"),
+        makeTranscript("ls -la", "total 0\n-rw-r--r-- 1 user group 0 Jan 1 00:00 file"),
+        makeTranscript("./dist/vouch --help", "Usage: vouch ..."),
+      ].join("\n"),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(6);
+    const uris = got.map((s) => s.uri);
+    expect(uris.some((u) => u.includes("git log"))).toBe(true);
+    expect(uris.some((u) => u.includes("sed"))).toBe(true);
+    expect(uris.some((u) => u.includes("grep"))).toBe(true);
+    expect(uris.some((u) => u.includes("sqlite3"))).toBe(true);
+    expect(uris.some((u) => u.includes("ls"))).toBe(true);
+    expect(uris.some((u) => u.includes("vouch"))).toBe(true);
+  });
+
+  it("rejects model-authored commands: echo, printf, yes, :, true", () => {
+    const path = join(tmp, "dl-reject.jsonl");
+    writeFileSync(
+      path,
+      [
+        makeTranscript('echo "X is Y"', "X is Y"),
+        makeTranscript("printf 'a\\nb\\n'", "a\nb"),
+        makeTranscript("yes | head -n 3", "y\ny\ny"),
+        makeTranscript(":", ""),
+        makeTranscript("true", ""),
+      ].join("\n"),
+    );
+    expect(gate.parseSessionSources(path)).toEqual([]);
+  });
+
+  it("rejects scripting one-liners with quoted literal args", () => {
+    const path = join(tmp, "dl-script.jsonl");
+    writeFileSync(
+      path,
+      [
+        makeTranscript(`python -c "print('hi')"`, "hi"),
+        makeTranscript(`node -e "console.log('hi')"`, "hi"),
+        makeTranscript(`ruby -e "puts \\"hi\\""`, "hi"),
+        makeTranscript(`perl -e "print \\"hi\\""`, "hi"),
+      ].join("\n"),
+    );
+    expect(gate.parseSessionSources(path)).toEqual([]);
+  });
+
+  it("rejects heredocs with literal body", () => {
+    const path = join(tmp, "dl-heredoc.jsonl");
+    writeFileSync(
+      path,
+      [
+        makeTranscript("cat <<'EOF'\nliteral\nEOF", "literal"),
+        makeTranscript('cat <<"EOF"\nliteral\nEOF', "literal"),
+      ].join("\n"),
+    );
+    expect(gate.parseSessionSources(path)).toEqual([]);
+  });
+
+  it("accepts cat realfile && echo done (primary is the read, not the echo)", () => {
+    const path = join(tmp, "dl-mixed.jsonl");
+    writeFileSync(path, makeTranscript("cat realfile && echo done", "real content\ndone"));
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(1);
+    expect(got[0]!.uri).toBe("realfile");
   });
 });
 
@@ -1534,7 +1627,7 @@ describe("runGate session-evidence auto-grounding", () => {
     expect(dossier.source_url).toBe("/repo/META.md");
   });
 
-  it("entity appears only in piped Bash output → still blocked (a pipe is not a session source, no session NLI)", async () => {
+  it("entity appears only in piped Bash output → now checked as session source, still blocked if NLI unsupported", async () => {
     const path = join(tmp, "ag-bash-pipe.jsonl");
     writeFileSync(
       path,
@@ -1543,10 +1636,11 @@ describe("runGate session-evidence auto-grounding", () => {
     generateObjectMock.mockImplementationOnce(() =>
       Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] } } as any),
     );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: false, score: 0.1, reason: "no task count" } } as any));
     const v = await gate.runGate({ draft: "Foo benchmark has 42 evaluation tasks.", model: "t", sessionTranscriptPath: path });
     expect(v.blocked).toBe(true);
-    expect(v.pairs[0]!.session_sources_checked).toBeUndefined(); // parseSessionSources returned [] → loop skipped
-    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+    expect(v.pairs[0]!.session_sources_checked).toBe(1);
+    expect(generateObjectMock).toHaveBeenCalledTimes(2);
     expect(store.listDossiers().length).toBe(0);
   });
 
@@ -1603,6 +1697,75 @@ describe("runGate session-evidence auto-grounding", () => {
     expect(v.blocked).toBe(true);
     expect(v.pairs[0]!.session_sources_checked).toBeUndefined(); // parseSessionSources returned [] → loop skipped
     expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session-source chunk slicing (issue #39)
+// ---------------------------------------------------------------------------
+
+describe("session-source chunk slicing", () => {
+  function transcriptWithSource(toolName: string, id: string, input: any, resultContent: any): string {
+    return [
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id, name: toolName, input }] } }),
+      JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: id, content: resultContent }] } }),
+    ].join("\n");
+  }
+
+  it("large source (>8k) → passes relevant chunk to NLI, not the head", async () => {
+    // Build content where the relevant text is well past the 8k threshold.
+    const fillerPara = "Commit abc123: some unrelated work that goes on and on to pad the paragraph size sufficiently for the chunk threshold\n".repeat(150); // ~10k chars
+    const relevant = "Commit xyz789: Fix the quantum flux capacitor bug\n";
+    const content = fillerPara + "\n" + relevant + "\n" + fillerPara;
+    expect(content.length).toBeGreaterThan(8000);
+
+    const path = join(tmp, "chunk1.jsonl");
+    writeFileSync(
+      path,
+      transcriptWithSource("Bash", "tu1", { command: "git log --oneline -200" }, content),
+    );
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "quantum flux capacitor", stance: "ASSERT", proposition: "The quantum flux capacitor bug was fixed." }] } } as any),
+    );
+
+    // Queue NLI response
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.91, reason: "yes" } } as any));
+
+    const v = await gate.runGate({ draft: "The quantum flux capacitor bug was fixed.", model: "t", sessionTranscriptPath: path });
+
+    // Verify the NLI prompt contained the relevant chunk (the positive signal).
+    const calls = generateObjectMock.mock.calls as any[];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    const nliCall = calls[1]![0] as any;
+    expect(nliCall.prompt).toContain("quantum flux capacitor");
+    // The prompt should be bounded — not the full raw content
+    expect(nliCall.prompt.length).toBeLessThan(10000);
+
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.auto_grounded).toBe(true);
+    expect(v.pairs[0]!.reason).toContain("chunked");
+  });
+
+  it("small source (≤8k) → uses full content, no chunking", async () => {
+    const content = "Foo benchmark has 42 tasks.\nBar benchmark has 7 tasks.";
+    const path = join(tmp, "chunk2.jsonl");
+    writeFileSync(path, transcriptWithSource("Bash", "tu1", { command: "cat small.md" }, content));
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 tasks." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.9, reason: "yes" } } as any));
+
+    const v = await gate.runGate({ draft: "Foo benchmark has 42 tasks.", model: "t", sessionTranscriptPath: path });
+
+    const calls = generateObjectMock.mock.calls as any[];
+    const nliCall = calls[1]![0] as any;
+    expect(nliCall.prompt).toContain("Foo benchmark has 42 tasks");
+    expect(nliCall.prompt).toContain("Bar benchmark has 7 tasks");
+
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.reason).toContain("full content");
   });
 });
 
