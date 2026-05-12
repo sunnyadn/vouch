@@ -881,6 +881,7 @@ program
   .option("--transcript-stdin", "Read Stop-hook payload JSON from stdin and derive transcript_path from it")
   .option("--transcript-path <path>", "Read the transcript directly from this path (overrides stdin)")
   .option("--draft <text>", "Use this text as the draft instead of reading a transcript")
+  .option("--session-context <path>", "Claude Code transcript JSONL to use as session evidence for auto-grounding (used with --draft; also overrides --transcript-path/-stdin for sources)")
   .option("--strict", "exit 2 on ungrounded claims (default)")
   .option("--advisory", "exit 0 + stderr warning only; never block")
   .option("--bypass-env <name>", "env var that disables the gate when set to '1'", "VOUCH_GATE_BYPASS")
@@ -897,6 +898,7 @@ program
       transcriptPath,
       hookPayload,
       draft: opts.draft,
+      sessionContext: opts.sessionContext,
       model: opts.model,
       topK: opts.topK,
       strict,

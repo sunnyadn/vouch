@@ -546,8 +546,10 @@ export interface SessionSource {
 const SESSION_SOURCE_TOOLS = new Set(["Read", "WebFetch", "WebSearch", "Bash"]);
 /** Max candidate session sources NLI-checked per ungrounded pair. */
 const SESSION_AUTOGROUND_K = 3;
-/** Most-recent unique session sources retained from a transcript. */
-const SESSION_SOURCES_MAX = 50;
+/** Most-recent unique session sources retained from a transcript.
+ *  If 100 proves insufficient, a relevance-ranked retention (keep sources most
+ *  lexically similar to the draft's propositions) is the smarter follow-up. */
+const SESSION_SOURCES_MAX = 100;
 const TOOL_PRIORITY: Record<string, number> = { Read: 0, Bash: 0, WebFetch: 1, WebSearch: 2 };
 
 // --- Bash file-read recognition (issue #22) --------------------------------
@@ -771,7 +773,7 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
   if (!lines.length) return [];
 
   const events: any[] = [];
-  // Pass 1: tool_use id → {name, input} from main-thread assistant events.
+  // Pass 1: tool_use id → {name, input} from assistant events (main-thread + sidechain).
   const toolUseById = new Map<string, { name: string; input: any }>();
   for (const line of lines) {
     let ev: any;
@@ -781,7 +783,7 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
       continue;
     }
     events.push(ev);
-    if (ev?.type !== "assistant" || ev?.isSidechain) continue;
+    if (ev?.type !== "assistant") continue;
     const c = ev?.message?.content;
     if (!Array.isArray(c)) continue;
     for (const b of c) {
@@ -792,10 +794,10 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
   }
   if (!events.some((e) => typeof e?.type === "string")) return []; // not a CC transcript
 
-  // Pass 2: tool_result blocks in main-thread user events.
+  // Pass 2: tool_result blocks in user events (main-thread + sidechain).
   const out: SessionSource[] = [];
   for (const ev of events) {
-    if (ev?.type !== "user" || ev?.isSidechain) continue;
+    if (ev?.type !== "user") continue;
     const c = ev?.message?.content;
     if (!Array.isArray(c)) continue;
     for (const b of c) {
@@ -1695,6 +1697,10 @@ export interface GateRunOptions {
   hookPayload?: any;
   /** Direct draft text — bypasses transcript reading (for tests / piping). */
   draft?: string;
+  /** Claude Code transcript JSONL to use as session evidence for auto-grounding.
+   *  When set, this path is passed to runGate as sessionTranscriptPath regardless
+   *  of whether draft or transcriptPath is used to obtain the draft text. */
+  sessionContext?: string;
   model: string;
   topK?: number;
   strict: boolean;
@@ -1830,7 +1836,7 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
           draft: draft!,
           model: opts.model,
           topK: opts.topK,
-          sessionTranscriptPath: transcriptAvailable ? transcriptPath : undefined,
+          sessionTranscriptPath: transcriptAvailable ? transcriptPath : opts.sessionContext,
           extractedPairs,
           abortRef,
         });

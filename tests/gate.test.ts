@@ -1354,7 +1354,7 @@ describe("parseSessionSources", () => {
     expect(byTool.WebSearch!.uri).toBe("websearch:foo benchmark size");
   });
 
-  it("ignores non-source tools, error results, sidechain events, and model-authored Bash", () => {
+  it("ignores non-source tools, error results, and model-authored Bash — includes sidechain sources", () => {
     const path = join(tmp, "ps2.jsonl");
     writeFileSync(
       path,
@@ -1389,7 +1389,11 @@ describe("parseSessionSources", () => {
         }),
       ].join("\n"),
     );
-    expect(gate.parseSessionSources(path)).toEqual([]);
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(1);
+    expect(got[0]!.tool).toBe("Read");
+    expect(got[0]!.uri).toBe("/sub/file");
+    expect(got[0]!.content).toBe("subagent read");
   });
 
   it("returns [] for a non-Claude-Code file or a missing file", () => {
@@ -2349,5 +2353,98 @@ describe("runGateCli watchdog", () => {
       process.env.VOUCH_GATE_BUDGET_MS = prevBudget;
       process.env.VOUCH_GATE_LOG = prevLog;
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runGateCli --session-context (issue #39 chunk 2)
+// ---------------------------------------------------------------------------
+
+describe("runGateCli --session-context", () => {
+  it("draft + session-context → auto-grounds from transcript sources, not blocked", async () => {
+    const path = join(tmp, "sc1.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu1", name: "Read", input: { file_path: "/repo/META.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu1", content: "     1\tSQLite is an embedded database engine." }] } }),
+      ].join("\n"),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "SQLite", stance: "ASSERT", proposition: "SQLite is an embedded database engine." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() => Promise.resolve({ object: { supported: true, score: 0.93, reason: "stated verbatim" } } as any));
+    const r = await gate.runGateCli({ draft: "SQLite is an embedded database engine.", sessionContext: path, model: "test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(0);
+    expect(r.verdict.blocked).toBe(false);
+    expect(r.verdict.pairs[0]!.auto_grounded).toBe(true);
+  });
+
+  it("draft without session-context → no sources → blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "SQLite", stance: "ASSERT", proposition: "SQLite is an embedded database engine." }] } } as any),
+    );
+    const r = await gate.runGateCli({ draft: "SQLite is an embedded database engine.", model: "test", strict: true, bypassEnv: "VOUCH_GATE_BYPASS" });
+    expect(r.exitCode).toBe(2);
+    expect(r.verdict.blocked).toBe(true);
+    expect(r.verdict.pairs[0]!.auto_grounded).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSessionSources — sidechain ingestion (issue #39 chunk 2)
+// ---------------------------------------------------------------------------
+
+describe("parseSessionSources sidechain ingestion", () => {
+  it("ingests sidechain tool_results (sub-agent Read / Bash git log)", () => {
+    const path = join(tmp, "ps-sidechain.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "assistant", isSidechain: true, message: { content: [{ type: "tool_use", id: "tu_sc1", name: "Read", input: { file_path: "/sub/notes.md" } }] } }),
+        JSON.stringify({ type: "user", isSidechain: true, message: { content: [{ type: "tool_result", tool_use_id: "tu_sc1", content: "     1\tSidechain content here." }] } }),
+        JSON.stringify({ type: "assistant", isSidechain: true, message: { content: [{ type: "tool_use", id: "tu_sc2", name: "Bash", input: { command: "git log --oneline -3" } }] } }),
+        JSON.stringify({ type: "user", isSidechain: true, message: { content: [{ type: "tool_result", tool_use_id: "tu_sc2", content: "abc123 first\nbcd234 second" }] } }),
+      ].join("\n"),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(2);
+    const byTool = Object.fromEntries(got.map((s) => [s.tool, s]));
+    expect(byTool.Read!.uri).toBe("/sub/notes.md");
+    expect(byTool.Read!.content).toBe("Sidechain content here.");
+    expect(byTool.Bash!.uri).toBe("session-bash: git log --oneline -3");
+    expect(byTool.Bash!.content).toBe("abc123 first\nbcd234 second");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSessionSources — retention bump (issue #39 chunk 2)
+// ---------------------------------------------------------------------------
+
+describe("parseSessionSources retention", () => {
+  it("retains up to 100 distinct session sources", () => {
+    const path = join(tmp, "ps-retention.jsonl");
+    const lines: string[] = [];
+    for (let i = 0; i < 60; i++) {
+      lines.push(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: `tu_${i}`, name: "Read", input: { file_path: `/file${i}.md` } }] } }));
+      lines.push(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: `tu_${i}`, content: `content ${i}` }] } }));
+    }
+    writeFileSync(path, lines.join("\n"));
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(60);
+  });
+
+  it("caps retention at 100 (keeps the most recent)", () => {
+    const path = join(tmp, "ps-retention-cap.jsonl");
+    const lines: string[] = [];
+    for (let i = 0; i < 110; i++) {
+      lines.push(JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: `tu_${i}`, name: "Read", input: { file_path: `/file${i}.md` } }] } }));
+      lines.push(JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: `tu_${i}`, content: `content ${i}` }] } }));
+    }
+    writeFileSync(path, lines.join("\n"));
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(100);
+    // Most recent should be present
+    expect(got.some((s) => s.uri === "/file109.md")).toBe(true);
   });
 });
