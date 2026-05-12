@@ -1,0 +1,239 @@
+/** Deterministic workspace-meta post-filter regression spec — issue #40.
+ *
+ *  The post-filter is deterministic (no LLM), so it's directly testable.
+ *  It re-classifies obvious workspace-meta ASSERTs → WORKSPACE before grounding.
+ */
+import { afterEach, beforeAll, describe, expect, it, mock } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tmp = mkdtempSync(join(tmpdir(), "vouch-wspf-test-"));
+process.env.VOUCH_DB_PATH = join(tmp, "test.db");
+
+const generateObjectMock = mock(() =>
+  Promise.resolve({ object: { pairs: [] } } as any),
+);
+
+mock.module("ai", () => ({
+  generateObject: generateObjectMock,
+  embed: () => Promise.resolve({ embeddings: [] }),
+}));
+
+mock.module("../src/providers.ts", () => ({
+  getLanguageModel: () => ({ id: "test-model" }) as any,
+  getEmbeddingModel: () => ({ id: "test-embedder" }) as any,
+}));
+
+const queryVec = new Float32Array([1, 0, 0, 0]);
+mock.module("../src/embedder.ts", () => ({
+  embedOne: () => Promise.resolve(queryVec),
+  embedBatch: () => Promise.resolve([queryVec]),
+}));
+
+const store = await import("../src/store.ts");
+const gate = await import("../src/gate.ts");
+
+afterEach(() => {
+  const db = store.getDb();
+  db.exec("DELETE FROM claim_dependencies; DELETE FROM claims; DELETE FROM dossiers;");
+  generateObjectMock.mockReset();
+  generateObjectMock.mockImplementation(() =>
+    Promise.resolve({ object: { pairs: [] } } as any),
+  );
+});
+
+beforeAll(() => {
+  process.on("exit", () => {
+    try {
+      rmSync(tmp, { recursive: true, force: true });
+    } catch {}
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reclassify expectations matrix
+// ---------------------------------------------------------------------------
+
+interface ReclassifyExpectation {
+  proposition: string;
+  entity: string;
+  draft?: string;
+  expectDowngrade: boolean;
+  rule?: 1 | 2 | 3;
+}
+
+const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
+  // downgrade (rule 1) — workspace-project entity / asset
+  {
+    proposition: "github.com/sunnyadn/crforest auto-redirects to github.com/sunnyadn/comprisk",
+    entity: "crforest",
+    expectDowngrade: true,
+    rule: 1,
+  },
+  {
+    proposition: "comprisk 0.3.0 does not exist on PyPI",
+    entity: "comprisk",
+    expectDowngrade: true,
+    rule: 1,
+  },
+  {
+    proposition: "the vouch CLI has a claim-batch subcommand",
+    entity: "vouch",
+    expectDowngrade: true,
+    rule: 1,
+  },
+
+  // downgrade (rule 2) — agent-machinery phrasings
+  {
+    proposition: "The default Pro verifier has a latency of approximately 3.7 seconds per call",
+    entity: "the Pro verifier",
+    expectDowngrade: true,
+    rule: 2,
+  },
+  {
+    proposition: "vertex_ai/gemini-3.1-pro-preview is the verifier model in this setup",
+    entity: "vertex_ai/gemini-3.1-pro-preview",
+    expectDowngrade: true,
+    rule: 2,
+  },
+  {
+    proposition: "the v3 benchmark harness uses Gemini Pro 3.1 as the generator",
+    entity: "the v3 harness",
+    expectDowngrade: true,
+    rule: 2,
+  },
+  {
+    proposition: "corpus draft cc-10 yielded 11 propositions",
+    entity: "cc-10",
+    expectDowngrade: true,
+    rule: 2,
+  },
+
+  // downgrade (rule 3) — mention-not-use
+  {
+    proposition: "smol-toml is the de-facto standard",
+    entity: "smol-toml",
+    draft: "the fire on 'smol-toml is the de-facto standard' was a good catch",
+    expectDowngrade: true,
+    rule: 3,
+  },
+
+  // NO downgrade (controls — must stay ASSERT)
+  {
+    proposition: "smol-toml is the de-facto standard now",
+    entity: "smol-toml",
+    draft: "I'd reach for smol-toml — it's the de-facto standard now.",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "vLLM added support for the Llama-3.1 405B model in version 0.5.4",
+    entity: "vLLM",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "bitsandbytes supports int8 quantization",
+    entity: "bitsandbytes",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "ChatGPT bios scored approximately 58% on FActScore",
+    entity: "ChatGPT",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "lodash-es 4.17.23 has high and medium severity advisories",
+    entity: "lodash-es",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "GPT-4 has approximately 1.7 trillion parameters",
+    entity: "GPT-4",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "Llama-3.1 405B was released in 2024",
+    entity: "Llama-3.1 405B",
+    expectDowngrade: false,
+  },
+  {
+    proposition: "comprisk uses lifelines 0.27 as a dependency",
+    entity: "lifelines",
+    expectDowngrade: false,
+  },
+];
+
+for (const exp of RECLASSIFY_EXPECTATIONS) {
+  const label = `${exp.expectDowngrade ? "downgrade" : "keep"}${exp.rule ? ` (rule ${exp.rule})` : ""}: "${exp.proposition}"`;
+  it(`reclassifyWorkspaceMeta — ${label}`, () => {
+    const draft = exp.draft ?? "";
+    const result = gate.reclassifyWorkspaceMeta(
+      [{ proposition: exp.proposition, stance: "ASSERT", entity: exp.entity }],
+      draft,
+    );
+    const p = result[0]!;
+    if (exp.expectDowngrade) {
+      expect(p.stance).toBe("WORKSPACE");
+      expect(p.reclassifiedRule).toBe(exp.rule);
+    } else {
+      expect(p.stance).toBe("ASSERT");
+      expect(p.reclassifiedRule).toBeUndefined();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// runGate-level integration tests
+// ---------------------------------------------------------------------------
+
+describe("runGate integration with post-filter", () => {
+  it("ASSERT that matches rule 2 → downgraded → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "vertex_ai/gemini-3.1-pro-preview",
+              stance: "ASSERT",
+              proposition: "vertex_ai/gemini-3.1-pro-preview is the verifier model in this setup",
+            },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "vertex_ai/gemini-3.1-pro-preview is the verifier model in this setup",
+      model: "test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.stance).toBe("WORKSPACE");
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.reason).toContain("reclassified WORKSPACE by deterministic post-filter (rule 2)");
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("ASSERT that does NOT match any rule → reaches grounding (blocked when KB empty)", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "FEVER",
+              stance: "ASSERT",
+              proposition: "FEVER has 185,445 claims.",
+            },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft: "FEVER has 185,445 claims.",
+      model: "test",
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.stance).toBe("ASSERT");
+    expect(v.pairs[0]!.grounded).toBe(false);
+  });
+});

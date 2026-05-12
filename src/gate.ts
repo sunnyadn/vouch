@@ -88,10 +88,24 @@ export const STANCES = [
   "META",
   "RETRACT",
   "REFER",
+  "WORKSPACE",
 ] as const;
 export type Stance = (typeof STANCES)[number];
 
-const StanceEnum = z.enum(STANCES);
+// The extractor prompt instructs the LLM to skip workspace items (return no
+// triple), so WORKSPACE is not a valid extractor output — only a post-filter
+// downgrade target.
+const StanceEnum = z.enum([
+  "ASSERT",
+  "OPINION",
+  "HEDGE",
+  "SPECULATE",
+  "NEGATE",
+  "COMPARE",
+  "META",
+  "RETRACT",
+  "REFER",
+]);
 
 const ExtractSchema = z.object({
   pairs: z
@@ -168,6 +182,9 @@ export interface ExtractedPair {
   proposition: string;
   stance: Stance;
   entity: string;
+  /** If set by reclassifyWorkspaceMeta, the rule number (1-3) that caused the
+   *  downgrade from ASSERT to WORKSPACE. */
+  reclassifiedRule?: number;
 }
 
 export interface GroundedPair extends ExtractedPair {
@@ -218,6 +235,147 @@ export async function extractPairs(
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic workspace-meta post-filter (issue #40)
+// ---------------------------------------------------------------------------
+
+function getWorkspaceProjects(): Set<string> {
+  const env = (process.env.VOUCH_GATE_WORKSPACE_PROJECTS || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+  const base = ["vouch", "comprisk", "crforest", "js-toml", "redacted-proj"];
+  return new Set([...base, ...env]);
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Lowercase, strip punctuation, collapse whitespace. */
+function normTokens(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Extract quoted / blockquoted text from the draft for mention-not-use
+ *  (rule 3).  Each entry is already token-normalised. */
+function extractQuotedRegions(draft: string): string[] {
+  const lc = draft.toLowerCase();
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+
+  const dqRe = /"([^"]{10,})"/g;
+  while ((m = dqRe.exec(lc))) out.push(normTokens(m[1]!));
+
+  const sqRe = /'([^']{10,})'/g;
+  while ((m = sqRe.exec(lc))) out.push(normTokens(m[1]!));
+
+  const btRe = /`([^`]{10,})`/g;
+  while ((m = btRe.exec(lc))) out.push(normTokens(m[1]!));
+
+  const bqRe = /^>\s*(.+)$/gm;
+  while ((m = bqRe.exec(lc))) out.push(normTokens(m[1]!));
+
+  return out;
+}
+
+/** Deterministic post-filter that re-classifies obvious workspace-meta ASSERTs
+ *  to WORKSPACE before grounding.  Recall-biased: when no rule cleanly matches,
+ *  the pair is left as ASSERT. */
+export function reclassifyWorkspaceMeta(
+  pairs: ExtractedPair[],
+  draft: string,
+): ExtractedPair[] {
+  const projects = getWorkspaceProjects();
+  const quoted = extractQuotedRegions(draft);
+
+  return pairs.map((pair) => {
+    if (pair.stance !== "ASSERT") return pair;
+
+    const prop = pair.proposition;
+    const lcProp = prop.toLowerCase();
+    const entity = pair.entity
+      .toLowerCase()
+      .trim()
+      .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
+
+    // ---- Rule 1 — workspace-project entity / asset ------------------------
+    if (projects.has(entity)) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+    }
+    if (/github\.com\/sunnyadn\//.test(lcProp)) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+    }
+    for (const proj of projects) {
+      const esc = escapeRegex(proj);
+      if (new RegExp(`\\b${esc} on pypi\\b`).test(lcProp)) {
+        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+      }
+      if (new RegExp(`\\b${esc} (does not )?exist(s)? on pypi\\b`).test(lcProp)) {
+        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+      }
+      if (new RegExp(`\\b${esc} v?\\d+\\.\\d+`).test(lcProp)) {
+        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+      }
+    }
+
+    // ---- Rule 2 — agent-machinery phrasings -------------------------------
+    const r2a =
+      /^the (default )?(pro |flash |pro-preview |flash-lite )?(verifier|extractor|generator|judge|gate|hook|harness|corpus|eval|dry.?run|benchmark harness|v\d+ (benchmark )?(impl(ementation)?|harness|config))\b/;
+    if (r2a.test(lcProp)) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 2 };
+    }
+
+    const r2b1 =
+      /\b(vertex_ai\/|gemini-3\.\d|gemini-\d|gpt-\d|claude-[\w.-]+)[\w.\/-]* is the (verifier|extractor|generator|judge|extractor model|verifier model) model?\b/;
+    const r2b2 =
+      /\bis the (verifier|extractor|generator|judge) model (in|for) (this|the) (setup|harness|run|installation|config(uration)?|benchmark)\b/;
+    if (r2b1.test(lcProp) || r2b2.test(lcProp)) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 2 };
+    }
+
+    const r2cMachinery =
+      /\bthis (setup|session|installation|benchmark|harness|run|environment|config(uration)?)\b/;
+    const r2cSubject =
+      /^(this (setup|session|installation|benchmark|harness|run|environment|config(uration)?)\b|the .*? in this (setup|session|installation|benchmark|harness|run|environment|config(uration)?)\b)/;
+    if (r2cMachinery.test(lcProp) && r2cSubject.test(lcProp)) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 2 };
+    }
+
+    const r2dArtifact =
+      /\b(cc-\d+|adv-\d+|labels\.jsonl|frozen_extractions|kb-snapshot|the gate-recall corpus)\b/;
+    if (r2dArtifact.test(lcProp.slice(0, 50))) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 2 };
+    }
+
+    const r2e =
+      /^(claude|this model|the (running )?model)\b.*(context (budget|window)|tokens? per|speed|latency|resource use).*( this (turn|session|run)| while )/;
+    if (r2e.test(lcProp)) {
+      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 2 };
+    }
+
+    // ---- Rule 3 — mention-not-use -----------------------------------------
+    const normProp = normTokens(prop);
+    const propTokens = normProp.split(" ");
+    if (propTokens.length >= 6) {
+      for (let i = 0; i <= propTokens.length - 6; i++) {
+        const slice = propTokens.slice(i, i + 6).join(" ");
+        for (const quote of quoted) {
+          if (quote.includes(slice)) {
+            return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };
+          }
+        }
+      }
+    }
+
+    return pair;
+  });
 }
 
 /** Normalized token set for cheap lexical overlap checks. */
@@ -1505,22 +1663,26 @@ export async function runGate(opts: {
   let incomplete = false;
 
   const extracted = opts.extractedPairs !== undefined ? opts.extractedPairs : await extractPairs(opts.draft, opts.model);
+  const pairsToCheck = extracted ? reclassifyWorkspaceMeta(extracted, opts.draft) : null;
   if (extracted === null) {
     classifierError = "extractor failed";
-  } else if (extracted.length) {
-    const checked: GroundedPair[] = new Array(extracted.length);
+  } else if (pairsToCheck && pairsToCheck.length) {
+    const checked: GroundedPair[] = new Array(pairsToCheck.length);
     let errored = false;
 
     // Separate ASSERT from non-ASSERT to preserve output ordering.
     const assertIndices: number[] = [];
-    for (let i = 0; i < extracted.length; i++) {
-      const p = extracted[i]!;
+    for (let i = 0; i < pairsToCheck.length; i++) {
+      const p = pairsToCheck[i]!;
       if (p.stance !== "ASSERT") {
+        const reason = p.reclassifiedRule
+          ? `reclassified WORKSPACE by deterministic post-filter (rule ${p.reclassifiedRule})`
+          : `stance=${p.stance} — no fact to ground`;
         checked[i] = {
           ...p,
           grounded: true,
           matched_claim_id: null,
-          reason: `stance=${p.stance} — no fact to ground`,
+          reason,
         };
       } else {
         assertIndices.push(i);
@@ -1531,7 +1693,7 @@ export async function runGate(opts: {
       incomplete = true;
     } else if (assertIndices.length) {
       try {
-        const assertPairs = assertIndices.map((i) => extracted[i]!);
+        const assertPairs = assertIndices.map((i) => pairsToCheck[i]!);
         const { results: groundedAssertions, incomplete: batchIncomplete } =
           await batchGroundAssertions(assertPairs, opts.topK ?? 3, opts.abortRef);
         if (batchIncomplete) incomplete = true;
