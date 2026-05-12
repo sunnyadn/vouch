@@ -120,7 +120,7 @@ For each proposition, return { proposition, entity, stance }:
   - stance — exactly one of:
       ASSERT    — declarative, checkable factual claim about a measurable property ("X has 100 features", "X beats Y by 3 points", "X was released in 2023")
       OPINION   — genuinely subjective evaluation where there is no empirical fact to check: "X is elegant", "X is the best choice for our use case", "X is overrated", "I'd reach for Y here", aesthetic or preference judgments. NOT ranking/standing claims that are empirically verifiable ("X is the de-facto standard", "X is the canonical implementation", "X is state-of-the-art on Y", "X is the most-downloaded") — those are ASSERT.
-      HEDGE     — assertion + caveat in the same sentence/clause: "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "凭印象", or equivalent
+      HEDGE     — assertion + caveat in the same sentence/clause: "(unverified)", "from training memory", "without verifying", "I haven't verified", "let me verify", "凭印象", or equivalent. Also: a block-level hedge prefix or trailing caveat that scopes an entire block of factual sentences (see DECISION RULES below).
       SPECULATE — hypothetical / conditional / modal ("X might do Y", "if X then Y")
       NEGATE    — explicit denial ("X does not support Y")
       COMPARE   — entity is the comparison topic without an asserted outcome ("we evaluated against X", "X vs Y")
@@ -130,6 +130,10 @@ For each proposition, return { proposition, entity, stance }:
 
 DECISION RULES:
   - Hedge tokens in the same sentence/clause → stance is HEDGE, even if surface looks declarative. Hedge wins over ASSERT.
+  - Block-level hedge scoping: a sentence that is a pure caveat about a group of claims ("From memory, and I haven't verified any of the following", "None of those four are things I've verified this session — they're from training memory", "the above is unverified / not checked / from memory", "none of these are verified") scopes ALL factual sentences in its block.
+      • Leading block hedge: scope forward to every factual sentence after it, until a clear topic change or paragraph break.
+      • Trailing block caveat: scope backward to every factual sentence in the same block.
+      • When in doubt whether a caveat is block-level, treat it as scoping the block — a false HEDGE is far less harmful than a false ASSERT-and-fire on something the author explicitly flagged unverified.
   - Evaluative/normative wording → stance is OPINION only when there is no empirical fact to check. "Is X good enough for us" is OPINION; "does X score ≥ 0.8" is ASSERT. Ranking/standing claims dressed in evaluative phrasing ("the de-facto standard", "the canonical implementation", "the most-downloaded", "state-of-the-art on Y") are checkable empirical assertions → ASSERT. On close calls between ASSERT and OPINION/REFER, choose ASSERT — grounding will pass it through cheaply if it is in fact grounded.
   - A claim about the model currently running this session (its capabilities, context budget, speed, resource use while doing the present work) → that is meta-commentary about the conversation → WORKSPACE, do not return a triple. The running model is not a third-party external entity here.
   - A sentence whose predicate is an action performed by the agent / assistant / "this session" in the present work — closed / opened / merged / reopened / ran / executed / pushed / committed / filed / created / dispatched / edited / wrote / dossiered / fetched an issue, PR, commit, branch, file, command, Linear issue, etc. — the named entities it mentions (GitHub, a repo name, an issue/PR number, a commit hash, a CLI tool name like \`gh\`/\`git\`/\`bun\`, a file path, a Linear ID) are context of that agent action, not the subject of a verifiable third-party claim → WORKSPACE, do not return a triple. The agent's own session actions are not third-party entities here.
@@ -236,6 +240,21 @@ function alphanumOnly(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9一-鿿]/g, "");
 }
 
+/** True when `text` mentions the same primary entity as the extracted pair.
+ *  Used to guard high-confidence embedding shortcuts so we don't ground a
+ *  claim about a different entity just because the sentence structure is
+ *  similar. */
+function sharesPrimaryEntity(pair: ExtractedPair, text: string): boolean {
+  const ent = pair.entity.toLowerCase().trim();
+  if (ent && text.toLowerCase().includes(ent)) return true;
+  const entAlnum = alphanumOnly(pair.entity);
+  return entAlnum.length >= 3 && alphanumOnly(text).includes(entAlnum);
+}
+
+const WIDER_TOPK = 8;
+const COSINE_SHORTCUT = 0.95;
+const COSINE_SECONDARY = 0.92;
+
 export async function checkGrounding(
   pair: ExtractedPair,
   topK = 8,
@@ -258,17 +277,18 @@ export async function checkGrounding(
     };
   }
 
-  const hits = store.searchHybrid(queryEmb, topK).filter((h) => h.kind === "claim");
+  const hits = store.searchHybrid(queryEmb, WIDER_TOPK).filter((h) => h.kind === "claim");
   const propTokens = tokenSet(pair.proposition);
 
-  for (const h of hits) {
+  for (let i = 0; i < hits.length; i++) {
+    const h = hits[i]!;
     if (h.id == null) continue;
     const claim = store.getClaim(h.id);
     if (!claim) continue;
     if (claim.status !== "supported") continue;
     if (claim.superseded_by != null) continue;
 
-    // Fast path: the draft is restating a claim already filed and supported.
+    // Fast path 1: the draft is restating a claim already filed and supported.
     // High lexical overlap with a supported claim's text → grounded without an
     // NLI round-trip. (Anti-demoralizer: "I grounded this, why are you firing".)
     if (jaccard(propTokens, tokenSet(claim.claim_text)) >= 0.8) {
@@ -278,6 +298,23 @@ export async function checkGrounding(
         matched_claim_id: claim.id,
         reason: `restates supported claim ${claim.id} (lexical overlap)`,
       };
+    }
+
+    // Fast path 2: high-confidence embedding match catches paraphrases the
+    // lexical fast-path misses (issue #37). Restricted to primary pool — the
+    // wider pool only gets the lower-threshold secondary pass (NLI, not shortcut).
+    if (i < topK && h.similarity >= COSINE_SHORTCUT && sharesPrimaryEntity(pair, claim.claim_text)) {
+      return {
+        ...pair,
+        grounded: true,
+        matched_claim_id: claim.id,
+        reason: `restates supported claim ${claim.id} (embedding cosine=${h.similarity.toFixed(3)})`,
+      };
+    }
+
+    // Only run NLI on primary pool (topK) or high-cosine secondary candidates.
+    if (i >= topK && !(h.similarity >= COSINE_SECONDARY && sharesPrimaryEntity(pair, claim.claim_text))) {
+      continue;
     }
 
     let quote = "";
@@ -368,7 +405,7 @@ async function batchGroundAssertions(
 
   const candidates: NliCandidate[] = [];
 
-  // Phase 1: parallel embed + search + lexical fast-path
+  // Phase 1: parallel embed + search + lexical fast-path + embedding shortcut
   await Promise.all(
     pairs.map(async (pair, idx) => {
       let queryEmb: Float32Array;
@@ -379,10 +416,12 @@ async function batchGroundAssertions(
         return;
       }
 
-      const hits = store.searchHybrid(queryEmb, topK).filter((h) => h.kind === "claim");
+      // Wider retrieval pool (cheap) — NLI only runs on topK + high-cosine extras.
+      const hits = store.searchHybrid(queryEmb, WIDER_TOPK).filter((h) => h.kind === "claim");
       const propTokens = tokenSet(pair.proposition);
 
-      for (const h of hits) {
+      for (let i = 0; i < hits.length; i++) {
+        const h = hits[i]!;
         if (h.id == null) continue;
         const claim = store.getClaim(h.id);
         if (!claim) continue;
@@ -397,6 +436,23 @@ async function batchGroundAssertions(
             reason: `restates supported claim ${claim.id} (lexical overlap)`,
           };
           return; // pair resolved — no NLI needed
+        }
+
+        // High-confidence embedding shortcut for paraphrases the lexical path
+        // misses (issue #37). Restricted to primary pool.
+        if (i < topK && h.similarity >= COSINE_SHORTCUT && sharesPrimaryEntity(pair, claim.claim_text)) {
+          results[idx] = {
+            ...pair,
+            grounded: true,
+            matched_claim_id: claim.id,
+            reason: `restates supported claim ${claim.id} (embedding cosine=${h.similarity.toFixed(3)})`,
+          };
+          return;
+        }
+
+        // Only add to NLI batch if in primary pool or a high-cosine secondary.
+        if (i >= topK && !(h.similarity >= COSINE_SECONDARY && sharesPrimaryEntity(pair, claim.claim_text))) {
+          continue;
         }
 
         let quote = "";

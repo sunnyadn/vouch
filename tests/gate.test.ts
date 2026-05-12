@@ -249,9 +249,41 @@ describe("runGate grounding", () => {
     expect(v.pairs[0]!.grounded).toBe(false);
   });
 
-  it("batched grounding makes ≤ 1 verifier call for a proposition with 3 candidates", async () => {
-    // Seed 3 supported claims with wording different enough to miss the lexical
-    // fast-path, so each falls through to NLI.
+  it("grounds via high-confidence embedding cosine shortcut (no NLI call)", async () => {
+    const slug = store.writeDossier({
+      source_url: "https://example.com",
+      source_type: "test",
+      verbatim_content: "SQLite is a free and open-source relational database engine written in C.",
+    });
+    const cid = store.recordClaim({
+      dossier_slug: slug,
+      claim_text: "SQLite is a free and open-source relational database engine written in C.",
+      score: 0.9,
+      status: "supported",
+      claim_type: "ATOMIC",
+      embedding: queryVec,
+    });
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "SQLite", stance: "ASSERT", proposition: "SQLite is an embedded relational database engine written in C." }] },
+      } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "SQLite is an embedded relational database engine written in C.",
+      model: "vertex_ai/test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.matched_claim_id).toBe(cid);
+    expect(v.pairs[0]!.reason).toContain("embedding cosine");
+    // No verifier call — shortcut handled it.
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("secondary pass: high-cosine candidate beyond topK=3 gets NLI-checked", async () => {
+    // Seed 3 supported claims with low-similarity embeddings (won't trigger shortcut).
     for (let i = 0; i < 3; i++) {
       const slug = store.writeDossier({
         source_url: `https://example.com/${i}`,
@@ -264,7 +296,79 @@ describe("runGate grounding", () => {
         score: 0.9,
         status: "supported",
         claim_type: "ATOMIC",
-        embedding: queryVec,
+        embedding: new Float32Array([0.5, 0.5, 0.5, 0.5]),
+      });
+    }
+
+    // Seed a 4th claim with high-similarity embedding (cos ≈ 0.93 with queryVec).
+    // This is below the 0.95 shortcut threshold but above the 0.92 secondary threshold.
+    const cos093 = Math.sqrt(1 - 0.93 * 0.93);
+    const emb093 = new Float32Array([0.93, cos093, 0, 0]);
+    const slug4 = store.writeDossier({
+      source_url: "https://example.com/4",
+      source_type: "test",
+      verbatim_content: "X possesses 2 features.",
+    });
+    const cid4 = store.recordClaim({
+      dossier_slug: slug4,
+      claim_text: "X possesses 2 features.",
+      score: 0.9,
+      status: "supported",
+      claim_type: "ATOMIC",
+      embedding: emb093,
+    });
+
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: { pairs: [{ entity: "X", stance: "ASSERT", proposition: "X has 2 features." }] },
+      } as any),
+    );
+
+    // One batch verdict call for the 3 primary candidates (claim4, claim1, claim2).
+    // Claim4 is the first candidate and should be entailed.
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: true, score: 0.95, reason: "yes" },
+            { idx: 1, supported: false, score: 0.1, reason: "no" },
+            { idx: 2, supported: false, score: 0.1, reason: "no" },
+          ],
+        },
+      } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "X has 2 features.",
+      model: "vertex_ai/test",
+      topK: 3,
+    });
+
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.matched_claim_id).toBe(cid4);
+    // 1 extractor + 1 batch verifier = 2 calls total
+    expect(generateObjectMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("batched grounding makes ≤ 1 verifier call for a proposition with 3 candidates", async () => {
+    // Seed 3 supported claims with wording different enough to miss the lexical
+    // fast-path, so each falls through to NLI. Embeddings are deliberately
+    // distinct from queryVec so the high-cosine shortcut (issue #37) doesn't
+    // fire — we want to exercise the batch-NLI path.
+    for (let i = 0; i < 3; i++) {
+      const slug = store.writeDossier({
+        source_url: `https://example.com/${i}`,
+        source_type: "test",
+        verbatim_content: `X possesses ${i + 1} features.`,
+      });
+      store.recordClaim({
+        dossier_slug: slug,
+        claim_text: `X possesses ${i + 1} features.`,
+        score: 0.9,
+        status: "supported",
+        claim_type: "ATOMIC",
+        embedding: new Float32Array([0.5, 0.5, 0.5, 0.5]),
       });
     }
 
