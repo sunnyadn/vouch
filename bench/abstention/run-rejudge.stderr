@@ -1,0 +1,6 @@
+usage: run_arm2_eval.py [-h] [--calibrate]
+                        [--subset {unanswerable,false_premise,control}]
+                        [--skip-gate] [--skip-judge] [--judge-only JUDGE_ONLY]
+                        [--out-suffix OUT_SUFFIX]
+run_arm2_eval.py: error: argument --out-suffix: expected one argument
+=== done Wed 13 May 2026 04:42:28 MDT ===

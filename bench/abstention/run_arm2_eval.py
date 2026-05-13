@@ -42,8 +42,8 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).parent
-GENERATOR_MODEL = os.environ.get("BENCH_GENERATOR_MODEL", "gemini-2.5-flash-lite")
-JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL", "gemini-2.5-pro")
+GENERATOR_MODEL = os.environ.get("BENCH_GENERATOR_MODEL", "gemini-3.1-flash-lite")
+JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL", "gemini-3.1-pro-preview")
 MAX_NEW_TOKENS = 512
 SUBSETS = ["unanswerable", "false_premise", "control"]
 
@@ -66,15 +66,21 @@ def make_client():
 def call_genai(client, model: str, prompt: str, temperature: float = 0.0) -> tuple[str, dict]:
     from google.genai import types
 
+    # `thinking_budget=0` disables thinking — supported on flash-lite (and
+    # cheaper / more deterministic). Pro models reject it; omit there.
+    supports_no_thinking = "flash-lite" in model or "flash-8b" in model
+    cfg_kwargs = dict(
+        temperature=temperature,
+        max_output_tokens=MAX_NEW_TOKENS,
+    )
+    if supports_no_thinking:
+        cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+
     t0 = time.perf_counter()
     response = client.models.generate_content(
         model=model,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=MAX_NEW_TOKENS,
-            thinking_config=types.ThinkingConfig(thinking_budget=0),
-        ),
+        config=types.GenerateContentConfig(**cfg_kwargs),
     )
     dt = time.perf_counter() - t0
     text = response.text or ""
@@ -352,6 +358,7 @@ def main():
     parser.add_argument("--subset", choices=SUBSETS, help="only this subset")
     parser.add_argument("--skip-gate", action="store_true", help="without-vouch arm only (skip gate sim)")
     parser.add_argument("--skip-judge", action="store_true", help="skip judge scoring (responses only)")
+    parser.add_argument("--judge-only", default=None, help="reuse a prior responses.jsonl (skip generation; just re-judge)")
     parser.add_argument("--out-suffix", default="", help="suffix for output files (e.g. -calibrate)")
     args = parser.parse_args()
 
@@ -366,29 +373,38 @@ def main():
     out_judgments = HERE / f"judgments{suffix}.jsonl"
     out_report = HERE / f"report{suffix}.md"
 
-    # ---- Generate (and revise under with-vouch) ----
-    print(f"[gen] generator={GENERATOR_MODEL}  subsets={subsets}  arms={[('with' if a else 'without')+'-vouch' for a in arms]}", file=sys.stderr)
     n_by_subset: dict[str, int] = {}
-    responses: list[dict] = []
-    for subset in subsets:
-        items = load_subset(subset, n_cap)
-        n_by_subset[subset] = len(items)
-        for i, item in enumerate(items, 1):
-            for vouch_on in arms:
-                try:
-                    rec = run_item(client, item, subset, vouch_on)
-                except Exception as e:
-                    rec = {"id": item["id"], "subset": subset, "arm": "with-vouch" if vouch_on else "without-vouch", "error": str(e)[:300]}
-                responses.append(rec)
-                print(
-                    f"  [{subset:13s}] {i:3d}/{len(items)} ({rec['arm']:13s}) "
-                    f"revised={rec.get('revised', False)!s:5s} "
-                    f"len={len(rec.get('response_final', ''))} "
-                    f"wall={rec.get('wall_s', 0):.1f}s",
-                    file=sys.stderr,
-                )
-    out_responses.write_text("\n".join(json.dumps(r) for r in responses) + "\n")
-    print(f"[gen] wrote {len(responses)} -> {out_responses}", file=sys.stderr)
+
+    if args.judge_only:
+        # Reuse cached generator outputs from a prior run.
+        cached_path = Path(args.judge_only)
+        responses = [json.loads(ln) for ln in cached_path.read_text().splitlines() if ln.strip()]
+        for r in responses:
+            n_by_subset[r["subset"]] = n_by_subset.get(r["subset"], 0) + (1 if r["arm"] == "without-vouch" else 0)
+        print(f"[judge-only] loaded {len(responses)} cached responses from {cached_path}", file=sys.stderr)
+    else:
+        # ---- Generate (and revise under with-vouch) ----
+        print(f"[gen] generator={GENERATOR_MODEL}  subsets={subsets}  arms={[('with' if a else 'without')+'-vouch' for a in arms]}", file=sys.stderr)
+        responses: list[dict] = []
+        for subset in subsets:
+            items = load_subset(subset, n_cap)
+            n_by_subset[subset] = len(items)
+            for i, item in enumerate(items, 1):
+                for vouch_on in arms:
+                    try:
+                        rec = run_item(client, item, subset, vouch_on)
+                    except Exception as e:
+                        rec = {"id": item["id"], "subset": subset, "arm": "with-vouch" if vouch_on else "without-vouch", "error": str(e)[:300]}
+                    responses.append(rec)
+                    print(
+                        f"  [{subset:13s}] {i:3d}/{len(items)} ({rec['arm']:13s}) "
+                        f"revised={rec.get('revised', False)!s:5s} "
+                        f"len={len(rec.get('response_final', ''))} "
+                        f"wall={rec.get('wall_s', 0):.1f}s",
+                        file=sys.stderr,
+                    )
+        out_responses.write_text("\n".join(json.dumps(r) for r in responses) + "\n")
+        print(f"[gen] wrote {len(responses)} -> {out_responses}", file=sys.stderr)
 
     if args.skip_judge:
         print(f"[skip] judge skipped per --skip-judge", file=sys.stderr)
@@ -397,10 +413,11 @@ def main():
     # ---- Judge ----
     print(f"[judge] judge={JUDGE_MODEL}", file=sys.stderr)
     judgments: list[dict] = []
-    # Build item lookup
+    # Build item lookup. Under --judge-only the cached responses may have any
+    # subset of IDs; load the FULL subset jsonls so every cached id resolves.
     item_lookup: dict[tuple[str, str], dict] = {}
     for subset in subsets:
-        for it in load_subset(subset, n_cap):
+        for it in load_subset(subset, None if args.judge_only else n_cap):
             item_lookup[(subset, it["id"])] = it
     for i, r in enumerate(responses, 1):
         if "error" in r:

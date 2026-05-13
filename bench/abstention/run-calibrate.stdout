@@ -1,0 +1,29 @@
+# arm-2 eval report — generator=gemini-2.5-flash-lite | judge=gemini-2.5-pro
+
+N: unanswerable=10, false_premise=10, control=10
+
+## With/without-vouch delta by subset
+
+| subset | metric | without-vouch | with-vouch | Δ |
+|---|---|---|---|---|
+| unanswerable | confab_rate ↓ | 0.0% | 0.0% | +0.0% |
+| unanswerable | appropriate_rate ↑ | 0.0% | 0.0% | +0.0% |
+| unanswerable | refused_vague_rate ↓ | 0.0% | 0.0% | +0.0% |
+| false_premise | confab_rate ↓ | 0.0% | 0.0% | +0.0% |
+| false_premise | appropriate_rate ↑ | 0.0% | 0.0% | +0.0% |
+| false_premise | refused_vague_rate ↓ | 0.0% | 0.0% | +0.0% |
+| control | correct_rate ↑ | 0.0% | 0.0% | +0.0% |
+| control | confab_rate ↓ | 0.0% | 0.0% | +0.0% |
+| control | refused_vague_rate ↓ | 0.0% | 0.0% | +0.0% |
+
+## Full category breakdown
+
+| subset | arm | total | correct | appropriate-abstain | appropriate-pushback | confabulated | refused-vague |
+|---|---|---|---|---|---|---|---|
+| unanswerable | without-vouch | 10 | 0 | 0 | 0 | 0 | 0 |
+| unanswerable | with-vouch | 10 | 0 | 0 | 0 | 0 | 0 |
+| false_premise | without-vouch | 10 | 0 | 0 | 0 | 0 | 0 |
+| false_premise | with-vouch | 10 | 0 | 0 | 0 | 0 | 0 |
+| control | without-vouch | 10 | 0 | 0 | 0 | 0 | 0 |
+| control | with-vouch | 10 | 0 | 0 | 0 | 0 | 0 |
+
