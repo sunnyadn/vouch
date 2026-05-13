@@ -189,6 +189,11 @@ export interface ExtractedPair {
    *  but was escalated to ASSERT because its sentence is a fact-shape claim
    *  carrying a trailing caveat like "(unverified, from training memory)". */
   escalatedFromHedge?: boolean;
+  /** If set by collapseSofterStancesToAssert (env-gated experiment), this
+   *  pair was originally a "softer" assertion stance (HEDGE/OPINION/
+   *  SPECULATE/NEGATE/COMPARE) that was collapsed to ASSERT under the
+   *  single-principle rule. */
+  stanceCollapsedFrom?: string;
 }
 
 export interface GroundedPair extends ExtractedPair {
@@ -512,6 +517,26 @@ function findSentenceContaining(draft: string, proposition: string): string | nu
     return draft.trim();
   }
   return null;
+}
+
+/** Stance-collapse experiment (env-gated by VOUCH_GATE_STANCE_COLLAPSE=1).
+ *  Treats the entire family of "softer" assertion stances as ASSERT-equivalent:
+ *  HEDGE / OPINION / SPECULATE / NEGATE / COMPARE → ASSERT.
+ *  Rationale: each softer stance has historically been a leak path (4a/4b/4c
+ *  dodging). Collapsing them to ASSERT means the gate's rule reduces to one
+ *  principle — any predicate on a named external entity needs a source —
+ *  rather than enumerating escape patterns per stance. WORKSPACE, REFER,
+ *  META, RETRACT are preserved (they're not "softer assertions" but
+ *  semantically different categories).
+ *
+ *  Default off so existing behavior is preserved; flip when measurement
+ *  confirms the collapse is a net win on the benchmark. */
+export function collapseSofterStancesToAssert(pairs: ExtractedPair[]): ExtractedPair[] {
+  if (process.env.VOUCH_GATE_STANCE_COLLAPSE !== "1") return pairs;
+  const SOFTER = new Set(["HEDGE", "OPINION", "SPECULATE", "NEGATE", "COMPARE"]);
+  return pairs.map((pair) =>
+    SOFTER.has(pair.stance) ? { ...pair, stance: "ASSERT", stanceCollapsedFrom: pair.stance } : pair,
+  );
 }
 
 /** Deterministic post-filter that escalates HEDGE → ASSERT when the sentence is
@@ -1980,7 +2005,9 @@ export async function runGate(opts: {
 
   const extracted = opts.extractedPairs !== undefined ? opts.extractedPairs : await extractPairs(opts.draft, opts.model);
   const pairsToCheck = extracted
-    ? escalateHedgeAssertions(reclassifyWorkspaceMeta(extracted, opts.draft), opts.draft)
+    ? collapseSofterStancesToAssert(
+        escalateHedgeAssertions(reclassifyWorkspaceMeta(extracted, opts.draft), opts.draft),
+      )
     : null;
   if (extracted === null) {
     classifierError = "extractor failed";
