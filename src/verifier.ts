@@ -64,7 +64,7 @@ SOURCE:
 {SOURCE}
 ---
 
-Question: Does the SOURCE genuinely support the CLAIM?
+Question: Does the SOURCE support **every** factual assertion in the CLAIM? The CLAIM is *supported* only if a faithful reader of the SOURCE would conclude that **all** of the CLAIM's facts — every number, name, date, quantity, and relationship it states — are stated in or directly entailed by the SOURCE. If the CLAIM contains **any** number, name, date, fact, or qualifier that the SOURCE does not state or entail (even if the rest of the CLAIM matches the SOURCE exactly), answer **not supported**. Partial overlap is not support. (Conversely: if the CLAIM is a *subset* of what the SOURCE says — the SOURCE states more, the CLAIM less — that IS supported.)
 
 Rules:
 - Be LENIENT on phrasing — same factual content with different words IS supported.
@@ -245,7 +245,7 @@ const BatchVerifySchema = z.object({
 
 const BATCH_VERIFIER_PROMPT_TEMPLATE = `You verify factual claims against source text.
 
-For each item below, determine whether the SOURCE genuinely supports the CLAIM.
+For each item below, determine whether the SOURCE supports **every** factual assertion in the CLAIM. The CLAIM is *supported* only if a faithful reader of the SOURCE would conclude that **all** of the CLAIM's facts — every number, name, date, quantity, and relationship it states — are stated in or directly entailed by the SOURCE. If the CLAIM contains **any** number, name, date, fact, or qualifier that the SOURCE does not state or entail (even if the rest of the CLAIM matches the SOURCE exactly), answer **not supported**. Partial overlap is not support. (Conversely: if the CLAIM is a *subset* of what the SOURCE says — the SOURCE states more, the CLAIM less — that IS supported.)
 
 {ITEMS_BLOCK}
 

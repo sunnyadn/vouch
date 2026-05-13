@@ -429,6 +429,64 @@ describe("verifyClaim temporal qualifier", () => {
 });
 
 // ---------------------------------------------------------------------------
+// verifyClaimAgainstSource whole-claim entailment (#41)
+// ---------------------------------------------------------------------------
+
+describe("verifyClaimAgainstSource whole-claim entailment", () => {
+  const overreachClaim =
+    "ChatGPT w/ RERANK achieved 69.3 Citation Rec, 67.8 Citation Prec, and 11.4 Claim on ELI5";
+  const overreachSource =
+    "ChatGPT with RERANK's citation precision on ALCE ELI5 is 67.8 percent";
+
+  it("prompt requires every factual assertion to be supported", async () => {
+    await verifier.verifyClaimAgainstSource(overreachClaim, overreachSource);
+    const callArgs = generateObjectMock.mock.calls[0][0];
+    expect(callArgs.prompt).toContain("**every** factual assertion");
+    expect(callArgs.prompt).toContain("Partial overlap is not support");
+  });
+
+  it("claim asserting more than source is unsupported", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          supported: false,
+          score: 0.1,
+          reason: "source does not mention citation recall or claim-NLI",
+        },
+      }),
+    );
+    const result = await verifier.verifyClaimAgainstSource(overreachClaim, overreachSource);
+    expect(result.status).toBe("unsupported");
+  });
+
+  it("claim that is a subset of source is supported", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: { supported: true, score: 0.95, reason: "citation precision confirmed" },
+      }),
+    );
+    const result = await verifier.verifyClaimAgainstSource(
+      "ChatGPT with RERANK's citation precision is 67.8 percent",
+      "ChatGPT w/ RERANK achieved 69.3 Citation Rec, 67.8 Citation Prec, and 11.4 Claim on ELI5",
+    );
+    expect(result.status).toBe("supported");
+  });
+
+  it("positive control: fully entailed claim is supported", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: { supported: true, score: 0.95, reason: "direct match" },
+      }),
+    );
+    const result = await verifier.verifyClaimAgainstSource(
+      "The cat sat on the mat",
+      "The cat sat on the mat and looked at the moon",
+    );
+    expect(result.status).toBe("supported");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // verifyClaimsBatch (SUN-7)
 // ---------------------------------------------------------------------------
 
@@ -580,6 +638,64 @@ describe("verifyClaimsBatch", () => {
         { claim_text: "B", source_passage: "B." },
       ]),
     ).rejects.toBeInstanceOf(verifier.TransientVerifierError);
+  });
+
+  // #41: batch prompt must also contain tightened wording
+  it("batch prompt requires every factual assertion to be supported", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: false, score: 0.1, reason: "overreach" },
+            { idx: 1, supported: true, score: 0.95, reason: "direct match" },
+          ],
+        },
+      } as any),
+    );
+
+    await verifier.verifyClaimsBatch([
+      {
+        claim_text:
+          "ChatGPT w/ RERANK achieved 69.3 Citation Rec, 67.8 Citation Prec, and 11.4 Claim on ELI5",
+        source_passage: "ChatGPT with RERANK's citation precision on ALCE ELI5 is 67.8 percent",
+      },
+      {
+        claim_text: "The sky is blue",
+        source_passage: "The sky is blue and the grass is green",
+      },
+    ]);
+
+    const callArgs = (generateObjectMock.mock.calls[0] as any)[0];
+    expect(callArgs.prompt).toContain("**every** factual assertion");
+    expect(callArgs.prompt).toContain("Partial overlap is not support");
+  });
+
+  it("batch: claim asserting more than source is unsupported", async () => {
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          verdicts: [
+            { idx: 0, supported: false, score: 0.1, reason: "overreach" },
+            { idx: 1, supported: true, score: 0.95, reason: "direct match" },
+          ],
+        },
+      } as any),
+    );
+
+    const results = await verifier.verifyClaimsBatch([
+      {
+        claim_text:
+          "ChatGPT w/ RERANK achieved 69.3 Citation Rec, 67.8 Citation Prec, and 11.4 Claim on ELI5",
+        source_passage: "ChatGPT with RERANK's citation precision on ALCE ELI5 is 67.8 percent",
+      },
+      {
+        claim_text: "The sky is blue",
+        source_passage: "The sky is blue and the grass is green",
+      },
+    ]);
+
+    expect(results[0]!.status).toBe("unsupported");
+    expect(results[1]!.status).toBe("supported");
   });
 });
 
