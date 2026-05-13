@@ -8,9 +8,10 @@
  *  Usage: `vouch fetch <url> --fetcher opencli` to force, OR generic auto-
  *  falls-back to opencli when its content looks thin/shell-only.
  *
- *  Dep: OpenCLI CLI installed (sunny has it as ~/.bun/bin/opencli) AND the
- *  Chrome browser-bridge extension connected (`opencli doctor` should be
- *  green). If either is missing this fetcher throws a clear actionable error.
+ *  Dep: OpenCLI CLI installed on the user's PATH (e.g. `~/.bun/bin/opencli`)
+ *  AND the Chrome browser-bridge extension connected (`opencli doctor` should
+ *  be green). If either is missing this fetcher throws a clear actionable
+ *  error.
  */
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

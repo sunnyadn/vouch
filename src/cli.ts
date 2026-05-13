@@ -349,7 +349,7 @@ program
   .option("--slug <slug>", "stable slug; lowercase + dashes/underscores only (auto-derived with --from-session-tool)")
   .option("--content <text>", "attested content (inline)")
   .option("--content-file <path>", "attested content (from file)")
-  .option("--attribution <name>", "who attests (e.g., 'sunny'); defaults to session-<tool> with --from-session-tool")
+  .option("--attribution <name>", "who attests (a name or handle); defaults to session-<tool> with --from-session-tool")
   .option("--date <YYYY-MM-DD>", "attestation date; defaults to today UTC")
   .option("--topic <topic>", "searchability tag")
   .option("--force-overwrite", "replace existing attestation at same slug")

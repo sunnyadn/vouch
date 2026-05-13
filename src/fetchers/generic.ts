@@ -6,7 +6,7 @@ import {
 } from "./markitdown.ts";
 
 const USER_AGENT =
-  "Mozilla/5.0 (compatible; vouch/0.1; +https://github.com/sunny/vouch) AppleWebKit/537.36";
+  "Mozilla/5.0 (compatible; vouch/0.3) AppleWebKit/537.36";
 
 /** HTML entity decode for the few entities we strip-and-substitute manually.
  * (Keep small — full entity table not worth carrying.) */
