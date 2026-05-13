@@ -10,6 +10,11 @@ import { join } from "node:path";
 
 const tmp = mkdtempSync(join(tmpdir(), "vouch-wspf-test-"));
 process.env.VOUCH_DB_PATH = join(tmp, "test.db");
+// Inject test-side workspace projects + user handle. Production code carries
+// no hardcoded defaults — these MUST be set by the user's config for Rule 1
+// self-reference checks to fire on specific names.
+process.env.VOUCH_GATE_WORKSPACE_PROJECTS = "vouch,comprisk,crforest,js-toml,redacted-proj";
+process.env.VOUCH_GATE_USER_HANDLE = "sunnyadn";
 
 const generateObjectMock = mock(() =>
   Promise.resolve({ object: { pairs: [] } } as any),
@@ -64,53 +69,75 @@ interface ReclassifyExpectation {
 }
 
 const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
-  // downgrade (rule 1) — workspace-project self-reference / publication-state / asset locator
+  // downgrade (rule 1) — workspace-project SELF-REFERENCE only
+  // Generic self-reference (works for any user — no name baked in):
   {
-    // github.com/sunnyadn/ locator
-    proposition: "github.com/sunnyadn/crforest auto-redirects to github.com/sunnyadn/comprisk",
-    entity: "crforest",
-    expectDowngrade: true,
-    rule: 1,
-  },
-  {
-    // publication state of user's own package
-    proposition: "comprisk 0.3.0 does not exist on PyPI",
-    entity: "comprisk",
-    expectDowngrade: true,
-    rule: 1,
-  },
-  {
-    // self-referential ownership: "my vouch"
+    // "my <proj>"
     proposition: "my vouch CLI has a claim-batch subcommand",
     entity: "vouch",
     expectDowngrade: true,
     rule: 1,
   },
   {
-    // self-referential ownership: "X is my project"
+    // "<proj> is my project"
     proposition: "vouch is my project for fact verification",
     entity: "vouch",
     expectDowngrade: true,
     rule: 1,
   },
-  // NO downgrade (rule 1 narrowed 2026-05-13): bare assertions about a
-  // workspace-project's behavior/API/features are NOT self-referential and
-  // must still be gate-checked against the KB. If KB lacks coverage, fire
-  // (correct — the agent should look at the repo before claiming).
+  {
+    // "I built <proj>"
+    proposition: "I built crforest as a competing-risks survival forest implementation",
+    entity: "crforest",
+    expectDowngrade: true,
+    rule: 1,
+  },
+  // Handle-derived self-reference (env-var-gated — only fires when
+  // VOUCH_GATE_USER_HANDLE is set; this test injects "sunnyadn"):
+  {
+    // "<handle>'s <proj>" — handle from env, not hardcoded
+    proposition: "sunnyadn's vouch CLI integrates with Claude Code Stop hook",
+    entity: "vouch",
+    expectDowngrade: true,
+    rule: 1,
+  },
+  {
+    // github.com/<handle>/ locator — handle from env, not hardcoded
+    proposition: "github.com/sunnyadn/crforest auto-redirects to github.com/sunnyadn/comprisk",
+    entity: "crforest",
+    expectDowngrade: true,
+    rule: 1,
+  },
+  // NO downgrade — bare assertions about a workspace-project's behavior /
+  // API / publication-state / version flow to grounding. KB has source of
+  // truth (e.g. PyPI download counts) → grounds; otherwise fires (correct —
+  // agent must check repo / package registry before claiming).
   {
     proposition: "the vouch CLI has a claim-batch subcommand",
     entity: "vouch",
-    expectDowngrade: false, // bare assertion about own project — must be checked
+    expectDowngrade: false,
   },
   {
     proposition: "crforest 0.4.0 supports clustered standard errors",
     entity: "crforest",
-    expectDowngrade: false, // bare API claim about own project — must be checked
+    expectDowngrade: false,
   },
   {
     proposition: "comprisk uses lifelines 0.27 as a dependency",
     entity: "comprisk",
-    expectDowngrade: false, // bare claim about own project's deps — must be checked
+    expectDowngrade: false,
+  },
+  {
+    // Publication-state: no longer special-cased — must ground or fire
+    proposition: "comprisk 0.3.0 does not exist on PyPI",
+    entity: "comprisk",
+    expectDowngrade: false,
+  },
+  {
+    // Version + publication predicate: also no longer special-cased
+    proposition: "vouch 0.3.0 is the current version on npm",
+    entity: "vouch",
+    expectDowngrade: false,
   },
 
   // downgrade (rule 2) — agent-machinery phrasings

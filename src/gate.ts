@@ -256,13 +256,27 @@ export async function extractPairs(
 // Deterministic workspace-meta post-filter (issue #40)
 // ---------------------------------------------------------------------------
 
+/** Workspace projects come ENTIRELY from `VOUCH_GATE_WORKSPACE_PROJECTS`
+ *  (comma-separated). No hardcoded defaults — historic base set
+ *  `[vouch, comprisk, crforest, js-toml, redacted-proj]` was the original
+ *  author's projects and constituted user-private bakeage in shared source
+ *  (cleaned up 2026-05-13). Empty env → no workspace projects → Rule 1
+ *  self-reference checks are no-ops. */
 function getWorkspaceProjects(): Set<string> {
-  const env = (process.env.VOUCH_GATE_WORKSPACE_PROJECTS || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-  const base = ["vouch", "comprisk", "crforest", "js-toml", "redacted-proj"];
-  return new Set([...base, ...env]);
+  return new Set(
+    (process.env.VOUCH_GATE_WORKSPACE_PROJECTS || "")
+      .split(",")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
+}
+
+/** Optional user/org handle (e.g. GitHub login) for owner-derived self-
+ *  reference patterns: `<handle>'s <proj>` and `github.com/<handle>/`.
+ *  Env unset → those patterns are no-ops. */
+function getUserHandle(): string | null {
+  const h = (process.env.VOUCH_GATE_USER_HANDLE || "").trim().toLowerCase();
+  return h || null;
 }
 
 function escapeRegex(s: string): string {
@@ -326,70 +340,60 @@ export function reclassifyWorkspaceMeta(
       .trim()
       .replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "");
 
-    // ---- Rule 1 — workspace-project SELF-REFERENCE / PUBLICATION-STATE ----
-    // Narrowed 2026-05-13: was originally `entity ∈ projects → WORKSPACE`
-    // which silenced ANY assertion whose entity is the user's project,
-    // including "crforest's X function does Y" / "vouch CLI has Z subcommand"
-    // — i.e. fact-shape claims about workspace-project behavior/API that the
-    // agent should check against KB or repo. Dogfooding 2026-05-12 showed
-    // this was the dominant cause of "武断的错误答案" in meta-handling-crforest
-    // sessions: agent confabulated about its own project's API and the gate
-    // silenced it. Narrowed to fire only on:
-    //   (a) the github.com/sunnyadn/ asset locator (location is always
-    //       workspace-meta)
-    //   (b) `<proj> on PyPI` / `<proj> (does not )?exist(s)? on PyPI` /
-    //       `<proj> v?N.N` — publication-state of the user's OWN package
-    //   (c) self-referential phrasings: `my <proj>` / `our <proj>` /
-    //       `I (built|wrote|maintain|own) <proj>` / `sunny's <proj>` /
-    //       `<proj> is my project` (the user is the author of <proj>)
-    // Everything else with `entity ∈ projects` goes to grounding — KB has the
-    // source-of-truth, or fires if not (correct behavior — the agent should
-    // look at the repo).
-    if (/github\.com\/sunnyadn\//.test(lcProp)) {
-      return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+    // ---- Rule 1 — workspace-project SELF-REFERENCE only ------------------
+    // Cleaned up 2026-05-13 (two passes):
+    //   (i)  Narrowed from "any entity ∈ projects → WORKSPACE" (silenced
+    //        ALL behavior/API claims about user's own projects) to a small
+    //        set of self-reference / publication-state / asset-locator
+    //        patterns.
+    //   (ii) Further removed user-private bakeage: dropped hardcoded
+    //        `github.com/sunnyadn/`, the hardcoded `sunny'?s` in self-ref
+    //        regexes, AND the PyPI / version-publication-state predicates.
+    //        Publication-state of a package IS a fact the agent can be
+    //        wrong about (e.g. "comprisk 0.3.0 does not exist on PyPI" is
+    //        verifiable via `pip index versions comprisk`); it should flow
+    //        to grounding, not get silently silenced.
+    // What remains is the unambiguous workspace-meta core: explicit
+    // self-reference where the speaker claims ownership/authorship of the
+    // project. Plus a handle-derived `<handle>'s <proj>` / `github.com/
+    // <handle>/` variant gated by VOUCH_GATE_USER_HANDLE (env unset → off).
+    const handle = getUserHandle();
+    if (handle) {
+      const escHandle = escapeRegex(handle);
+      if (new RegExp(`\\bgithub\\.com/${escHandle}/`).test(lcProp)) {
+        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+      }
     }
     for (const proj of projects) {
       const esc = escapeRegex(proj);
-      // Optional version between project name and the publication-state
-      // predicate, so `comprisk 0.3.0 does not exist on PyPI` matches the
-      // same as `comprisk does not exist on PyPI`.
-      const versionOpt = `( v?\\d+\\.\\d+(\\.\\d+)?)?`;
-      if (new RegExp(`\\b${esc}${versionOpt} on pypi\\b`).test(lcProp)) {
-        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
-      }
+      // Generic self-reference (works for any user — no name baked in):
+      //   `(my|our) <proj>`
+      //   `I (built|wrote|maintain|created|own|made|started|developed|authored) <proj>`
+      //   `<proj> is (my|our) (project|package|library|cli|tool|repo)`
       if (
-        new RegExp(`\\b${esc}${versionOpt} (does not )?exist(s)? on pypi\\b`).test(lcProp)
-      ) {
-        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
-      }
-      // Narrowed 2026-05-13: was `\\b${esc} v?\\d+\\.\\d+` (any version
-      // number after project name → WORKSPACE), but that swept in behavior
-      // claims like `crforest 0.4.0 supports clustered standard errors` —
-      // exactly the dogfooding-failure-case the agent confabulates about.
-      // Restrict to publication-state predicates after the version (released
-      // / current version / latest version / available / shipped).
-      if (
-        new RegExp(
-          `\\b${esc} v?\\d+\\.\\d+(\\.\\d+)?\\s+(is (the )?(current|latest) version|was released|is published|is shipped|is available|is on (pypi|npm|crates\\.io))\\b`,
-        ).test(lcProp)
-      ) {
-        return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
-      }
-      // Self-referential / ownership phrasings: only when the user names
-      // themselves as author/owner/builder.
-      if (
-        new RegExp(`\\b(my|our|sunny'?s) ${esc}\\b`).test(lcProp) ||
+        new RegExp(`\\b(my|our) ${esc}\\b`).test(lcProp) ||
         new RegExp(`\\bi (built|wrote|maintain|created|own|made|started|developed|authored) ${esc}\\b`).test(lcProp) ||
-        new RegExp(`\\b${esc} is (my|our|sunny'?s) (project|package|library|cli|tool|repo)\\b`).test(lcProp)
+        new RegExp(`\\b${esc} is (my|our) (project|package|library|cli|tool|repo)\\b`).test(lcProp)
       ) {
         return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+      }
+      // Handle-derived self-reference: `<handle>'s <proj>` /
+      // `<proj> is <handle>'s (project|...)`. Gated by VOUCH_GATE_USER_HANDLE.
+      if (handle) {
+        const escHandle = escapeRegex(handle);
+        if (
+          new RegExp(`\\b${escHandle}'?s ${esc}\\b`).test(lcProp) ||
+          new RegExp(`\\b${esc} is ${escHandle}'?s (project|package|library|cli|tool|repo)\\b`).test(lcProp)
+        ) {
+          return { ...pair, stance: "WORKSPACE", reclassifiedRule: 1 };
+        }
       }
     }
-    // Note: bare `entity ∈ projects` is NO LONGER a downgrade trigger. A
-    // proposition like "crforest 0.4 supports clustered standard errors" with
-    // entity=crforest now flows to grounding; if the KB lacks the assertion,
-    // the gate fires — which is the right behavior, the agent should check
-    // the repo before claiming.
+    // Note: bare `entity ∈ projects`, `<proj> on PyPI`, `github.com/<handle>/`
+    // (without env), and version-publication-state assertions are all NO
+    // LONGER downgrade triggers. They flow to grounding — KB has the source
+    // of truth (e.g. `comprisk PyPI downloads`), or the gate fires and the
+    // agent must check the repo / package registry before claiming.
 
     // ---- Rule 2 — agent-machinery phrasings -------------------------------
     const r2a =
