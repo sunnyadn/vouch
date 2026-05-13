@@ -129,6 +129,38 @@ const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
     rule: 3,
   },
 
+  // downgrade (rule 3 — entity-in-quoted-region path)
+  {
+    proposition: "Cole & Hernán (2008) is a paper",
+    entity: "Cole & Hernán (2008)",
+    draft:
+      "Earlier the gate fired on `Cole & Hernán (2008)` and `Uno (2011)` as the prior-row content I was diagnosing.",
+    expectDowngrade: true,
+    rule: 3,
+  },
+  {
+    proposition: "Uno (2011) is a 2011 paper",
+    entity: "Uno (2011)",
+    draft:
+      'I quoted "Uno (2011)" in the prior turn to refer to a gate fire, not as my own assertion.',
+    expectDowngrade: true,
+    rule: 3,
+  },
+  {
+    proposition: "FActScore is a metric",
+    entity: "FActScore",
+    draft: "> FActScore\n\nis what the prior turn discussed, not asserted here.",
+    expectDowngrade: true,
+    rule: 3,
+  },
+  {
+    proposition: "FActScore paper is",
+    entity: "FActScore paper",
+    draft: "I mentioned `FActScore paper` earlier.",
+    expectDowngrade: true,
+    rule: 3,
+  },
+
   // NO downgrade (controls — must stay ASSERT)
   {
     // contraction apostrophes ("I'd", "it's") must NOT be treated as quote
@@ -173,6 +205,23 @@ const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
     proposition: "comprisk uses lifelines 0.27 as a dependency",
     entity: "lifelines",
     expectDowngrade: false,
+  },
+
+  // NO downgrade (rule 3b negative — predicate appears in non-quoted prose)
+  {
+    proposition: "Cole & Hernán (2008) introduces the ESS clip method",
+    entity: "Cole & Hernán (2008)",
+    draft:
+      "The gate fired on `Cole & Hernán (2008)` last turn. Independently, Cole & Hernán (2008) introduces the ESS clip method.",
+    expectDowngrade: false,
+  },
+  // downgrade (rule 1 wins over 3b — workspace-project entity)
+  {
+    proposition: "vouch is a verifier",
+    entity: "vouch",
+    draft: "`vouch` was mentioned in the prior turn.",
+    expectDowngrade: true,
+    rule: 1,
   },
 ];
 
@@ -248,5 +297,32 @@ describe("runGate integration with post-filter", () => {
     expect(v.pairs.length).toBe(1);
     expect(v.pairs[0]!.stance).toBe("ASSERT");
     expect(v.pairs[0]!.grounded).toBe(false);
+  });
+
+  it("ASSERT with entity-in-quoted-region + invented predicate → rule 3b → not blocked", async () => {
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "Cole & Hernán (2008)",
+              stance: "ASSERT",
+              proposition: "Cole & Hernán (2008) is a paper",
+            },
+          ],
+        },
+      } as any),
+    );
+    const v = await gate.runGate({
+      draft:
+        "Earlier the gate fired on `Cole & Hernán (2008)` and `Uno (2011)` as the prior-row content I was diagnosing.",
+      model: "test",
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs.length).toBe(1);
+    expect(v.pairs[0]!.stance).toBe("WORKSPACE");
+    expect(v.pairs[0]!.reclassifiedRule).toBe(3);
+    expect(v.pairs[0]!.reason).toContain("reclassified WORKSPACE by deterministic post-filter (rule 3)");
+    expect(generateObjectMock).toHaveBeenCalledTimes(1);
   });
 });

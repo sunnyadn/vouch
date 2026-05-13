@@ -64,14 +64,14 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, appendFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { generateObject } from "ai";
 import { z } from "zod";
 
 import { DB_PATH, MAX_SOURCE_CHARS } from "./config.ts";
 import { getLanguageModel } from "./providers.ts";
 import { embedOne } from "./embedder.ts";
-import { classifyError, verifyClaimAgainstSource, verifyClaimsBatch } from "./verifier.ts";
+import { classifyError, verifyClaimAgainstSource, verifyClaimsBatch, verifyContradiction } from "./verifier.ts";
 import * as store from "./store.ts";
 import type { ClaimType } from "./types.ts";
 
@@ -207,6 +207,17 @@ export interface GroundedPair extends ExtractedPair {
    *  proposition but did NOT entail it, this carries the best-matching source
    *  so the CLI can suggest `vouch attest --from-session-tool`. */
   hint?: { tool_use_id: string; uri: string; overlap: number };
+  /** Set when the session-ledger contradiction check (#43) found a prior
+   *  ASSERT in this transcript that semantically denies the new one. The
+   *  pair is flipped to grounded:false and the gate fires; the message
+   *  guides the agent to retract or supersede. */
+  contradicts_session?: {
+    old_turn: number;
+    old_claim: number;
+    old_proposition: string;
+    score: number;
+    reason: string;
+  };
 }
 
 export interface GateVerdict {
@@ -386,6 +397,57 @@ export function reclassifyWorkspaceMeta(
           if (quote.includes(slice)) {
             return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };
           }
+        }
+      }
+    }
+
+    // ---- Rule 3b — entity in a quoted region with invented predicate --------
+    // When the extractor canonicalizes a bare quoted mention into a fact-shape
+    // sentence, the predicate may be invented. Downgrade if the entity is fully
+    // inside a quoted region and the predicate body does not appear in the
+    // non-quoted prose.
+    const entityNorm = normTokens(pair.entity);
+    const entityTokens = entityNorm.split(" ").filter(Boolean);
+    if (entityTokens.length >= 1) {
+      const inQuotedRegion = quoted.some((qr) => qr.includes(entityNorm));
+      if (inQuotedRegion) {
+        const propNorm = normTokens(prop);
+        const STOPWORDS = new Set([
+          "is", "are", "was", "were", "be", "been", "being",
+          "a", "an", "the", "of", "in", "on", "at", "to", "for", "by",
+          "and", "or", "but", "as", "with",
+        ]);
+        // Strip entity from proposition; what remains is the predicate body
+        const body = propNorm.replace(entityNorm, "").trim().replace(/\s+/g, " ");
+        const bodyContentTokens = body
+          .split(" ")
+          .filter((t) => t && !STOPWORDS.has(t));
+        if (bodyContentTokens.length < 2) {
+          // Proposition is essentially just the entity → mention-not-use
+          return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };
+        }
+        // Check whether the predicate body's content tokens appear outside
+        // the quoted region that contains the entity (in order, allowing gaps
+        // for stopwords/other words). We only strip the region(s) holding the
+        // entity — other quoted/code terms may be genuine parts of the assertion.
+        const draftNorm = normTokens(draft);
+        let nonQuoted = draftNorm;
+        for (const qr of quoted) {
+          if (qr.includes(entityNorm)) {
+            nonQuoted = nonQuoted.replace(qr, " ");
+          }
+        }
+        nonQuoted = nonQuoted.replace(/\s+/g, " ").trim();
+        const nonQuotedTokens = nonQuoted.split(" ").filter(Boolean);
+        let matched = 0;
+        for (const t of nonQuotedTokens) {
+          if (t === bodyContentTokens[matched]) {
+            matched++;
+            if (matched === bodyContentTokens.length) break;
+          }
+        }
+        if (matched < bodyContentTokens.length) {
+          return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };
         }
       }
     }
@@ -1728,6 +1790,165 @@ async function safeHarvest(draft: string): Promise<HarvestResult | undefined> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Session ledger — cross-turn self-consistency (issue #43)
+// ---------------------------------------------------------------------------
+
+/** Derive the session transcript_id (basename minus .jsonl) used as the ledger
+ *  partition key. */
+export function transcriptIdFromPath(p: string): string {
+  return basename(p).replace(/\.jsonl$/, "");
+}
+
+const SESSION_CONTRADICTION_TOPK = 5;
+const SESSION_CONTRADICTION_MIN_COS = 0.55;
+const SESSION_CONTRADICTION_FIRE_SCORE = 0.75;
+
+interface SessionLedgerOutcome {
+  /** New pair state, possibly with grounded flipped to false because of
+   *  contradiction or with a "retraction-of-self" status. */
+  pair: GroundedPair;
+  /** True iff this pair's verdict triggers blocking on top of the existing
+   *  grounding pass. */
+  contradictionFire: boolean;
+}
+
+/** Heuristic entity-match for RETRACT auto-mark. Entities are loose strings;
+ *  do a normalized contains check both ways. */
+function entitiesMatch(a: string, b: string): boolean {
+  const na = a.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const nb = b.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  return na.includes(nb) || nb.includes(na);
+}
+
+/** Per-turn session-ledger pass:
+ *  1. RETRACT-stance pairs in this turn → mark matching prior ledger entries as retracted.
+ *  2. For each new ASSERT (or escalated ASSERT) → embed, find cosine candidates, run
+ *     inverse-NLI; if contradicts a prior active entry, flip the pair to ungrounded.
+ *  3. Persist all final pair states to the ledger.
+ *  Returns the (possibly contradiction-flipped) pairs and whether any contradiction
+ *  fired on this turn. */
+export async function applySessionLedger(
+  transcriptPath: string,
+  pairs: GroundedPair[],
+  abortRef?: { aborted: boolean },
+): Promise<{ pairs: GroundedPair[]; contradictionFire: boolean }> {
+  const transcript_id = transcriptIdFromPath(transcriptPath);
+  const turn_idx = store.getNextSessionTurnIdx(transcript_id);
+
+  // ----- 1. RETRACT-stance pairs in this turn → mark prior matches retracted.
+  for (const p of pairs) {
+    if (p.stance !== "RETRACT") continue;
+    const priors = store.listSessionClaims(transcript_id, { only_active: true });
+    for (const r of priors) {
+      if (entitiesMatch(r.entity, p.entity)) {
+        store.markSessionClaimRetracted(
+          transcript_id,
+          r.turn_idx,
+          r.claim_idx,
+          `RETRACT in turn ${turn_idx}: "${p.proposition.slice(0, 120)}"`,
+        );
+      }
+    }
+  }
+
+  // ----- 2. Contradiction check on new ASSERTs (and escalated-from-HEDGE).
+  let contradictionFire = false;
+  const outPairs: GroundedPair[] = [];
+  for (let claim_idx = 0; claim_idx < pairs.length; claim_idx++) {
+    const p = pairs[claim_idx]!;
+    // Only check claims the agent is actually asserting. Skip RETRACT,
+    // WORKSPACE, REFER, OPINION, HEDGE (stays HEDGE — #42 already escalated
+    // any HEDGE-with-trailing-caveat to ASSERT before grounding).
+    if (p.stance !== "ASSERT") {
+      outPairs.push(p);
+      continue;
+    }
+    if (abortRef?.aborted) {
+      outPairs.push(p);
+      continue;
+    }
+    let queryEmb: Float32Array | null = null;
+    try {
+      queryEmb = await embedOne(p.proposition);
+    } catch {
+      // embed failure — fall through, no contradiction check possible.
+    }
+    if (!queryEmb) {
+      outPairs.push(p);
+      continue;
+    }
+    const candidates = store.findSessionContradictionCandidates(transcript_id, queryEmb, {
+      topK: SESSION_CONTRADICTION_TOPK,
+      minCos: SESSION_CONTRADICTION_MIN_COS,
+    });
+    let flippedPair: GroundedPair = p;
+    for (const cand of candidates) {
+      if (abortRef?.aborted) break;
+      try {
+        const verdict = await verifyContradiction(p.proposition, cand.row.proposition);
+        if (verdict.contradicts && verdict.score >= SESSION_CONTRADICTION_FIRE_SCORE) {
+          flippedPair = {
+            ...p,
+            grounded: false,
+            reason:
+              `contradicts prior session turn ${cand.row.turn_idx} claim ${cand.row.claim_idx}: ` +
+              `"${cand.row.proposition.slice(0, 140)}" — ${verdict.reason}`,
+            contradicts_session: {
+              old_turn: cand.row.turn_idx,
+              old_claim: cand.row.claim_idx,
+              old_proposition: cand.row.proposition,
+              score: verdict.score,
+              reason: verdict.reason,
+            },
+          };
+          contradictionFire = true;
+          break;
+        }
+      } catch {
+        // Verifier transient error — skip this candidate (recall-biased).
+        continue;
+      }
+    }
+    outPairs.push(flippedPair);
+  }
+
+  // ----- 3. Persist final pair states to the ledger.
+  for (let claim_idx = 0; claim_idx < outPairs.length; claim_idx++) {
+    const p = outPairs[claim_idx]!;
+    let emb: Float32Array | null = null;
+    try {
+      emb = await embedOne(p.proposition);
+    } catch {
+      emb = null;
+    }
+    const verdict = p.contradicts_session
+      ? "contradicted"
+      : p.escalatedFromHedge
+      ? "escalated"
+      : p.reclassifiedRule
+      ? "reclassified"
+      : p.grounded
+      ? "grounded"
+      : "ungrounded";
+    store.recordSessionClaim({
+      transcript_id,
+      turn_idx,
+      claim_idx,
+      proposition: p.proposition,
+      entity: p.entity ?? "",
+      stance: p.stance,
+      verdict,
+      reason: p.reason,
+      embedding: emb,
+    });
+  }
+
+  return { pairs: outPairs, contradictionFire };
+}
+
 export async function runGate(opts: {
   draft: string;
   model: string;
@@ -1836,6 +2057,26 @@ export async function runGate(opts: {
     }
 
     pairs = checked.filter((p): p is GroundedPair => !!p);
+
+    // Session-ledger pass (#43): RETRACT auto-mark, contradiction-fire vs
+    // prior-turn ASSERTs in this transcript, persist this turn's pairs.
+    // Only runs when we have a transcript to key the ledger by, and only
+    // when the per-pair grounding loop wasn't truncated (errored/incomplete);
+    // a truncated grounding pass would write incomplete verdicts.
+    if (!errored && !incomplete && opts.sessionTranscriptPath && pairs.length) {
+      try {
+        const ledger = await applySessionLedger(
+          opts.sessionTranscriptPath,
+          pairs,
+          opts.abortRef,
+        );
+        pairs = ledger.pairs;
+      } catch (e) {
+        // Ledger errors fail OPEN — never let a session-DB hiccup block.
+        classifierError = classifierErrorMessage(e);
+      }
+    }
+
     // A verifier error fails the gate OPEN (blocked stays false) — a transient
     // system fault carries no signal about the (claim, source) pair.
     if (!errored && !incomplete) blocked = pairs.some((p) => !p.grounded);
