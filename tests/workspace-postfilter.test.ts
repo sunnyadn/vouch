@@ -64,24 +64,53 @@ interface ReclassifyExpectation {
 }
 
 const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
-  // downgrade (rule 1) — workspace-project entity / asset
+  // downgrade (rule 1) — workspace-project self-reference / publication-state / asset locator
   {
+    // github.com/sunnyadn/ locator
     proposition: "github.com/sunnyadn/crforest auto-redirects to github.com/sunnyadn/comprisk",
     entity: "crforest",
     expectDowngrade: true,
     rule: 1,
   },
   {
+    // publication state of user's own package
     proposition: "comprisk 0.3.0 does not exist on PyPI",
     entity: "comprisk",
     expectDowngrade: true,
     rule: 1,
   },
   {
-    proposition: "the vouch CLI has a claim-batch subcommand",
+    // self-referential ownership: "my vouch"
+    proposition: "my vouch CLI has a claim-batch subcommand",
     entity: "vouch",
     expectDowngrade: true,
     rule: 1,
+  },
+  {
+    // self-referential ownership: "X is my project"
+    proposition: "vouch is my project for fact verification",
+    entity: "vouch",
+    expectDowngrade: true,
+    rule: 1,
+  },
+  // NO downgrade (rule 1 narrowed 2026-05-13): bare assertions about a
+  // workspace-project's behavior/API/features are NOT self-referential and
+  // must still be gate-checked against the KB. If KB lacks coverage, fire
+  // (correct — the agent should look at the repo before claiming).
+  {
+    proposition: "the vouch CLI has a claim-batch subcommand",
+    entity: "vouch",
+    expectDowngrade: false, // bare assertion about own project — must be checked
+  },
+  {
+    proposition: "crforest 0.4.0 supports clustered standard errors",
+    entity: "crforest",
+    expectDowngrade: false, // bare API claim about own project — must be checked
+  },
+  {
+    proposition: "comprisk uses lifelines 0.27 as a dependency",
+    entity: "comprisk",
+    expectDowngrade: false, // bare claim about own project's deps — must be checked
   },
 
   // downgrade (rule 2) — agent-machinery phrasings
@@ -182,13 +211,16 @@ const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
     expectDowngrade: false,
   },
 
-  // downgrade (rule 1 wins — workspace-project entity)
+  // NO downgrade (rule 1 narrowed): bare `entity=vouch` no longer wins.
+  // Even though the entity is a workspace project and the draft mentions it
+  // in inline-code, the proposition "vouch is a verifier" is a fact-shape
+  // claim about its identity — should be ground-checked against the KB
+  // (which has many vouch claims). If KB grounds, pass; if not, fire.
   {
     proposition: "vouch is a verifier",
     entity: "vouch",
     draft: "`vouch` was mentioned in the prior turn.",
-    expectDowngrade: true,
-    rule: 1,
+    expectDowngrade: false,
   },
 ];
 
