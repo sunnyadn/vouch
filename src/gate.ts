@@ -401,56 +401,17 @@ export function reclassifyWorkspaceMeta(
       }
     }
 
-    // ---- Rule 3b — entity in a quoted region with invented predicate --------
-    // When the extractor canonicalizes a bare quoted mention into a fact-shape
-    // sentence, the predicate may be invented. Downgrade if the entity is fully
-    // inside a quoted region and the predicate body does not appear in the
-    // non-quoted prose.
-    const entityNorm = normTokens(pair.entity);
-    const entityTokens = entityNorm.split(" ").filter(Boolean);
-    if (entityTokens.length >= 1) {
-      const inQuotedRegion = quoted.some((qr) => qr.includes(entityNorm));
-      if (inQuotedRegion) {
-        const propNorm = normTokens(prop);
-        const STOPWORDS = new Set([
-          "is", "are", "was", "were", "be", "been", "being",
-          "a", "an", "the", "of", "in", "on", "at", "to", "for", "by",
-          "and", "or", "but", "as", "with",
-        ]);
-        // Strip entity from proposition; what remains is the predicate body
-        const body = propNorm.replace(entityNorm, "").trim().replace(/\s+/g, " ");
-        const bodyContentTokens = body
-          .split(" ")
-          .filter((t) => t && !STOPWORDS.has(t));
-        if (bodyContentTokens.length < 2) {
-          // Proposition is essentially just the entity → mention-not-use
-          return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };
-        }
-        // Check whether the predicate body's content tokens appear outside
-        // the quoted region that contains the entity (in order, allowing gaps
-        // for stopwords/other words). We only strip the region(s) holding the
-        // entity — other quoted/code terms may be genuine parts of the assertion.
-        const draftNorm = normTokens(draft);
-        let nonQuoted = draftNorm;
-        for (const qr of quoted) {
-          if (qr.includes(entityNorm)) {
-            nonQuoted = nonQuoted.replace(qr, " ");
-          }
-        }
-        nonQuoted = nonQuoted.replace(/\s+/g, " ").trim();
-        const nonQuotedTokens = nonQuoted.split(" ").filter(Boolean);
-        let matched = 0;
-        for (const t of nonQuotedTokens) {
-          if (t === bodyContentTokens[matched]) {
-            matched++;
-            if (matched === bodyContentTokens.length) break;
-          }
-        }
-        if (matched < bodyContentTokens.length) {
-          return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };
-        }
-      }
-    }
+    // NOTE: Rule 3b (entity-in-quoted-region with invented predicate) was
+    // shipped in d85eae7 and reverted here after the #35 freeze showed it
+    // dropped recall 100% → 69% on the standing corpus. The regression came
+    // from requiring the predicate body's content tokens to appear
+    // CONTIGUOUSLY in non-quoted prose — but the LLM extractor reorders /
+    // simplifies / paraphrases the proposition, so legitimate ASSERTs like
+    // `\`lodash-es\` 4.17.23 has high and medium severity alerts` were
+    // downgraded because the canonicalized proposition wasn't a contiguous
+    // slice of the original draft. Re-design needed (jaccard / minimum
+    // overlap percentage with the entity-stripped body, not contiguous
+    // match) before re-introducing. Tracked in #44 part 3 redesign.
 
     return pair;
   });
