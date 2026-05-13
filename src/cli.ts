@@ -860,6 +860,53 @@ program
     emit({ ok }, renderSupersede(parseInt(oldId, 10), parseInt(newId, 10), opts.reason));
   });
 
+// ---------- session show (issue #43) ----------
+program
+  .command("session")
+  .description("Inspect the per-transcript session-claim ledger")
+  .argument("<subcommand>", 'subcommand: "show"')
+  .argument("<transcriptId>", "transcript_id (basename of the Claude Code transcript file, minus .jsonl)")
+  .option("--include-retracted", "Include retracted rows in the listing")
+  .option("--only-active", "Only show rows that are neither retracted nor superseded")
+  .option("--format <fmt>", 'output format: "text" (default) or "json"', "text")
+  .action((subcommand: string, transcriptId: string, opts: any) => {
+    if (subcommand !== "show") {
+      console.error(`unknown session subcommand: ${subcommand} (expected: show)`);
+      process.exit(2);
+    }
+    const rows = store.listSessionClaims(transcriptId, {
+      include_retracted: !!opts.includeRetracted,
+      only_active: !!opts.onlyActive,
+    });
+    if (opts.format === "json") {
+      // Strip embeddings for compact JSON output.
+      const stripped = rows.map((r) => {
+        const { embedding: _e, ...rest } = r as any;
+        return rest;
+      });
+      process.stdout.write(JSON.stringify(stripped, null, 2) + "\n");
+      return;
+    }
+    if (!rows.length) {
+      console.log(`(no session claims for transcript_id ${transcriptId})`);
+      return;
+    }
+    console.log(`Session ledger for ${transcriptId} — ${rows.length} claim(s):\n`);
+    for (const r of rows) {
+      const flags: string[] = [];
+      if (r.retracted) flags.push("RETRACTED");
+      if (r.superseded_by_turn !== null) {
+        flags.push(`superseded by turn ${r.superseded_by_turn} claim ${r.superseded_by_claim}`);
+      }
+      const flagStr = flags.length ? ` [${flags.join(", ")}]` : "";
+      console.log(`  turn ${r.turn_idx} claim ${r.claim_idx}  stance=${r.stance}  verdict=${r.verdict}${flagStr}`);
+      console.log(`    entity: ${r.entity}`);
+      console.log(`    "${r.proposition}"`);
+      if (r.reason) console.log(`    reason: ${r.reason}`);
+      console.log(`    ts: ${r.ts}\n`);
+    }
+  });
+
 // ---------- list-dossiers ----------
 program
   .command("list-dossiers")

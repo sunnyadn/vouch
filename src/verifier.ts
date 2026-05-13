@@ -232,6 +232,77 @@ export async function verifyClaimAgainstSource(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Contradiction check — inverse-NLI for the session ledger (#43)
+// ---------------------------------------------------------------------------
+
+const ContradictionSchema = z.object({
+  contradicts: z.boolean(),
+  score: z.number().min(0).max(1),
+  reason: z.string().max(500),
+});
+
+const CONTRADICTION_PROMPT_TEMPLATE = `You are checking whether two propositions are mutually exclusive.
+
+PROPOSITION A: "{PROP_A}"
+PROPOSITION B: "{PROP_B}"
+
+Question: Are these two propositions mutually exclusive — can a faithful reader of both conclude that one denies the other?
+
+CONTRADICTS = true iff there is at least one factual assertion in one proposition whose **negation** is asserted in the other (e.g. A says "X treats Y as Z", B says "X does NOT treat Y as Z" / "X treats Y as W ≠ Z"). Both propositions being simultaneously true must be **logically impossible** given their literal content.
+
+CONTRADICTS = false in all of the following:
+- Different topics, different entities, or different scopes (one is silent where the other speaks).
+- One is a subset / superset of the other (partial coverage, same content).
+- Same factual content with different wording, paraphrase, or precision (e.g. "≈ 0.86" vs "0.862" → not contradiction unless one explicitly excludes the other's value).
+- An update or refinement that adds detail without denying prior content.
+- Saying nothing about a fact is NOT the same as denying it.
+
+Be CONSERVATIVE: when in doubt, answer false. We only want clear, logical mutual exclusion.
+
+Return JSON: { contradicts: boolean, score: 0..1 confidence, reason: one short sentence }.`;
+
+export interface ContradictionResult {
+  contradicts: boolean;
+  score: number;
+  reason: string;
+  verifier: string;
+}
+
+/** Inverse-NLI: ask whether two propositions are mutually exclusive. Used by
+ *  the session-ledger contradiction-fire path in runGate. */
+export async function verifyContradiction(
+  propA: string,
+  propB: string,
+): Promise<ContradictionResult> {
+  const prompt = CONTRADICTION_PROMPT_TEMPLATE
+    .replace("{PROP_A}", propA)
+    .replace("{PROP_B}", propB);
+  try {
+    const { object } = await generateObject({
+      model: getLanguageModel(VERIFIER_MODEL),
+      schema: ContradictionSchema,
+      prompt,
+      temperature: 0.0,
+    });
+    return {
+      contradicts: object.contradicts,
+      score: object.score,
+      reason: object.reason,
+      verifier: VERIFIER_MODEL,
+    };
+  } catch (e: any) {
+    const transient = classifyError(e);
+    if (transient) throw transient;
+    return {
+      contradicts: false,
+      score: 0,
+      reason: `contradiction verifier error: ${e?.message || String(e)}`.slice(0, 300),
+      verifier: `${VERIFIER_MODEL}-error`,
+    };
+  }
+}
+
 const BatchVerifySchema = z.object({
   verdicts: z.array(
     z.object({

@@ -1,0 +1,21 @@
+{
+  "nli": "minicheck",
+  "limit": null,
+  "results": [
+    {
+      "input": "alce_dryrun_with_vouch_v2.json",
+      "n_samples": 100,
+      "citation_recall": 88.97058823529412,
+      "citation_precision": 88.74172185430463,
+      "citation_f1": 88.85600767228387,
+      "n_sentences_with_cites": 272,
+      "n_sentences_supported": 242,
+      "n_individual_cites": 302,
+      "n_individual_supported": 268,
+      "claim_nli": 24.666666666666664,
+      "n_claims_total": 300,
+      "n_claims_entailed": 74,
+      "n_answers_with_claims": 100
+    }
+  ]
+}

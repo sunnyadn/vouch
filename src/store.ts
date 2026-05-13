@@ -84,6 +84,31 @@ function initSchema(db: Database) {
     CREATE INDEX IF NOT EXISTS idx_dep_claim ON claim_dependencies(claim_id);
     CREATE INDEX IF NOT EXISTS idx_dep_target ON claim_dependencies(depends_on_id);
   `);
+  // Session claims ledger (issue #43) — per-transcript record of what the
+  // agent has asserted in THIS session, with verdicts. Powers cross-turn
+  // self-contradiction detection (a stateless gate cannot see "you said X
+  // earlier; now saying ¬X").
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_claims (
+      transcript_id TEXT NOT NULL,
+      turn_idx INTEGER NOT NULL,
+      claim_idx INTEGER NOT NULL,
+      proposition TEXT NOT NULL,
+      entity TEXT NOT NULL,
+      stance TEXT NOT NULL,
+      verdict TEXT NOT NULL,
+      reason TEXT,
+      embedding BLOB,
+      ts TEXT NOT NULL,
+      superseded_by_turn INTEGER,
+      superseded_by_claim INTEGER,
+      retracted INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (transcript_id, turn_idx, claim_idx)
+    );
+    CREATE INDEX IF NOT EXISTS idx_session_claims_tid ON session_claims(transcript_id);
+    CREATE INDEX IF NOT EXISTS idx_session_claims_active
+      ON session_claims(transcript_id, retracted, superseded_by_turn);
+  `);
 }
 
 // ---------------------------------------------------------------------------
@@ -869,4 +894,168 @@ export function searchHybrid(
 
   hits.sort((a, b) => b.similarity - a.similarity);
   return hits.slice(0, topK);
+}
+
+// ---------------------------------------------------------------------------
+// Session claims ledger (issue #43)
+// ---------------------------------------------------------------------------
+
+export interface SessionClaimRow {
+  transcript_id: string;
+  turn_idx: number;
+  claim_idx: number;
+  proposition: string;
+  entity: string;
+  stance: string;
+  /** grounded | ungrounded | reclassified | escalated | contradicted */
+  verdict: string;
+  reason: string | null;
+  ts: string;
+  superseded_by_turn: number | null;
+  superseded_by_claim: number | null;
+  /** 0 | 1 */
+  retracted: number;
+  embedding?: Float32Array | null;
+}
+
+export interface RecordSessionClaimInput {
+  transcript_id: string;
+  turn_idx: number;
+  claim_idx: number;
+  proposition: string;
+  entity: string;
+  stance: string;
+  verdict: string;
+  reason?: string | null;
+  embedding?: Float32Array | null;
+}
+
+/** Return the next unused turn_idx for this transcript (0 if no rows yet). */
+export function getNextSessionTurnIdx(transcript_id: string): number {
+  const row = getDb()
+    .prepare("SELECT MAX(turn_idx) AS m FROM session_claims WHERE transcript_id = ?")
+    .get(transcript_id) as { m: number | null } | undefined;
+  return (row?.m ?? -1) + 1;
+}
+
+export function recordSessionClaim(input: RecordSessionClaimInput): void {
+  const ts = new Date().toISOString();
+  const embBlob = input.embedding ? embToBlob(input.embedding) : null;
+  getDb()
+    .prepare(
+      `INSERT OR REPLACE INTO session_claims
+       (transcript_id, turn_idx, claim_idx, proposition, entity, stance, verdict, reason,
+        embedding, ts, superseded_by_turn, superseded_by_claim, retracted)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)`,
+    )
+    .run(
+      input.transcript_id,
+      input.turn_idx,
+      input.claim_idx,
+      input.proposition,
+      input.entity,
+      input.stance,
+      input.verdict,
+      input.reason ?? null,
+      embBlob,
+      ts,
+    );
+}
+
+export function getSessionClaim(
+  transcript_id: string,
+  turn_idx: number,
+  claim_idx: number,
+): SessionClaimRow | null {
+  const row = getDb()
+    .prepare(
+      `SELECT * FROM session_claims
+       WHERE transcript_id = ? AND turn_idx = ? AND claim_idx = ?`,
+    )
+    .get(transcript_id, turn_idx, claim_idx) as any;
+  if (!row) return null;
+  row.embedding = blobToEmb(row.embedding);
+  return row as SessionClaimRow;
+}
+
+export function listSessionClaims(
+  transcript_id: string,
+  opts: { include_retracted?: boolean; only_active?: boolean } = {},
+): SessionClaimRow[] {
+  const db = getDb();
+  let sql = `SELECT * FROM session_claims WHERE transcript_id = ?`;
+  if (opts.only_active) {
+    sql += ` AND retracted = 0 AND superseded_by_turn IS NULL`;
+  } else if (!opts.include_retracted) {
+    sql += ` AND retracted = 0`;
+  }
+  sql += ` ORDER BY turn_idx ASC, claim_idx ASC`;
+  return (db.prepare(sql).all(transcript_id) as any[]).map((r) => {
+    r.embedding = blobToEmb(r.embedding);
+    return r as SessionClaimRow;
+  });
+}
+
+/** Find prior session claims (same transcript, not retracted, not superseded,
+ *  verdict in {grounded, escalated}) whose embedding is cosine-close to
+ *  queryEmb. Returns top-K above threshold, sorted desc by similarity.
+ *  Excludes WORKSPACE / REFER / reclassified rows — those aren't assertions
+ *  the agent is making, so they can't be contradicted. */
+export function findSessionContradictionCandidates(
+  transcript_id: string,
+  queryEmb: Float32Array,
+  opts: { topK?: number; minCos?: number; excludeTurn?: number } = {},
+): Array<{ row: SessionClaimRow; similarity: number }> {
+  const topK = opts.topK ?? 10;
+  const minCos = opts.minCos ?? 0.6;
+  const rows = listSessionClaims(transcript_id, { only_active: true });
+  const hits: Array<{ row: SessionClaimRow; similarity: number }> = [];
+  for (const r of rows) {
+    if (!r.embedding) continue;
+    if (opts.excludeTurn !== undefined && r.turn_idx === opts.excludeTurn) continue;
+    if (r.stance === "WORKSPACE" || r.stance === "REFER" || r.verdict === "reclassified") continue;
+    const s = cosine(r.embedding, queryEmb);
+    if (s >= minCos) hits.push({ row: r, similarity: s });
+  }
+  hits.sort((a, b) => b.similarity - a.similarity);
+  return hits.slice(0, topK);
+}
+
+/** Soft-delete a prior session claim. Reason is appended to the row's reason
+ *  field so the audit log retains the original verdict reason. */
+export function markSessionClaimRetracted(
+  transcript_id: string,
+  turn_idx: number,
+  claim_idx: number,
+  reason: string,
+): boolean {
+  const db = getDb();
+  const res = db
+    .prepare(
+      `UPDATE session_claims
+       SET retracted = 1,
+           reason = COALESCE(reason, '') || (CASE WHEN COALESCE(reason, '') = '' THEN '' ELSE ' | ' END) || 'retracted: ' || ?
+       WHERE transcript_id = ? AND turn_idx = ? AND claim_idx = ?`,
+    )
+    .run(reason, transcript_id, turn_idx, claim_idx);
+  return res.changes > 0;
+}
+
+/** Mark an old session claim as superseded by a new one in the same session. */
+export function markSessionClaimSuperseded(
+  transcript_id: string,
+  old_turn: number,
+  old_claim: number,
+  new_turn: number,
+  new_claim: number,
+): boolean {
+  const db = getDb();
+  const res = db
+    .prepare(
+      `UPDATE session_claims
+       SET superseded_by_turn = ?, superseded_by_claim = ?
+       WHERE transcript_id = ? AND turn_idx = ? AND claim_idx = ?`,
+    )
+    .run(new_turn, new_claim, transcript_id, old_turn, old_claim);
+  return res.changes > 0;
 }
