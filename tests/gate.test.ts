@@ -468,13 +468,13 @@ describe("runGate stance dispatch", () => {
       Promise.resolve({
         object: {
           pairs: [
-            { entity: "FEVER", stance: "HEDGE", proposition: "FEVER has 185,445 claims." },
+            { entity: "FEVER", stance: "HEDGE", proposition: "I think FEVER has 185,445 claims." },
           ],
         },
       } as any),
     );
     const v = await gate.runGate({
-      draft: "FEVER has 185,445 claims (unverified, from training memory).",
+      draft: "I think FEVER has 185,445 claims.",
       model: "vertex_ai/test",
     });
     expect(v.blocked).toBe(false);
@@ -622,17 +622,17 @@ describe("runGate stance dispatch", () => {
       Promise.resolve({
         object: {
           pairs: [
-            { entity: "FEVER", stance: "HEDGE", proposition: "FEVER has roughly 185k claims." },
+            { entity: "FEVER", stance: "HEDGE", proposition: "I think FEVER has roughly 185k claims." },
             { entity: "FEVER", stance: "RETRACT", proposition: "Retracting earlier claim about FEVER." },
-            { entity: "MiniCheck-7B", stance: "HEDGE", proposition: "MiniCheck-7B is around 7B params." },
+            { entity: "MiniCheck-7B", stance: "HEDGE", proposition: "Probably MiniCheck-7B is around 7B params." },
           ],
         },
       } as any),
     );
     const v = await gate.runGate({
       draft:
-        "FEVER has roughly 185k claims (unverified). Retracting earlier claim about FEVER. " +
-        "MiniCheck-7B is around 7B params (from training memory).",
+        "I think FEVER has roughly 185k claims. Retracting earlier claim about FEVER. " +
+        "Probably MiniCheck-7B is around 7B params.",
       model: "vertex_ai/test",
     });
     expect(v.blocked).toBe(false);
@@ -648,13 +648,13 @@ describe("runGate stance dispatch", () => {
         object: {
           pairs: [
             { entity: "FEVER", stance: "ASSERT", proposition: "FEVER has 185,445 claims." },
-            { entity: "MiniCheck-7B", stance: "HEDGE", proposition: "MiniCheck-7B is 7B params." },
+            { entity: "MiniCheck-7B", stance: "HEDGE", proposition: "I think MiniCheck-7B is 7B params." },
           ],
         },
       } as any),
     );
     const v = await gate.runGate({
-      draft: "FEVER has 185,445 claims. MiniCheck-7B is 7B params (unverified).",
+      draft: "FEVER has 185,445 claims. I think MiniCheck-7B is 7B params.",
       model: "vertex_ai/test",
     });
     expect(v.blocked).toBe(true);

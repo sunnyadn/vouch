@@ -185,6 +185,10 @@ export interface ExtractedPair {
   /** If set by reclassifyWorkspaceMeta, the rule number (1-3) that caused the
    *  downgrade from ASSERT to WORKSPACE. */
   reclassifiedRule?: number;
+  /** If set by escalateHedgeAssertions, this pair was originally stance=HEDGE
+   *  but was escalated to ASSERT because its sentence is a fact-shape claim
+   *  carrying a trailing caveat like "(unverified, from training memory)". */
+  escalatedFromHedge?: boolean;
 }
 
 export interface GroundedPair extends ExtractedPair {
@@ -386,6 +390,75 @@ export function reclassifyWorkspaceMeta(
       }
     }
 
+    return pair;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic HEDGE escape-hatch post-filter (issue #42)
+// ---------------------------------------------------------------------------
+
+const HEDGE_ESCAPE_BLOCK_PATTERNS = [
+  // trailing parenthetical caveat
+  /\(\s*unverified\b[^)]*\)\s*\.?\s*$/i,
+  /\(\s*(?:from\s+)?(?:training|my)\s+memory[^)]*\)\s*\.?\s*$/i,
+  /\(\s*training\s+memory[^)]*\)\s*\.?\s*$/i,
+  /\(\s*named\s*,\s*not\s+(?:run|tested|verified|checked)\s+here\s*\)\s*\.?\s*$/i,
+  /\(\s*not\s+(?:verified|checked)\b[^)]*\)\s*\.?\s*$/i,
+  // trailing comma-separated caveat (no parens)
+  /,\s+(?:unverified|from\s+(?:training|my)\s+memory|training\s+memory)\b[^.]*\.?\s*$/i,
+  // " — unverified" em-dash trailer
+  /\s+[—-]\s+(?:unverified|from\s+(?:training|my)\s+memory)\b[^.]*\.?\s*$/i,
+];
+
+const HEDGE_KEEP_PATTERNS = [
+  // leading epistemic hedge
+  /^\s*(?:i\s+(?:think|believe|suspect|guess)|afaik|probably|maybe|perhaps)\b/i,
+  // question form
+  /\?\s*$/,
+  // explicit uncertainty about identity
+  /^\s*i\s+(?:am\s+not|'m\s+not|do\s+not|don'?t)\s+(?:sure|know)\b/i,
+  // placeholder/TBD
+  /\b(?:TBD|placeholder|TK|FIXME)\b/i,
+];
+
+/** Best-effort locate the sentence in `draft` that contains `proposition`. */
+function findSentenceContaining(draft: string, proposition: string): string | null {
+  const normProp = normTokens(proposition);
+  const sentences = draft
+    .replace(/\n+/g, " ")
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const sent of sentences) {
+    if (normTokens(sent).includes(normProp)) {
+      return sent;
+    }
+  }
+  // Fallback: try the whole draft
+  if (normTokens(draft).includes(normProp)) {
+    return draft.trim();
+  }
+  return null;
+}
+
+/** Deterministic post-filter that escalates HEDGE → ASSERT when the sentence is
+ *  a fact-shape claim carrying a trailing parenthetical/comma caveat.
+ *  Recall-biased: when the sentence cannot be located, or no rule matches,
+ *  the pair is left as HEDGE. */
+export function escalateHedgeAssertions(
+  pairs: ExtractedPair[],
+  draft: string,
+): ExtractedPair[] {
+  return pairs.map((pair) => {
+    if (pair.stance !== "HEDGE") return pair;
+    const sentence = findSentenceContaining(draft, pair.proposition);
+    if (!sentence) return pair;
+    const isBlock = HEDGE_ESCAPE_BLOCK_PATTERNS.some((re) => re.test(sentence));
+    const isKeep = HEDGE_KEEP_PATTERNS.some((re) => re.test(sentence));
+    if (isBlock && !isKeep) {
+      return { ...pair, stance: "ASSERT", escalatedFromHedge: true };
+    }
     return pair;
   });
 }
@@ -1675,7 +1748,9 @@ export async function runGate(opts: {
   let incomplete = false;
 
   const extracted = opts.extractedPairs !== undefined ? opts.extractedPairs : await extractPairs(opts.draft, opts.model);
-  const pairsToCheck = extracted ? reclassifyWorkspaceMeta(extracted, opts.draft) : null;
+  const pairsToCheck = extracted
+    ? escalateHedgeAssertions(reclassifyWorkspaceMeta(extracted, opts.draft), opts.draft)
+    : null;
   if (extracted === null) {
     classifierError = "extractor failed";
   } else if (pairsToCheck && pairsToCheck.length) {
