@@ -273,8 +273,11 @@ function extractQuotedRegions(draft: string): string[] {
   const dqRe = /"([^"]{10,})"/g;
   while ((m = dqRe.exec(lc))) out.push(normTokens(m[1]!));
 
-  const sqRe = /'([^']{10,})'/g;
-  while ((m = sqRe.exec(lc))) out.push(normTokens(m[1]!));
+  // NOTE: deliberately NOT matching single-quoted regions (`'...'`) — the
+  // apostrophes in English contractions ("it's", "I'd", "don't") get treated
+  // as quote delimiters, so any text between two contractions is spuriously
+  // captured as a "quoted region". Single-quote *quotation* in agent prose is
+  // rare; double-quotes / backticks / blockquotes cover the real cases.
 
   const btRe = /`([^`]{10,})`/g;
   while ((m = btRe.exec(lc))) out.push(normTokens(m[1]!));
@@ -361,11 +364,17 @@ export function reclassifyWorkspaceMeta(
     }
 
     // ---- Rule 3 — mention-not-use -----------------------------------------
+    // Require an 8-token contiguous overlap inside an actual quoted region
+    // (double-quote / backtick / blockquote — NOT single-quote, see
+    // extractQuotedRegions). Conservative: a false-keep (the prop fires even
+    // though it was being quoted) is cheaper than a false-downgrade (a real
+    // assertion gets suppressed because some nearby text was quoted).
+    const RULE3_MIN_TOKENS = 8;
     const normProp = normTokens(prop);
     const propTokens = normProp.split(" ");
-    if (propTokens.length >= 6) {
-      for (let i = 0; i <= propTokens.length - 6; i++) {
-        const slice = propTokens.slice(i, i + 6).join(" ");
+    if (propTokens.length >= RULE3_MIN_TOKENS) {
+      for (let i = 0; i <= propTokens.length - RULE3_MIN_TOKENS; i++) {
+        const slice = propTokens.slice(i, i + RULE3_MIN_TOKENS).join(" ");
         for (const quote of quoted) {
           if (quote.includes(slice)) {
             return { ...pair, stance: "WORKSPACE", reclassifiedRule: 3 };

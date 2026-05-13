@@ -110,20 +110,33 @@ const RECLASSIFY_EXPECTATIONS: ReclassifyExpectation[] = [
     rule: 2,
   },
 
-  // downgrade (rule 3) — mention-not-use
+  // downgrade (rule 3) — mention-not-use: an ≥8-token slice of the proposition
+  // appears inside a real double-quote / backtick / blockquote region of the draft
   {
-    proposition: "smol-toml is the de-facto standard",
+    proposition: "smol-toml is the de-facto standard now in the JS ecosystem",
     entity: "smol-toml",
-    draft: "the fire on 'smol-toml is the de-facto standard' was a good catch",
+    draft:
+      'I should note the gate fired on "smol-toml is the de-facto standard now in the JS ecosystem" — that is a quoted claim being discussed, not an assertion I am making.',
+    expectDowngrade: true,
+    rule: 3,
+  },
+  {
+    proposition: "FActScore decomposes a generation into atomic facts and scores the supported fraction",
+    entity: "FActScore",
+    draft:
+      "> FActScore decomposes a generation into atomic facts and scores the supported fraction\n\n(quoting the FActScore README above; I'm not asserting this myself)",
     expectDowngrade: true,
     rule: 3,
   },
 
   // NO downgrade (controls — must stay ASSERT)
   {
+    // contraction apostrophes ("I'd", "it's") must NOT be treated as quote
+    // delimiters — this draft has no real quoted region
     proposition: "smol-toml is the de-facto standard now",
     entity: "smol-toml",
-    draft: "I'd reach for smol-toml — it's the de-facto standard now.",
+    draft:
+      "I'd reach for smol-toml — it's the de-facto standard now, it's what most new projects pull in, and it doesn't pull a parser-generator into your bundle.",
     expectDowngrade: false,
   },
   {
