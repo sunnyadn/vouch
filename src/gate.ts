@@ -270,17 +270,20 @@ function extractQuotedRegions(draft: string): string[] {
   const out: string[] = [];
   let m: RegExpExecArray | null;
 
-  const dqRe = /"([^"]{10,})"/g;
-  while ((m = dqRe.exec(lc))) out.push(normTokens(m[1]!));
+  // IMPORTANT — match each quoted span CORRECTLY first, then length-filter.
+  // A naive `/"([^"]{10,})"/g` would, when it hits a short span (e.g. an inline
+  // `code` shorter than the minimum), *skip* that span and instead match the
+  // prose between two short spans (` ` text ` ` → captures "text"). So: match
+  // single-line `"..."` / `` `...` `` spans (content can't span a newline or
+  // contain the delimiter → adjacent delimiters pair correctly), THEN keep the
+  // ones ≥10 chars. Also deliberately NOT matching single-quoted regions
+  // (`'...'`) — English contraction apostrophes ("it's", "I'd") would be
+  // treated as delimiters; single-quote quotation in agent prose is rare.
+  const dqRe = /"([^"\n]+)"/g;
+  while ((m = dqRe.exec(lc))) if (m[1]!.length >= 10) out.push(normTokens(m[1]!));
 
-  // NOTE: deliberately NOT matching single-quoted regions (`'...'`) — the
-  // apostrophes in English contractions ("it's", "I'd", "don't") get treated
-  // as quote delimiters, so any text between two contractions is spuriously
-  // captured as a "quoted region". Single-quote *quotation* in agent prose is
-  // rare; double-quotes / backticks / blockquotes cover the real cases.
-
-  const btRe = /`([^`]{10,})`/g;
-  while ((m = btRe.exec(lc))) out.push(normTokens(m[1]!));
+  const btRe = /`([^`\n]+)`/g;
+  while ((m = btRe.exec(lc))) if (m[1]!.length >= 10) out.push(normTokens(m[1]!));
 
   const bqRe = /^>\s*(.+)$/gm;
   while ((m = bqRe.exec(lc))) out.push(normTokens(m[1]!));
