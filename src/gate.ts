@@ -241,6 +241,19 @@ export interface GroundedPair extends ExtractedPair {
     score: number;
     reason: string;
   };
+  /** Top KB candidates that the gate's grounding step considered but that
+   *  NLI did NOT entail. Surfaced in the fire message (#50 E) so the agent
+   *  sees what the KB has on this entity in-line — no need to re-run
+   *  `vouch search`. Capped at 2 to keep the fire scannable. Sorted by
+   *  NLI score descending (closest-miss first — most likely fixable via
+   *  rephrasing or claim-against-existing-dossier). */
+  kb_candidates?: Array<{
+    claim_id: number;
+    claim_text: string;
+    dossier_slug: string | null;
+    nli_reason: string;
+    nli_score: number;
+  }>;
 }
 
 export interface GateVerdict {
@@ -856,6 +869,11 @@ async function batchGroundAssertions(
 
     try {
       const batchResults = await verifyClaimsBatch(batchItems);
+      // #50 (E): collect non-entailing candidates per pair so the fire
+      // message can surface them inline. Buffer here, prune+sort once after
+      // the batch settles (so a candidate that DID entail can short-circuit
+      // its pair to grounded:true without polluting kb_candidates).
+      const candidateBuffer = new Map<number, GroundedPair["kb_candidates"]>();
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i]!;
         const r = batchResults[i]!;
@@ -866,7 +884,37 @@ async function batchGroundAssertions(
             matched_claim_id: c.claimId,
             reason: `entailed by claim ${c.claimId} (score=${r.score.toFixed(2)})`,
           };
+          continue;
         }
+        // Non-supported — capture for #50 (E) surfacing IF this pair is
+        // still ungrounded at the end. Note: source_passage carries the
+        // verifier's natural-language reason for unsupported claims (the
+        // post-#49 invariant: only `supported` paths store verbatim quote).
+        const claim = store.getClaim(c.claimId);
+        if (!claim) continue;
+        // Surface filter: the candidate's claim text must actually mention
+        // the firing entity. Primary-pool hits skip the sharesPrimaryEntity
+        // gate during NLI (so we find genuine entailments via paraphrase),
+        // but for DISPLAY we only want candidates the agent can actually
+        // act on — showing "CoBuddy has 131k context" as a KB candidate for
+        // a claim about "BridgeNet" is noise, not signal.
+        if (!sharesPrimaryEntity(pairs[c.pairIdx]!, claim.claim_text)) continue;
+        if (!candidateBuffer.has(c.pairIdx)) candidateBuffer.set(c.pairIdx, []);
+        candidateBuffer.get(c.pairIdx)!.push({
+          claim_id: c.claimId,
+          claim_text: claim.claim_text,
+          dossier_slug: claim.dossier_slug || null,
+          nli_reason: r.source_passage || "(no reason returned)",
+          nli_score: r.score,
+        });
+      }
+      // Sort each pair's buffer by NLI score desc, keep top 2. Attach only
+      // when the pair stayed ungrounded (didn't get entailed by another
+      // candidate in the same batch).
+      for (const [pairIdx, buf] of candidateBuffer.entries()) {
+        if (results[pairIdx]!.grounded) continue;
+        buf!.sort((a, b) => b.nli_score - a.nli_score);
+        results[pairIdx]!.kb_candidates = buf!.slice(0, 2);
       }
     } catch (e) {
       // Transient/system error on the batch — re-throw so runGate can fail-open.
@@ -2688,15 +2736,45 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
         `      — looks like a session observation (you ran \`${p.hint.uri}\` this session): ` +
           `\`vouch attest --from-session-tool ${p.hint.tool_use_id} --stance observation --claim "${safeProp}"\` to record it`,
       );
+      continue;
+    }
+    // #50 (E) — inline KB candidates the gate's own grounding step
+    // already considered. Counterfactual hit rate on the 2026-05-14
+    // dogfood baseline is 80% of dodge propositions (vs 0% for the
+    // provider-hint cascade), so this is where the load-bearing
+    // information lives. Render before the `vouch search` suggestion so
+    // the agent sees "re-claim against existing dossier" as the first
+    // option when the KB has anything close.
+    if (p.kb_candidates && p.kb_candidates.length > 0) {
+      lines.push(`      KB nearest:`);
+      for (const c of p.kb_candidates) {
+        const truncatedClaim = c.claim_text.length > 160
+          ? c.claim_text.slice(0, 160) + "…"
+          : c.claim_text;
+        const dossierLine = c.dossier_slug
+          ? `\n         dossier: ${c.dossier_slug}`
+          : "";
+        const reasonLine = c.nli_reason
+          ? `\n         NLI gap: ${c.nli_reason.slice(0, 200)}`
+          : "";
+        lines.push(
+          `        [claim ${c.claim_id}, NLI=${c.nli_score.toFixed(2)}] "${truncatedClaim}"${dossierLine}${reasonLine}`,
+        );
+      }
+      // Show both productive paths the agent can choose between.
+      const closestSlug = p.kb_candidates[0]!.dossier_slug;
+      if (closestSlug) {
+        const safeProp = p.proposition.replace(/"/g, '\\"');
+        lines.push(
+          `      → if rephrasing the claim closes the gap: vouch claim "${safeProp}" --type ATOMIC --dossier ${closestSlug}`,
+        );
+      }
+      lines.push(`      → for a fresh source: ${suggestVerification(p.entity, draft)}`);
     } else {
-      // #50 (B) — pre-suggest `vouch search "<entity>" [--provider X]`. The
-      // search primitive already does KB-first + web fallback (cli.ts:957);
-      // we just add a `--provider` hint when the RAW DRAFT carries a
-      // structural signal (arxiv id / PMID / DOI). Skip when the session-
-      // observation hint above already supplied a more specific command —
-      // two competing suggestions per entity would be noise.
-      const sug = suggestVerification(p.entity, draft);
-      lines.push(renderSuggestionLine(sug));
+      // No KB candidates at all (Phase 1 hybrid search returned nothing
+      // relevant). Fall back to the suggestion-only path — search will
+      // route to web fallback under cli.ts:957's behavior.
+      lines.push(renderSuggestionLine(suggestVerification(p.entity, draft)));
     }
   }
   const anySessionChecked = ungrounded.some((p) => (p.session_sources_checked ?? 0) > 0);
