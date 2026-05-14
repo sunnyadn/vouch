@@ -2892,10 +2892,27 @@ function formatSessionSummary(
     c.awaiting_revise > 0
       ? `[vouch-gate] revise backlog: ${c.awaiting_revise} fired entit${c.awaiting_revise === 1 ? "y" : "ies"} from prior turns awaiting revise verification (#50 A Stage 1)\n`
       : "";
+
+  // P-γ humility line: ratio of explicit-uncertainty stances (HEDGE +
+  // SPECULATE) to all truth-bearing stances (ASSERT + HEDGE + SPECULATE).
+  // A growing-confident agent has a falling humility rate; a chronically-
+  // hedging agent has a high one. Both are diagnostic signals the user
+  // can use to push back. Rendered only when there's meaningful volume
+  // (≥10 truth-bearing claims) to avoid noisy single-digit ratios.
+  const truthBearing = c.asserts + c.hedges + c.speculates;
+  let humilityLine = "";
+  if (truthBearing >= 10) {
+    const hedged = c.hedges + c.speculates;
+    const rate = ((hedged / truthBearing) * 100).toFixed(1);
+    humilityLine =
+      `[vouch-gate] humility: ${hedged}/${truthBearing} = ${rate}% explicit-uncertainty (${c.asserts} assert / ${c.hedges} hedge / ${c.speculates} speculate)\n`;
+  }
+
   return (
     `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n` +
     stage2Lines +
-    awaitingLine
+    awaitingLine +
+    humilityLine
   );
 }
 

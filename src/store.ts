@@ -988,6 +988,14 @@ export function getSessionFireCounts(transcript_id: string): {
   reclassified: number;
   retracted: number;
   awaiting_revise: number;
+  /** P-γ stance breakdown: counts of confident-vs-uncertain stances over
+   *  the full session. ASSERT is the confident truth-bearing stance; HEDGE
+   *  and SPECULATE are the explicit-uncertainty truth-bearing stances. The
+   *  humility ratio (HEDGE+SPECULATE) / (ASSERT+HEDGE+SPECULATE) is the
+   *  starting humility signal made visible per Stop hook. */
+  asserts: number;
+  hedges: number;
+  speculates: number;
 } {
   const row = getDb()
     .prepare(
@@ -997,7 +1005,10 @@ export function getSessionFireCounts(transcript_id: string): {
          SUM(CASE WHEN verdict = 'grounded' THEN 1 ELSE 0 END) AS grounded,
          SUM(CASE WHEN verdict = 'reclassified' THEN 1 ELSE 0 END) AS reclassified,
          SUM(CASE WHEN retracted = 1 THEN 1 ELSE 0 END) AS retracted,
-         SUM(CASE WHEN awaiting_revise = 1 THEN 1 ELSE 0 END) AS awaiting_revise
+         SUM(CASE WHEN awaiting_revise = 1 THEN 1 ELSE 0 END) AS awaiting_revise,
+         SUM(CASE WHEN stance = 'ASSERT' THEN 1 ELSE 0 END) AS asserts,
+         SUM(CASE WHEN stance = 'HEDGE' THEN 1 ELSE 0 END) AS hedges,
+         SUM(CASE WHEN stance = 'SPECULATE' THEN 1 ELSE 0 END) AS speculates
        FROM session_claims
        WHERE transcript_id = ?`,
     )
@@ -1009,6 +1020,9 @@ export function getSessionFireCounts(transcript_id: string): {
         reclassified: number;
         retracted: number;
         awaiting_revise: number;
+        asserts: number;
+        hedges: number;
+        speculates: number;
       }
     | undefined;
   return {
@@ -1018,6 +1032,9 @@ export function getSessionFireCounts(transcript_id: string): {
     reclassified: row?.reclassified ?? 0,
     retracted: row?.retracted ?? 0,
     awaiting_revise: row?.awaiting_revise ?? 0,
+    asserts: row?.asserts ?? 0,
+    hedges: row?.hedges ?? 0,
+    speculates: row?.speculates ?? 0,
   };
 }
 
