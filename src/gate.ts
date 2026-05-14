@@ -2717,6 +2717,40 @@ function writeGateLog(entry: AuditEntry) {
  *  human/judge pass via classify_fires.ts. This line surfaces the raw
  *  pressure: a fire count that climbs without a matching grounded count
  *  is the dodge-accumulation signal the user can act on. */
+/** #50 (A) Stage 3 — escalated block message rendered when this turn passed
+ *  its own gate but Stage 2 detected unaddressed prior-turn fires. Names the
+ *  lingering entities and points at the productive paths. */
+function formatEscalatedBlockMessage(verdict: GateVerdict, draft: string): string {
+  const lines: string[] = [];
+  lines.push(
+    `[vouch-gate] Detected unaddressed prior-turn fires — your previous draft fired on entit(y|ies) below, but this revise neither verified, hedged, nor removed them (#50 A Stage 3, VOUCH_GATE_ESCALATE_UNADDRESSED=1).`,
+  );
+  for (const u of verdict.reviseCheck?.stillUnaddressed ?? []) {
+    lines.push(
+      `  • "${u.entity}" (fired turn ${u.turn_idx}): "${u.proposition.slice(0, 200)}"`,
+    );
+    lines.push(`      → suggested: ${suggestVerification(u.entity, draft)}`);
+    lines.push(
+      `      → or hedge: keep the claim with an explicit "(unverified, from training memory)" tag near "${u.entity}"`,
+    );
+  }
+  lines.push("");
+  lines.push(
+    `To pass this turn, the revise above must contain ONE of the following for EACH listed entity:`,
+  );
+  lines.push(
+    `  • A \`vouch fetch <url>\` / \`vouch claim ...\` / \`vouch search ...\` / \`WebFetch\` / \`gh api\` tool call referencing the entity, OR`,
+  );
+  lines.push(
+    `  • An explicit \`(unverified, from training memory)\` (or equivalent) hedge tag adjacent to the entity, OR`,
+  );
+  lines.push(
+    `  • Demonstrable removal of the entity from the claim (no new proposition mentions it).`,
+  );
+  lines.push("");
+  return lines.join("\n") + "\n";
+}
+
 function formatSessionSummary(
   transcript_id: string,
   reviseCheck?: GateVerdict["reviseCheck"],
@@ -2901,7 +2935,24 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
               : null;
           const sessionMsg = sessionTid ? formatSessionSummary(sessionTid, verdict.reviseCheck) : "";
 
-          if (!verdict.blocked) {
+          // #50 (A) Stage 3: opt-in enforcement. When
+          // VOUCH_GATE_ESCALATE_UNADDRESSED=1 AND Stage 2's reviseCheck
+          // reports stillUnaddressed prior-turn fires AND we're in strict
+          // mode, escalate to a block even if THIS turn's draft didn't
+          // independently fire. The forcing function: the agent cannot pass
+          // a turn while leaving the previous fire's entity asserted-but-
+          // ungrounded. Default OFF — Stage 2 advisory is enough for
+          // user-mediated workflows. Opt-in for sessions where the user
+          // is not in the loop.
+          const escalateOn = process.env.VOUCH_GATE_ESCALATE_UNADDRESSED === "1";
+          const escalatedFromUnaddressed =
+            escalateOn &&
+            opts.strict &&
+            !verdict.blocked &&
+            (verdict.reviseCheck?.stillUnaddressed.length ?? 0) > 0;
+          const effectiveBlocked = verdict.blocked || escalatedFromUnaddressed;
+
+          if (!effectiveBlocked) {
             const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
             const msgs: string[] = [deltaMsg];
             if (autoGrounded.length) msgs.push(formatAutoGroundMessage(autoGrounded));
@@ -2915,6 +2966,12 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
           } else if (!opts.strict) {
             message = formatBlockMessage(verdict, true, draft || "") + deltaMsg + sessionMsg;
             exitCode = 0;
+          } else if (escalatedFromUnaddressed && !verdict.blocked) {
+            // Strict-mode Stage 3 escalation: this turn passed its OWN gate
+            // but a prior turn's fire is still unaddressed. Block with an
+            // escalation message that names the lingering entities.
+            message = formatEscalatedBlockMessage(verdict, draft || "") + deltaMsg + sessionMsg;
+            exitCode = 2;
           } else {
             message = formatBlockMessage(verdict, false, draft || "") + deltaMsg + sessionMsg;
             exitCode = 2;
