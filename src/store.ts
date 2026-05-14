@@ -938,6 +938,48 @@ export function getNextSessionTurnIdx(transcript_id: string): number {
   return (row?.m ?? -1) + 1;
 }
 
+/** Per-session verdict counts on session_claims — for surfacing in the gate's
+ *  per-turn message so the agent (and the user) can see whether fires are
+ *  accumulating without being resolved. Counts are over all turns in this
+ *  transcript's session_claims history; the gate appends this on every Stop
+ *  hook so trend is visible turn-by-turn.
+ *
+ *  - `total`        = every claim the gate has processed in this session
+ *  - `ungrounded`   = fires (verdict='ungrounded'); the dodge-attractor surface
+ *  - `grounded`     = passed grounding directly OR via session-source autoground
+ *  - `reclassified` = postfilter caught it as workspace-meta etc; no fire
+ *  - `retracted`    = explicitly retracted in a later turn
+ */
+export function getSessionFireCounts(transcript_id: string): {
+  total: number;
+  ungrounded: number;
+  grounded: number;
+  reclassified: number;
+  retracted: number;
+} {
+  const row = getDb()
+    .prepare(
+      `SELECT
+         COUNT(*) AS total,
+         SUM(CASE WHEN verdict = 'ungrounded' THEN 1 ELSE 0 END) AS ungrounded,
+         SUM(CASE WHEN verdict = 'grounded' THEN 1 ELSE 0 END) AS grounded,
+         SUM(CASE WHEN verdict = 'reclassified' THEN 1 ELSE 0 END) AS reclassified,
+         SUM(CASE WHEN retracted = 1 THEN 1 ELSE 0 END) AS retracted
+       FROM session_claims
+       WHERE transcript_id = ?`,
+    )
+    .get(transcript_id) as
+    | { total: number; ungrounded: number; grounded: number; reclassified: number; retracted: number }
+    | undefined;
+  return {
+    total: row?.total ?? 0,
+    ungrounded: row?.ungrounded ?? 0,
+    grounded: row?.grounded ?? 0,
+    reclassified: row?.reclassified ?? 0,
+    retracted: row?.retracted ?? 0,
+  };
+}
+
 export function recordSessionClaim(input: RecordSessionClaimInput): void {
   const ts = new Date().toISOString();
   const embBlob = input.embedding ? embToBlob(input.embedding) : null;

@@ -2511,6 +2511,28 @@ function writeGateLog(entry: AuditEntry) {
   }
 }
 
+/** Single-line per-session fire summary appended to every Stop hook's
+ *  stderr. Counts come from store.session_claims (gate-time verdicts), so
+ *  this is the *intent* signal — the agent attempted N claims, M fired,
+ *  K got grounded one way or another. The cross-turn revise outcome
+ *  (verified / hedged / dodged) is NOT classified here; that's a downstream
+ *  human/judge pass via classify_fires.ts. This line surfaces the raw
+ *  pressure: a fire count that climbs without a matching grounded count
+ *  is the dodge-accumulation signal the user can act on. */
+function formatSessionSummary(transcript_id: string): string {
+  const c = store.getSessionFireCounts(transcript_id);
+  if (c.total === 0) return "";
+  const unresolved = c.ungrounded;
+  const resolvedNotes: string[] = [];
+  if (c.grounded > 0) resolvedNotes.push(`${c.grounded} grounded`);
+  if (c.reclassified > 0) resolvedNotes.push(`${c.reclassified} reclassified`);
+  if (c.retracted > 0) resolvedNotes.push(`${c.retracted} retracted`);
+  const resolvedStr = resolvedNotes.length ? ` · ${resolvedNotes.join(" / ")}` : "";
+  return (
+    `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n`
+  );
+}
+
 function formatDeltaMessage(
   delta: store.KbDelta,
   unsupportedSkipped: number,
@@ -2624,6 +2646,19 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
           const advisories = verdict.harvest?.flags.length ?? 0;
           const deltaMsg = formatDeltaMessage(delta, unsupportedSkipped, advisories);
 
+          // Per-session fire counter (P1 of #50 work). Visible-to-user
+          // dodge-pressure signal: how many fires has THIS session accumulated
+          // and how many got resolved (grounded / autoground / reclassified).
+          // Surfacing this puts the dodge-rate trend in the user's face every
+          // turn — the user-mediated forcing function (today's session proved
+          // this works when active; this makes it systematic instead of ad-hoc).
+          const sessionTid = transcriptAvailable
+            ? transcriptIdFromPath(transcriptPath!)
+            : opts.sessionContext
+              ? transcriptIdFromPath(opts.sessionContext)
+              : null;
+          const sessionMsg = sessionTid ? formatSessionSummary(sessionTid) : "";
+
           if (!verdict.blocked) {
             const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
             const msgs: string[] = [deltaMsg];
@@ -2632,13 +2667,14 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
               const hm = formatHarvestMessage(verdict.harvest);
               if (hm) msgs.push(hm);
             }
+            if (sessionMsg) msgs.push(sessionMsg);
             message = msgs.join("");
             exitCode = 0;
           } else if (!opts.strict) {
-            message = formatBlockMessage(verdict, true, draft || "") + deltaMsg;
+            message = formatBlockMessage(verdict, true, draft || "") + deltaMsg + sessionMsg;
             exitCode = 0;
           } else {
-            message = formatBlockMessage(verdict, false, draft || "") + deltaMsg;
+            message = formatBlockMessage(verdict, false, draft || "") + deltaMsg + sessionMsg;
             exitCode = 2;
           }
         }
