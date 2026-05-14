@@ -179,8 +179,13 @@ Output JSON: {{"category": "<one of above>", "reason": "<one short sentence>", "
 # ---------------------------------------------------------------------------
 
 
-def run_vouch_gate(draft: str, timeout: int = 60) -> tuple[bool, str]:
-    """Run `vouch gate --strict --draft <text>` as subprocess.
+def run_vouch_gate(draft: str, user_prompt: str | None = None, timeout: int = 60) -> tuple[bool, str]:
+    """Run `vouch gate --strict --draft <text> [--session-context <path>]`.
+
+    When `user_prompt` is given, synthesize a one-event Claude-Code-style
+    transcript (a single user turn carrying the prompt as a text block) and
+    pass it via --session-context. This exercises vouch's UserPrompt source
+    branch (issue #46) — the gate sees what context the user provided.
 
     Returns (would_block, fire_message). would_block=True iff vouch exits 2.
     fire_message is stderr content (the gate's human-readable feedback).
@@ -189,16 +194,41 @@ def run_vouch_gate(draft: str, timeout: int = 60) -> tuple[bool, str]:
     # Use a longer per-gate budget than the production 25s, since the harness
     # is offline and we want a complete measurement.
     env["VOUCH_GATE_BUDGET_MS"] = env.get("VOUCH_GATE_BUDGET_MS", "60000")
+
+    cmd = ["vouch", "gate", "--strict", "--draft", draft]
+    ctx_path: Path | None = None
+    if user_prompt:
+        # One-event transcript: a single user turn whose content is the prompt.
+        # vouch's parseSessionSources treats this as a UserPrompt source (#46).
+        import tempfile
+        fd, fname = tempfile.mkstemp(prefix="vouch-bench-ctx-", suffix=".jsonl")
+        os.close(fd)
+        ctx_path = Path(fname)
+        event = {
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": user_prompt}]},
+        }
+        ctx_path.write_text(json.dumps(event) + "\n")
+        cmd += ["--session-context", str(ctx_path)]
+
     try:
         r = subprocess.run(
-            ["vouch", "gate", "--strict", "--draft", draft],
+            cmd,
             env=env,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
+        if ctx_path and ctx_path.exists():
+            ctx_path.unlink()
         return False, "[gate timeout]"
+    finally:
+        if ctx_path and ctx_path.exists():
+            try:
+                ctx_path.unlink()
+            except OSError:
+                pass
     would_block = r.returncode == 2
     return would_block, r.stderr.strip()
 
@@ -221,7 +251,7 @@ def run_item(client, item: dict, subset: str, vouch_on: bool, prompt_mode: str =
     meta_final = meta_v1
 
     if vouch_on:
-        would_block, fire_msg = run_vouch_gate(response_v1)
+        would_block, fire_msg = run_vouch_gate(response_v1, user_prompt=user_prompt)
         if would_block:
             gate_fire = fire_msg[:2000]  # cap for log volume
             revise_prompt = REVISE_PROMPT_TEMPLATE.format(

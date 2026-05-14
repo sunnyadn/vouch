@@ -205,9 +205,18 @@ export interface GroundedPair extends ExtractedPair {
    *  NLI-checked. 0 = none matched the entity. Absent when no session
    *  transcript was available or the pair was already grounded. */
   session_sources_checked?: number;
-  /** True when this pair was resolved by auto-grounding against a source the
-   *  agent retrieved this session (Read / WebFetch / WebSearch / Bash cat). */
+  /** True when this pair was resolved by auto-grounding against a session
+   *  source (tool-result OR user-prompt). Distinguish persistence behavior
+   *  via auto_grounded_kind (#46). */
   auto_grounded?: boolean;
+  /** Discriminator for `auto_grounded`: `"tool-result"` (Read / WebFetch /
+   *  WebSearch / Bash) writes a dossier + records the claim in vouch's KB —
+   *  the agent retrieved this and it is auditable as evidence. `"user-prompt"`
+   *  matches user-pasted context as a faithfulness-source (no KB write); the
+   *  agent's proposition is consistent with what the user provided, but vouch
+   *  did not verify the user's source. Trust tier is the user's responsibility,
+   *  not vouch's (#46). */
+  auto_grounded_kind?: "tool-result" | "user-prompt";
   /** When the gate fired and a session source had lexical overlap with the
    *  proposition but did NOT entail it, this carries the best-matching source
    *  so the CLI can suggest `vouch attest --from-session-tool`. */
@@ -879,10 +888,14 @@ async function batchGroundAssertions(
 // ---------------------------------------------------------------------------
 
 export interface SessionSource {
-  /** `Bash` = any non-model-authored command (denylist, not allowlist). */
-  tool: "Read" | "WebFetch" | "WebSearch" | "Bash";
+  /** `Bash` = any non-model-authored command (denylist, not allowlist).
+   *  `UserPrompt` = verbatim text the user typed/pasted into a prior user turn,
+   *  used as a faithfulness-check source (NOT world-truth grounding). Distinct
+   *  trust tier — see autoGroundPair's UserPrompt branch (no dossier write). */
+  tool: "Read" | "WebFetch" | "WebSearch" | "Bash" | "UserPrompt";
   /** Source identifier: a file path (Read / Bash cat-head-tail), `session-bash:<cmd>`
-   *  for other Bash commands, URL (WebFetch), or `websearch:<query>`. */
+   *  for other Bash commands, URL (WebFetch), `websearch:<query>`, or
+   *  `user-prompt:event-<idx>` for UserPrompt sources. */
   uri: string;
   content: string;
   /** The `tool_use_id` from the transcript's `tool_result` block. */
@@ -896,7 +909,14 @@ const SESSION_AUTOGROUND_K = 3;
  *  If 100 proves insufficient, a relevance-ranked retention (keep sources most
  *  lexically similar to the draft's propositions) is the smarter follow-up. */
 const SESSION_SOURCES_MAX = 100;
-const TOOL_PRIORITY: Record<string, number> = { Read: 0, Bash: 0, WebFetch: 1, WebSearch: 2 };
+/** Per-message cap on UserPrompt source content. Large pastes get truncated;
+ *  the head of the prompt is what the agent most likely keyed off, and the
+ *  NLI window itself caps at SESSION_NLI_MAX_CHARS. */
+const USER_PROMPT_MAX_CHARS = 12000;
+/** Floor below which a user-typed turn is ignored as a faithfulness source
+ *  (e.g. "ok", "可以", "继续" — chit-chat, not paste-context). */
+const USER_PROMPT_MIN_CHARS = 80;
+const TOOL_PRIORITY: Record<string, number> = { Read: 0, Bash: 0, WebFetch: 1, WebSearch: 2, UserPrompt: 3 };
 
 // --- Bash file-read recognition (issue #22) --------------------------------
 //
@@ -1140,13 +1160,42 @@ export function parseSessionSources(transcriptPath: string): SessionSource[] {
   }
   if (!events.some((e) => typeof e?.type === "string")) return []; // not a CC transcript
 
-  // Pass 2: tool_result blocks in user events (main-thread + sidechain).
+  // Pass 2: tool_result blocks AND verbatim user-typed text blocks in user
+  // events (main-thread + sidechain). User-typed text becomes a "UserPrompt"
+  // session source — a faithfulness check pool (#46), not world-truth KB.
   const out: SessionSource[] = [];
-  for (const ev of events) {
+  for (let evIdx = 0; evIdx < events.length; evIdx++) {
+    const ev = events[evIdx];
     if (ev?.type !== "user") continue;
     const c = ev?.message?.content;
+    // Handle bare-string content (some transcripts wrap message.content as a
+    // string for simple user-typed messages).
+    if (typeof c === "string") {
+      const text = c.trim();
+      if (text.length >= USER_PROMPT_MIN_CHARS) {
+        out.push({
+          tool: "UserPrompt",
+          uri: `user-prompt:event-${evIdx}`,
+          content: text.length > USER_PROMPT_MAX_CHARS ? text.slice(0, USER_PROMPT_MAX_CHARS) : text,
+          tool_use_id: `user-prompt-${evIdx}`,
+        });
+      }
+      continue;
+    }
     if (!Array.isArray(c)) continue;
     for (const b of c) {
+      // ---- UserPrompt branch — verbatim user-typed text ---------------
+      if (b?.type === "text" && typeof b.text === "string") {
+        const text = b.text.trim();
+        if (text.length < USER_PROMPT_MIN_CHARS) continue;
+        out.push({
+          tool: "UserPrompt",
+          uri: `user-prompt:event-${evIdx}`,
+          content: text.length > USER_PROMPT_MAX_CHARS ? text.slice(0, USER_PROMPT_MAX_CHARS) : text,
+          tool_use_id: `user-prompt-${evIdx}`,
+        });
+        continue;
+      }
       if (b?.type !== "tool_result" || typeof b.tool_use_id !== "string" || b.is_error) continue;
       const tu = toolUseById.get(b.tool_use_id);
       if (!tu || !SESSION_SOURCE_TOOLS.has(tu.name)) continue;
@@ -1390,6 +1439,29 @@ async function autoGroundPair(
     const verdict = await verifyClaimAgainstSource(pair.proposition, slice);
     if (verdict.status !== "supported") continue;
 
+    // UserPrompt branch (#46): the user pasted this content. We've verified
+    // the agent's claim is FAITHFUL to that paste — not that the paste itself
+    // is world-truth. Pass the gate, but DO NOT persist as a dossier (the
+    // source isn't vouch-verified; promoting user prompts to KB would let
+    // adversarial / mistaken / LLM-generated pastes ground future claims).
+    // The agent took responsibility for the paste; vouch reports the
+    // faithfulness check and leaves world-truth verification to the user's
+    // own `vouch fetch` / `vouch claim` workflow.
+    if (src.tool === "UserPrompt") {
+      return {
+        grounded: true,
+        pair: {
+          ...pair,
+          grounded: true,
+          matched_claim_id: null,
+          auto_grounded: true,
+          auto_grounded_kind: "user-prompt",
+          session_sources_checked: n,
+          reason: `auto-grounded against user-provided context (${sliceReason}, score=${verdict.score.toFixed(2)}) — faithfulness-checked, not KB-verified`,
+        },
+      };
+    }
+
     // Entailed by a tool-retrieved source. Snapshot it as a dossier and file
     // the claim against it. The quote-in-dossier invariant holds trivially:
     // the "quote" is the retrieved content itself, which NLI just entailed —
@@ -1435,6 +1507,7 @@ async function autoGroundPair(
         grounded: true,
         matched_claim_id: cid,
         auto_grounded: true,
+        auto_grounded_kind: "tool-result",
         session_sources_checked: n,
         reason: `auto-grounded from session ${src.tool} of ${src.uri} (${sliceReason}, score=${verdict.score.toFixed(2)})`,
       },

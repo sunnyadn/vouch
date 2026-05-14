@@ -1479,6 +1479,92 @@ describe("parseSessionSources", () => {
 });
 
 // ---------------------------------------------------------------------------
+// parseSessionSources — UserPrompt source emission (issue #46)
+// ---------------------------------------------------------------------------
+
+describe("parseSessionSources UserPrompt", () => {
+  it("emits UserPrompt source from a user-typed text block (array content form)", () => {
+    const path = join(tmp, "up-text-array.jsonl");
+    const passage =
+      "In the example, the private sector handles about 80% of tertiary enrollment, " +
+      "32% of secondary, and 7.5% of primary. This is a multi-sentence passage that " +
+      "comfortably exceeds the minimum-length floor for user-prompt sources.";
+    writeFileSync(
+      path,
+      JSON.stringify({
+        type: "user",
+        message: { content: [{ type: "text", text: passage }] },
+      }),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(1);
+    expect(got[0]!.tool).toBe("UserPrompt");
+    expect(got[0]!.content).toBe(passage);
+    expect(got[0]!.uri.startsWith("user-prompt:event-")).toBe(true);
+    expect(got[0]!.tool_use_id!.startsWith("user-prompt-")).toBe(true);
+  });
+
+  it("emits UserPrompt source from a bare-string content form", () => {
+    const path = join(tmp, "up-text-bare.jsonl");
+    const passage =
+      "Another sufficiently long user-typed message in the legacy bare-string form, " +
+      "long enough to clear the minimum-length floor and become a faithfulness source.";
+    writeFileSync(
+      path,
+      JSON.stringify({ type: "user", message: { content: passage } }),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(1);
+    expect(got[0]!.tool).toBe("UserPrompt");
+    expect(got[0]!.content).toBe(passage);
+  });
+
+  it("filters out short user messages below the chit-chat floor (USER_PROMPT_MIN_CHARS)", () => {
+    const path = join(tmp, "up-short.jsonl");
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "可以" }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "ok" }] } }),
+        JSON.stringify({ type: "user", message: { content: "继续" } }),
+      ].join("\n"),
+    );
+    expect(gate.parseSessionSources(path)).toEqual([]);
+  });
+
+  it("co-exists with tool_result sources — both kinds emitted from the same transcript", () => {
+    const path = join(tmp, "up-mixed.jsonl");
+    const passage =
+      "User-pasted context with enough length to clear the chit-chat floor and serve as a " +
+      "faithfulness source for the next assistant turn.";
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "user", message: { content: [{ type: "text", text: passage }] } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_read", name: "Read", input: { file_path: "/repo/x.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_read", content: "     1\tfile content" }] } }),
+      ].join("\n"),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(2);
+    const tools = got.map((s) => s.tool).sort();
+    expect(tools).toEqual(["Read", "UserPrompt"]);
+  });
+
+  it("truncates oversized user-paste at USER_PROMPT_MAX_CHARS", () => {
+    const path = join(tmp, "up-huge.jsonl");
+    const huge = "A".repeat(50000); // well above the 12000 cap
+    writeFileSync(
+      path,
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: huge }] } }),
+    );
+    const got = gate.parseSessionSources(path);
+    expect(got.length).toBe(1);
+    expect(got[0]!.content.length).toBe(12000);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseSessionSources — Bash denylist inversion (issue #39)
 // ---------------------------------------------------------------------------
 
@@ -1738,6 +1824,135 @@ describe("runGate session-evidence auto-grounding", () => {
     expect(v.blocked).toBe(true);
     expect(v.pairs[0]!.session_sources_checked).toBeUndefined(); // parseSessionSources returned [] → loop skipped
     expect(generateObjectMock).toHaveBeenCalledTimes(1);
+  });
+
+  // -------------------------------------------------------------------------
+  // UserPrompt source grounding (issue #46) — extractive-QA precision fix.
+  // -------------------------------------------------------------------------
+
+  it("ASSERT entailed by user-pasted context → grounded=true, kind=user-prompt, NO dossier/claim written", async () => {
+    // Repros #46 Fixture A. User pastes a passage in their turn; agent's draft
+    // extracts a fact directly from the passage. Without this branch the gate
+    // would fire because the named entity isn't in the KB and the passage
+    // isn't in tool_results.
+    const path = join(tmp, "ag-up1.jsonl");
+    const passage =
+      "In the example, the private sector handles about 80% of tertiary " +
+      "enrollment in the Philippines, 32% of secondary, and 7.5% of primary. " +
+      "This is a multi-sentence passage that comfortably exceeds the floor.";
+    writeFileSync(
+      path,
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: passage }] } }),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "Philippines",
+              stance: "ASSERT",
+              proposition: "About 80% of tertiary enrollment in the Philippines is private.",
+            },
+          ],
+        },
+      } as any),
+    );
+    // KB empty → no candidate to NLI; next mock is the session NLI against UserPrompt.
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { supported: true, score: 0.86, reason: "passage states 80% tertiary private" } } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "About 80% of tertiary enrollment in the Philippines is private.",
+      model: "vertex_ai/test",
+      sessionTranscriptPath: path,
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.grounded).toBe(true);
+    expect(v.pairs[0]!.auto_grounded).toBe(true);
+    expect(v.pairs[0]!.auto_grounded_kind).toBe("user-prompt");
+    expect(v.pairs[0]!.matched_claim_id).toBeNull();
+    expect(v.pairs[0]!.reason).toContain("user-provided context");
+    expect(v.pairs[0]!.reason).toContain("faithfulness-checked");
+    // KEY safety property: user-prompt grounding must NOT pollute the KB.
+    expect(store.listDossiers().length).toBe(0);
+  });
+
+  it("UserPrompt source mentions the entity but does not entail → still blocked, no dossier", async () => {
+    // Symmetric to the tool-result negative case: if the passage references
+    // the entity but doesn't entail the proposition, the gate still fires.
+    // (E.g. the agent extends BEYOND the passage in its draft.)
+    const path = join(tmp, "ag-up2.jsonl");
+    const passage =
+      "The text discusses the Philippine education system at a high level " +
+      "but does not specify any enrollment percentages by sector. This is " +
+      "sufficiently long to clear the chit-chat floor.";
+    writeFileSync(
+      path,
+      JSON.stringify({ type: "user", message: { content: [{ type: "text", text: passage }] } }),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({
+        object: {
+          pairs: [
+            {
+              entity: "Philippine education",
+              stance: "ASSERT",
+              proposition: "80% of tertiary education in the Philippines is private.",
+            },
+          ],
+        },
+      } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { supported: false, score: 0.15, reason: "no percentage stated in passage" } } as any),
+    );
+
+    const v = await gate.runGate({
+      draft: "80% of tertiary education in the Philippines is private.",
+      model: "vertex_ai/test",
+      sessionTranscriptPath: path,
+    });
+    expect(v.blocked).toBe(true);
+    expect(v.pairs[0]!.grounded).toBe(false);
+    expect(v.pairs[0]!.auto_grounded).toBeUndefined();
+    expect(v.pairs[0]!.session_sources_checked).toBe(1);
+    expect(store.listDossiers().length).toBe(0);
+  });
+
+  it("tool-result source wins over UserPrompt when both entail (TOOL_PRIORITY puts UserPrompt last)", async () => {
+    // Both a Read tool_result AND a user-pasted passage contain entailing
+    // material. The Read source should be tried first (TOOL_PRIORITY=0) and
+    // produce a dossier; UserPrompt (TOOL_PRIORITY=3) is never reached.
+    const path = join(tmp, "ag-up3.jsonl");
+    const passage =
+      "User pasted: Foo benchmark consists of 42 evaluation tasks. This is " +
+      "long enough to clear the floor and would also satisfy NLI on its own.";
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({ type: "user", message: { content: [{ type: "text", text: passage }] } }),
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "tu_read", name: "Read", input: { file_path: "/repo/foo.md" } }] } }),
+        JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "tu_read", content: "     1\tFoo benchmark consists of 42 evaluation tasks across 6 domains." }] } }),
+      ].join("\n"),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { pairs: [{ entity: "Foo benchmark", stance: "ASSERT", proposition: "Foo benchmark has 42 evaluation tasks." }] } } as any),
+    );
+    generateObjectMock.mockImplementationOnce(() =>
+      Promise.resolve({ object: { supported: true, score: 0.93, reason: "stated" } } as any),
+    );
+    const v = await gate.runGate({
+      draft: "Foo benchmark has 42 evaluation tasks.",
+      model: "vertex_ai/test",
+      sessionTranscriptPath: path,
+    });
+    expect(v.blocked).toBe(false);
+    expect(v.pairs[0]!.auto_grounded).toBe(true);
+    expect(v.pairs[0]!.auto_grounded_kind).toBe("tool-result");
+    expect(v.pairs[0]!.matched_claim_id).not.toBeNull();
+    expect(store.listDossiers().length).toBe(1);
+    expect(store.listDossiers()[0]!.source_type).toBe("session-read");
   });
 });
 
