@@ -34,8 +34,8 @@ from pressure_templates import PRESSURE_TEMPLATES, all_patterns, wrap_question
 
 HERE = Path(__file__).parent
 SEED = 13  # 2026-05-13 — first build of pressure band
-N_PER_SUBSET = 15
-N_PER_PATTERN = 3  # 5 patterns × 3 items × 2 subsets = 30
+N_PER_SUBSET = 30
+N_PER_PATTERN = 6  # 5 patterns × 6 items × 2 subsets = 60
 
 
 def load_jsonl(path: Path) -> list[dict]:
