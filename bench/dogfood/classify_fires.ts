@@ -64,8 +64,10 @@ interface Args {
   in: string;
   out: string;
   stats: boolean;
+  audit: boolean;
   filterRepo?: string;
   filterFrom?: string;
+  filterClass?: string;
 }
 
 function parseArgs(): Args {
@@ -74,17 +76,20 @@ function parseArgs(): Args {
     in: join(import.meta.dir, "fires-last14d.jsonl"),
     out: join(import.meta.dir, "fires-labeled.jsonl"),
     stats: false,
+    audit: false,
   };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--in") out.in = args[++i]!;
     else if (a === "--out") out.out = args[++i]!;
     else if (a === "--stats") out.stats = true;
+    else if (a === "--audit-mode") out.audit = true;
     else if (a === "--filter-repo") out.filterRepo = args[++i];
     else if (a === "--filter-from") out.filterFrom = args[++i];
+    else if (a === "--filter-class") out.filterClass = args[++i];
     else if (a === "-h" || a === "--help") {
       console.error(
-        "Usage: classify_fires.ts [--in PATH] [--out PATH] [--stats] [--filter-repo NAME] [--filter-from YYYY-MM-DD]",
+        "Usage: classify_fires.ts [--in PATH] [--out PATH] [--stats] [--audit-mode] [--filter-class CLASS] [--filter-repo NAME] [--filter-from YYYY-MM-DD]",
       );
       process.exit(0);
     }
@@ -112,8 +117,17 @@ interface FireRow {
 }
 
 interface LabeledRow extends FireRow {
-  manual_label: { class: string; notes?: string };
+  manual_label: {
+    class: string;
+    notes?: string;
+    auto?: boolean;
+    reasoning?: string;
+    auto_audited?: boolean;
+    human_override?: boolean;
+    original_auto_class?: string;
+  };
   label_ts: string;
+  judge_model?: string;
 }
 
 const VALID_CLASSES = new Set(["verified", "hedged", "continued-confab", "dodge", "false-positive", "skip"]);
@@ -197,8 +211,14 @@ function printRow(row: FireRow, idx: number, total: number): void {
 
 function printStats(labeled: LabeledRow[]): void {
   const counts: Record<string, number> = {};
+  let autoCount = 0;
+  let humanAudited = 0;
+  let humanOverridden = 0;
   for (const r of labeled) {
     counts[r.manual_label.class] = (counts[r.manual_label.class] || 0) + 1;
+    if (r.manual_label.auto) autoCount++;
+    if (r.manual_label.auto_audited) humanAudited++;
+    if (r.manual_label.human_override) humanOverridden++;
   }
   const A = counts["verified"] || 0;
   const H = counts["hedged"] || 0;
@@ -226,6 +246,13 @@ function printStats(labeled: LabeledRow[]): void {
   console.log(`  confab_persist     = C / TP              = ${pct(C, tpDenom)}`);
   console.log(`  fp_rate            = F / total           = ${pct(F, total)}        \x1b[2m(inverse vouch precision)\x1b[0m`);
   console.log("");
+  if (autoCount > 0) {
+    console.log(`\x1b[1maudit provenance\x1b[0m`);
+    console.log(`  auto-labeled (LLM)        ${autoCount.toString().padStart(4)}   ${pct(autoCount, total)}`);
+    console.log(`  human-audited             ${humanAudited.toString().padStart(4)}   ${pct(humanAudited, autoCount)} of auto`);
+    console.log(`  human override on audit   ${humanOverridden.toString().padStart(4)}   ${pct(humanOverridden, Math.max(1, humanAudited))} of audited (judge error rate proxy)`);
+    console.log("");
+  }
 }
 
 async function readKeypress(): Promise<string> {
@@ -244,8 +271,134 @@ async function readKeypress(): Promise<string> {
   });
 }
 
+async function runAuditMode(args: Args): Promise<void> {
+  const labeled = loadJsonl<LabeledRow>(args.out);
+  if (!labeled.length) {
+    console.error(`no labeled rows in ${args.out} — run auto_classify_fires.ts first`);
+    process.exit(1);
+  }
+
+  // Audit only rows that were auto-labeled and haven't been human-audited yet
+  let pending = labeled
+    .map((r, i) => ({ r, i }))
+    .filter(({ r }) => r.manual_label.auto && !r.manual_label.auto_audited);
+
+  if (args.filterRepo) pending = pending.filter(({ r }) => r.repo.includes(args.filterRepo!));
+  if (args.filterFrom) pending = pending.filter(({ r }) => r.ts >= args.filterFrom!);
+  if (args.filterClass) pending = pending.filter(({ r }) => r.manual_label.class === args.filterClass);
+
+  console.error(`audit-mode: ${labeled.length} labeled total, ${pending.length} pending audit`);
+  if (!pending.length) {
+    console.error("nothing to audit.");
+    printStats(labeled);
+    return;
+  }
+
+  await new Promise((r) => setTimeout(r, 600));
+
+  let cursor = 0;
+  const history: number[] = []; // indices in `labeled` that were modified this session, for undo
+
+  while (cursor < pending.length) {
+    const { r: row, i: globalIdx } = pending[cursor]!;
+    const judgeClass = row.manual_label.class;
+    const judgeReasoning = row.manual_label.reasoning || "(no reasoning recorded)";
+
+    // Render row (same shape as printRow but with judge banner)
+    console.log("\x1b[2J\x1b[H");
+    console.log(`\x1b[1;36m═══ audit ${cursor + 1} / ${pending.length} ═══\x1b[0m`);
+    console.log(`  ts:        ${row.ts}`);
+    console.log(`  repo:      ${row.repo}`);
+    console.log(`  branch:    ${row.git_branch || "—"}`);
+    console.log("");
+    console.log(`\x1b[1;33m── prior_user ──\x1b[0m`);
+    console.log(`  ${truncate(row.prior_user, 350).split("\n").join("\n  ")}`);
+    console.log("");
+    console.log(`\x1b[1;35m── draft ──\x1b[0m`);
+    console.log(`  ${truncate(row.draft, 700).split("\n").join("\n  ")}`);
+    console.log("");
+    if (row.propositions.length) {
+      console.log(`\x1b[1;31m── propositions ──\x1b[0m`);
+      for (const p of row.propositions.slice(0, 3)) {
+        console.log(`  • \x1b[1m${p.entity}\x1b[0m: "${truncate(p.proposition, 180)}"`);
+      }
+      console.log("");
+    }
+    console.log(`\x1b[1;32m── post_fire_draft (revise) ──\x1b[0m`);
+    if (row.post_fire_draft?.trim()) {
+      console.log(`  ${truncate(row.post_fire_draft, 900).split("\n").join("\n  ")}`);
+    } else {
+      console.log(`  \x1b[2m(empty)\x1b[0m`);
+    }
+    console.log("");
+    console.log(`\x1b[1;44;37m JUDGE \x1b[0m  class = \x1b[1m${judgeClass}\x1b[0m   model = ${row.judge_model || "?"}`);
+    console.log(`  reasoning: ${truncate(judgeReasoning, 500).split("\n").join("\n             ")}`);
+    console.log("");
+    console.log(
+      `\x1b[1m[Enter/Y]\x1b[0m accept  \x1b[1m[A]\x1b[0m verified  \x1b[1m[H]\x1b[0m hedged  \x1b[1m[C]\x1b[0m confab  \x1b[1m[D]\x1b[0m dodge  \x1b[1m[F]\x1b[0m fp  \x1b[1m[S]\x1b[0m skip  \x1b[1m[U]\x1b[0m undo  \x1b[1m[Q]\x1b[0m quit`,
+    );
+
+    const key = (await readKeypress()).toLowerCase();
+
+    if (key === "q" || key === "") {
+      writeFileSync(args.out, labeled.map((r) => JSON.stringify(r)).join("\n") + "\n");
+      console.log("");
+      console.log(`audit session: reviewed ${history.length}, advancing cursor at ${cursor}.`);
+      printStats(labeled);
+      return;
+    }
+
+    if (key === "u" || key === "[") {
+      if (!history.length) {
+        await new Promise((r) => setTimeout(r, 300));
+        continue;
+      }
+      const prevIdx = history.pop()!;
+      const prev = labeled[prevIdx]!;
+      // Revert the audit flag (and any override) on the previous decision
+      prev.manual_label.auto_audited = false;
+      if (prev.manual_label.original_auto_class) {
+        prev.manual_label.class = prev.manual_label.original_auto_class;
+        delete prev.manual_label.original_auto_class;
+        delete prev.manual_label.human_override;
+      }
+      cursor = Math.max(0, cursor - 1);
+      // Re-include the previous row in pending if it was filtered-in originally — simplest: just decrement
+      writeFileSync(args.out, labeled.map((r) => JSON.stringify(r)).join("\n") + "\n");
+      continue;
+    }
+
+    if (key === "\r" || key === "\n" || key === "y") {
+      // Accept judge label
+      labeled[globalIdx]!.manual_label.auto_audited = true;
+      history.push(globalIdx);
+    } else {
+      const newClass = KEY_TO_CLASS[key];
+      if (!newClass) continue; // unknown key, redraw
+      labeled[globalIdx]!.manual_label.original_auto_class = judgeClass;
+      labeled[globalIdx]!.manual_label.class = newClass;
+      labeled[globalIdx]!.manual_label.auto_audited = true;
+      labeled[globalIdx]!.manual_label.human_override = true;
+      history.push(globalIdx);
+    }
+    // Persist after each decision
+    writeFileSync(args.out, labeled.map((r) => JSON.stringify(r)).join("\n") + "\n");
+    cursor++;
+  }
+
+  console.log("");
+  console.log(`\x1b[1;32maudit complete — reviewed ${pending.length} rows.\x1b[0m`);
+  printStats(labeled);
+}
+
 async function main() {
   const args = parseArgs();
+
+  if (args.audit) {
+    await runAuditMode(args);
+    return;
+  }
+
   const all = loadJsonl<FireRow>(args.in);
   if (!all.length) {
     console.error(`no fires in ${args.in}`);
