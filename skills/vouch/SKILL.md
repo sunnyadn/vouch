@@ -109,6 +109,7 @@ Every factual segment in your response to the user carries a tag:
 | `[inference-from: <id1>, …]` | Conclusion deduced from verified claims | scenario-anchored OR paper-derived only |
 | `[interpretation: <id>]` | Substantive reframing of one claim | cite the single claim |
 | `[hypothesis]` | Speculation you can't fully justify | explicit |
+| `[gap: <text>]` | What you didn't check / don't know — surfaces blind spots **before** the user finds them | scoped, specific, real (P-γ.5) |
 
 The gate harvests the four derived forms on a passing draft — `claim_text` is
 your segment **verbatim**, `depends_on` is the cited ids, `status` is
@@ -137,6 +138,64 @@ is HYPOTHESIS, not INFERENCE.
 When the user asks "X vs Y, which?", the most credible evidence is a quote
 where the *loser* admits the weakness in their own docs — self-admissions
 have more leverage than third-party benchmarks. Spend fetch budget there.
+
+## Humility surface (P-γ + P-γ.5)
+
+On every Stop hook, vouch reports two humility signals after the per-turn
+delta:
+
+```
+[vouch-gate] humility: H+S / total = X% explicit-uncertainty
+            (A assert / H hedge / S speculate)
+[vouch-gate] blind-spots this turn: N enumerated
+            (X explicit [gap:] / Y natural phrase)
+```
+
+The two axes are orthogonal:
+
+- **humility ratio** (per-claim): of all truth-bearing propositions, what
+  fraction was HEDGE or SPECULATE rather than ASSERT? A chronically low
+  ratio (≤5%) suggests over-confident claiming. Healthy is roughly 10–25%
+  for grounded analytical work.
+- **blind-spots this turn**: did you surface what you DIDN'T check, as
+  `[gap: …]` markers or natural phrases ("I didn't check", "haven't
+  verified", "worth checking")? 0 blind-spots on a multi-claim turn is
+  a flag for over-confidence by omission, even if individual claims are
+  well-hedged.
+
+**Use `[gap: <specific thing you didn't check>]` proactively** when you've
+made claims about an entity but haven't verified a specific facet (e.g.,
+performance on a sub-distribution, a specific version, an edge case).
+They're cheap to write and they make the limits of your retrieval visible.
+
+## Counter-evidence (P-α, opt-in)
+
+When `VOUCH_GATE_COUNTER_EVIDENCE=1` is set, vouch ALSO searches the KB
+for claims that **contradict** what you just confidently asserted (not
+just confirmation). If a strong counter-claim exists, the gate fires
+even though your assertion had support, with a message like:
+
+```
+⚠ counter-evidence in KB:
+   [claim 142, contra=0.90] "<contradicting claim>"
+       dossier: evidence/…
+       why contradicts: <verifier reason>
+   → reconcile: edit to acknowledge the disagreement
+   → supersede: vouch claim --supersedes <id> citing why
+   → hedge: "(unverified, sources disagree)" near the entity
+```
+
+Three productive responses:
+
+1. **Reconcile** — most claims with serious counter-evidence belong as
+   "X is widely held; Y is the counter-position from <source>." Mark with
+   `[synthesis-of: <support-id>, <contra-id>]`.
+2. **Supersede** — if your new claim is correct and the old one wrong:
+   `vouch claim "<new>" --type ATOMIC --dossier <new-src>` → `vouch
+   supersede <old> <new> --reason "<why old was wrong>"`.
+3. **Hedge with explicit disagreement note** — when you genuinely can't
+   resolve right now: `(unverified, sources disagree)` adjacent to the
+   entity.
 
 ## Output
 
@@ -174,3 +233,23 @@ its own corrections.
 - ❌ Don't fabricate claim_ids — they come from `vouch list-claims` /
   `vouch search` output.
 - ❌ Don't auto-supersede other agents' claims without strong justification.
+- ❌ Don't pad `[gap:]` markers with vacuous "minor things" to game the
+  blind-spot counter (P-γ.5). Each gap should be a specific facet the user
+  could reasonably ask about. If you can't think of a real one, leave it
+  out — 0 honest gaps is better than 3 fake ones.
+- ❌ Don't dodge a counter-evidence fire (P-α) by silently removing the
+  contradicted entity (4b silent-rephrase per #50). Reconcile, supersede,
+  or hedge — the system-tracked `awaiting_revise` ledger will flag a
+  silent-remove + same-shape re-assert as still-unaddressed on the next
+  turn.
+
+## Mirror the gate's verdict in your reply
+
+When the gate's footer reports humility + blind-spot counts and they're
+LOW, mention it briefly in your response so the user can act on the
+diagnostic:
+
+> "Note: 0 blind-spots enumerated this turn — I should flag that I
+> didn't check X and Y." [gap: X] [gap: Y]
+
+This isn't ceremony; it's making the audit signal user-actionable.
