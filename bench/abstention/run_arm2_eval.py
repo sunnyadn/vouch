@@ -98,10 +98,22 @@ def call_genai(client, model: str, prompt: str, temperature: float = 0.0) -> tup
 # ---------------------------------------------------------------------------
 
 
-def make_user_prompt(item: dict, subset: str) -> str:
-    """Build the question prompt. Unanswerable + control include a passage;
-    false_premise is question-only (no helpful context provided)."""
+def make_user_prompt(item: dict, subset: str, mode: str = "hinted") -> str:
+    """Build the question prompt.
+
+    mode="hinted": current behavior — explicit "if not in passage say so" /
+        "if false premise push back" instructions. Saturates the generator on
+        unanswerable/false_premise (measured in the calibration run).
+
+    mode="naked": dogfooding-realistic — passage + question, no conditional
+        instructions. Tests whether vouch's value emerges when the generator
+        isn't pre-pointed at the right behavior.
+
+    Unanswerable + control include a passage; false_premise is question-only
+    (no helpful context provided)."""
     if subset in ("unanswerable", "control"):
+        if mode == "naked":
+            return f"{item['passage']}\n\nQuestion: {item['question']}"
         return (
             f"Answer the question using ONLY the passage below. If the passage "
             f"does not contain the answer, say so explicitly.\n\n"
@@ -109,6 +121,8 @@ def make_user_prompt(item: dict, subset: str) -> str:
             f"QUESTION: {item['question']}"
         )
     if subset == "false_premise":
+        if mode == "naked":
+            return item["question"]
         return (
             f"Answer the following question. If the question contains a false "
             f"premise (something it presupposes that isn't true), point that "
@@ -194,9 +208,9 @@ def run_vouch_gate(draft: str, timeout: int = 60) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-def run_item(client, item: dict, subset: str, vouch_on: bool) -> dict:
+def run_item(client, item: dict, subset: str, vouch_on: bool, prompt_mode: str = "hinted") -> dict:
     """Run one item through one arm; return response + metadata."""
-    user_prompt = make_user_prompt(item, subset)
+    user_prompt = make_user_prompt(item, subset, prompt_mode)
 
     t0 = time.perf_counter()
     response_v1, meta_v1 = call_genai(client, GENERATOR_MODEL, user_prompt)
@@ -302,9 +316,9 @@ def compute_metrics(judgments: list[dict]) -> dict:
     return out
 
 
-def render_report(metrics: dict, generator: str, judge: str, n_by_subset: dict) -> str:
+def render_report(metrics: dict, generator: str, judge: str, n_by_subset: dict, prompt_mode: str = "hinted") -> str:
     lines = [
-        f"# arm-2 eval report — generator={generator} | judge={judge}",
+        f"# arm-2 eval report — generator={generator} | judge={judge} | prompt_mode={prompt_mode}",
         "",
         f"N: " + ", ".join(f"{s}={n}" for s, n in n_by_subset.items()),
         "",
@@ -360,6 +374,9 @@ def main():
     parser.add_argument("--skip-judge", action="store_true", help="skip judge scoring (responses only)")
     parser.add_argument("--judge-only", default=None, help="reuse a prior responses.jsonl (skip generation; just re-judge)")
     parser.add_argument("--out-suffix", default="", help="suffix for output files (e.g. -calibrate)")
+    parser.add_argument("--prompt-mode", choices=["hinted", "naked"], default="hinted",
+                        help="hinted (default): includes 'if not in passage say so' / 'push back on false premise'. "
+                             "naked: passage+question only, no conditional instructions (dogfooding-realistic).")
     args = parser.parse_args()
 
     n_cap = 10 if args.calibrate else None
@@ -384,7 +401,7 @@ def main():
         print(f"[judge-only] loaded {len(responses)} cached responses from {cached_path}", file=sys.stderr)
     else:
         # ---- Generate (and revise under with-vouch) ----
-        print(f"[gen] generator={GENERATOR_MODEL}  subsets={subsets}  arms={[('with' if a else 'without')+'-vouch' for a in arms]}", file=sys.stderr)
+        print(f"[gen] generator={GENERATOR_MODEL}  subsets={subsets}  arms={[('with' if a else 'without')+'-vouch' for a in arms]}  prompt_mode={args.prompt_mode}", file=sys.stderr)
         responses: list[dict] = []
         for subset in subsets:
             items = load_subset(subset, n_cap)
@@ -392,7 +409,7 @@ def main():
             for i, item in enumerate(items, 1):
                 for vouch_on in arms:
                     try:
-                        rec = run_item(client, item, subset, vouch_on)
+                        rec = run_item(client, item, subset, vouch_on, args.prompt_mode)
                     except Exception as e:
                         rec = {"id": item["id"], "subset": subset, "arm": "with-vouch" if vouch_on else "without-vouch", "error": str(e)[:300]}
                     responses.append(rec)
@@ -437,7 +454,7 @@ def main():
 
     # ---- Report ----
     metrics = compute_metrics(judgments)
-    report = render_report(metrics, GENERATOR_MODEL, JUDGE_MODEL, n_by_subset)
+    report = render_report(metrics, GENERATOR_MODEL, JUDGE_MODEL, n_by_subset, args.prompt_mode)
     out_report.write_text(report)
     print(f"[report] -> {out_report}\n", file=sys.stderr)
     print(report)
