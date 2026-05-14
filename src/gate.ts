@@ -276,13 +276,17 @@ export interface GateVerdict {
    *  PASSING draft (block-check first; if passing, harvest) and only when there
    *  was something to report. See `harvestDerivedClaims`. */
   harvest?: HarvestResult;
-  /** #50 (A) Stage 2 result: classification of how this turn's draft addressed
-   *  prior-turn fires that were awaiting_revise=1. Per-action counts plus the
-   *  list of entities still un-addressed (= candidate dodge surface). */
+  /** #50 (A) Stage 2 + 3.5 result: classification of how this turn's draft
+   *  addressed prior-turn fires that were awaiting_revise=1. Per-action
+   *  counts plus the list of entities still un-addressed (= candidate
+   *  dodge surface). suspectedSilentRephrase: Stage 3.5 sub-count of
+   *  'remove' outcomes that look like (4b) silent-rephrase dodges via
+   *  high-cosine proposition match. */
   reviseCheck?: {
     addressedFetch: number;
     addressedHedge: number;
     addressedRemove: number;
+    suspectedSilentRephrase: number;
     stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
   };
   /** True when the watchdog budget was exceeded before all propositions could
@@ -2244,6 +2248,7 @@ export async function applySessionLedger(
     addressedFetch: number;
     addressedHedge: number;
     addressedRemove: number;
+    suspectedSilentRephrase: number;
     stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
   };
 }> {
@@ -2258,6 +2263,10 @@ export async function applySessionLedger(
     addressedFetch: number;
     addressedHedge: number;
     addressedRemove: number;
+    /** Stage 3.5 sub-count: of `remove` outcomes, how many had a NEW
+     *  high-cosine proposition in this turn (suspected silent-rephrase
+     *  dodge per #50 (4b))? When >0 the advisory line names them. */
+    suspectedSilentRephrase: number;
     stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
   } | undefined;
   if (draft) {
@@ -2266,7 +2275,13 @@ export async function applySessionLedger(
       let addressedFetch = 0;
       let addressedHedge = 0;
       let addressedRemove = 0;
+      let suspectedSilentRephrase = 0;
       const stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }> = [];
+      // Stage 3.5: pre-embed each new pair's proposition for the silent-
+      // rephrase cosine check. Skip pairs with missing embeddings (the
+      // embedOne call below catches transient errors). Cached per turn.
+      const newPairEmbeddings: Array<{ idx: number; emb: Float32Array }> = [];
+      const STAGE_35_COSINE = 0.85; // threshold for "semantically the same claim"
       for (const row of awaiting) {
         // Skip entries from THIS same turn (they're being processed now, not
         // "prior-turn fires"). Compare turn_idx.
@@ -2279,8 +2294,50 @@ export async function applySessionLedger(
           addressedHedge++;
           store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "hedge", turn_idx);
         } else if (via === "remove") {
-          addressedRemove++;
-          store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "remove", turn_idx);
+          // Stage 3.5: check whether 'remove' is legitimate topic-drop or
+          // silent-rephrase. If a NEW pair this turn has a proposition
+          // semantically very close to the fired one (cosine >= 0.85), the
+          // agent kept the claim but excised the entity name — (4b) dodge.
+          // Compare against the fired proposition's stored embedding.
+          let suspectedRephrase = false;
+          if (row.embedding && pairs.length) {
+            // Lazy-embed new pairs the first time we need them.
+            if (newPairEmbeddings.length === 0) {
+              for (let pi = 0; pi < pairs.length; pi++) {
+                try {
+                  const e = await embedOne(pairs[pi]!.proposition);
+                  newPairEmbeddings.push({ idx: pi, emb: e });
+                } catch {
+                  // skip
+                }
+              }
+            }
+            for (const { emb } of newPairEmbeddings) {
+              // Compute cosine inline (avoid importing yet another helper).
+              const n = Math.min(row.embedding.length, emb.length);
+              let dot = 0;
+              for (let k = 0; k < n; k++) dot += row.embedding[k]! * emb[k]!;
+              if (dot >= STAGE_35_COSINE) {
+                suspectedRephrase = true;
+                break;
+              }
+            }
+          }
+          if (suspectedRephrase) {
+            // Treat as still-unaddressed: the claim's content survived
+            // even though the entity name didn't.
+            suspectedSilentRephrase++;
+            stillUnaddressed.push({
+              entity: row.entity,
+              turn_idx: row.turn_idx,
+              proposition: row.proposition,
+            });
+            // Don't clear awaiting_revise yet — agent needs to address
+            // the underlying claim, not just rename the entity.
+          } else {
+            addressedRemove++;
+            store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "remove", turn_idx);
+          }
         } else {
           stillUnaddressed.push({
             entity: row.entity,
@@ -2289,7 +2346,7 @@ export async function applySessionLedger(
           });
         }
       }
-      reviseCheck = { addressedFetch, addressedHedge, addressedRemove, stillUnaddressed };
+      reviseCheck = { addressedFetch, addressedHedge, addressedRemove, suspectedSilentRephrase, stillUnaddressed };
     }
   }
 
@@ -2894,10 +2951,10 @@ function formatSessionSummary(
   if (c.retracted > 0) resolvedNotes.push(`${c.retracted} retracted`);
   const resolvedStr = resolvedNotes.length ? ` · ${resolvedNotes.join(" / ")}` : "";
 
-  // #50 (A) Stage 2: classify how THIS turn addressed prior-turn fires.
-  // Render two lines: (a) the cleared-this-turn breakdown, (b) the still-
-  // unaddressed list (the candidate dodge surface). Advisory only — no
-  // re-fire yet. Stage 3 promotes (b) to escalated fires.
+  // #50 (A) Stage 2 + 3.5: classify how THIS turn addressed prior-turn
+  // fires. Render lines: (a) cleared-this-turn breakdown, (b) suspected
+  // silent-rephrase count (Stage 3.5), (c) still-unaddressed list (the
+  // candidate dodge surface). Advisory only — no re-fire yet.
   let stage2Lines = "";
   if (reviseCheck) {
     const cleared =
@@ -2909,6 +2966,10 @@ function formatSessionSummary(
     if (cleared > 0) {
       stage2Lines +=
         `[vouch-gate] revise check (#50 A Stage 2): ${cleared} prior fire(s) addressed this turn (${clearedParts.join(" / ")})\n`;
+    }
+    if (reviseCheck.suspectedSilentRephrase > 0) {
+      stage2Lines +=
+        `⚠ [vouch-gate] silent-rephrase suspected (#50 A Stage 3.5): ${reviseCheck.suspectedSilentRephrase} prior fire(s) had the entity removed but the underlying claim recurred at high cosine (≥0.85) in this turn — kept on the awaiting backlog\n`;
     }
     if (reviseCheck.stillUnaddressed.length > 0) {
       const entityList = reviseCheck.stillUnaddressed
