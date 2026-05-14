@@ -69,6 +69,7 @@ Question: Does the SOURCE support **every** factual assertion in the CLAIM? The 
 Rules:
 - Be LENIENT on phrasing — same factual content with different words IS supported.
 - Be STRICT on facts — every entity, number, dataset, baseline, or causal relationship in the claim must trace to the source.
+- SUBJECT-PREDICATE ALIGNMENT (#48): a claim of the form "<subject> <predicate>" requires the SOURCE to attribute that predicate specifically to that subject. The SOURCE mentioning the subject elsewhere AND mentioning the predicate elsewhere is token co-occurrence, NOT support. Claims framed with "Based on the text provided, …" / "According to the passage, …" / "The text states that …" do NOT inherit support from their framing — strip the framing and evaluate the inner proposition against the source's actual content.
 - ABSENCE CLAIMS ("source does not mention X" / "X is missing from the paper"):
     supported = source genuinely lacks X.
     unsupported = source actually contains X (claim is wrong about absence).
@@ -76,6 +77,16 @@ Rules:
     supported requires the cell at the right row × column.
     A correct number at the wrong position FAILS.
 - Reject "almost-true" claims that overstate, generalize, or paraphrase beyond what the source says.
+
+Counter-examples to internalize the subject-predicate alignment rule:
+
+  CLAIM: "Phagocytosis is an example of a less sophisticated defense mechanism that jawed vertebrates have."
+  SOURCE: "Defense mechanisms ... evolved in ancient eukaryotes and remain in their modern descendants, such as plants and invertebrates. These mechanisms include phagocytosis, antimicrobial peptides called defensins, ..."
+  VERDICT: NOT SUPPORTED. The source attributes phagocytosis to ancient eukaryotes / plants / invertebrates — not to jawed vertebrates. Token overlap on the entity "phagocytosis" and the topic "defense mechanism" is not entailment of the specific subject-predicate ("jawed vertebrates have phagocytosis").
+
+  CLAIM: "Based on the text provided, the p-adic norm gets smaller when a number is prime."
+  SOURCE: "this norm gets smaller when a number is multiplied by p"
+  VERDICT: NOT SUPPORTED. The claim's predicate ("when a number is prime") does not match the source's predicate ("when a number is multiplied by p"). The framing "Based on the text provided" in the CLAIM does not itself create support — strip it and evaluate the inner content.
 
 Return your verdict as JSON: { supported, score (0..1 confidence), reason (one sentence) }.`;
 
@@ -323,6 +334,7 @@ For each item below, determine whether the SOURCE supports **every** factual ass
 Rules:
 - Be LENIENT on phrasing — same factual content with different words IS supported.
 - Be STRICT on facts — every entity, number, dataset, baseline, or causal relationship in the claim must trace to the source.
+- SUBJECT-PREDICATE ALIGNMENT (#48): a claim of the form "<subject> <predicate>" requires the SOURCE to attribute that predicate specifically to that subject. The SOURCE mentioning the subject elsewhere AND mentioning the predicate elsewhere is token co-occurrence, NOT support. Claims framed with "Based on the text provided, …" / "According to the passage, …" / "The text states that …" do NOT inherit support from their framing — strip the framing and evaluate the inner proposition against the source's actual content.
 - ABSENCE CLAIMS ("source does not mention X" / "X is missing from the paper"):
     supported = source genuinely lacks X.
     unsupported = source actually contains X (claim is wrong about absence).
@@ -330,6 +342,16 @@ Rules:
     supported requires the cell at the right row × column.
     A correct number at the wrong position FAILS.
 - Reject "almost-true" claims that overstate, generalize, or paraphrase beyond what the source says.
+
+Counter-examples to internalize the subject-predicate alignment rule:
+
+  CLAIM: "Phagocytosis is an example of a less sophisticated defense mechanism that jawed vertebrates have."
+  SOURCE: "Defense mechanisms ... evolved in ancient eukaryotes and remain in their modern descendants, such as plants and invertebrates. These mechanisms include phagocytosis, antimicrobial peptides called defensins, ..."
+  VERDICT: NOT SUPPORTED. The source attributes phagocytosis to ancient eukaryotes / plants / invertebrates — not to jawed vertebrates. Token overlap on the entity "phagocytosis" and the topic "defense mechanism" is not entailment of the specific subject-predicate ("jawed vertebrates have phagocytosis").
+
+  CLAIM: "Based on the text provided, the p-adic norm gets smaller when a number is prime."
+  SOURCE: "this norm gets smaller when a number is multiplied by p"
+  VERDICT: NOT SUPPORTED. The claim's predicate ("when a number is prime") does not match the source's predicate ("when a number is multiplied by p"). The framing "Based on the text provided" in the CLAIM does not itself create support — strip it and evaluate the inner content.
 
 Return your verdicts as JSON: { verdicts: [{ idx (0-based), supported (boolean), score (0..1 confidence), reason (one sentence) }] }.`;
 

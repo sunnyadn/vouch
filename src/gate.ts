@@ -170,6 +170,14 @@ EXCLUDE entirely (do NOT return any triple):
       (d) Forward-looking or proposed entities framed as not-yet-existing ("I'll file ISSUE-X", "a planned feature would ...").
       (e) Internal issue-tracker IDs (Linear / Jira / GitHub) and their described scope when filing / summarizing / proposing them.
 
+EXTRACTIVE FRAMING IS NOT A WORKSPACE SIGNAL (#48):
+  A draft framed as "Based on the text provided, X is Y" / "According to the passage, X is Y" / "The text states that X is Y" still makes a verifiable factual claim about the named entity X. DO extract it as ASSERT (or whichever stance fits the claim shape) — the downstream grounding step will verify whether the cited source actually entails the predicate. The extractive framing is the agent's CLAIM of source, not proof that the source supports it. Do NOT skip the proposition merely because the agent attributed it to a provided passage.
+
+  Counter-example to internalize:
+    DRAFT: "Based on the text provided, the answer is the p-adic norm gets smaller when a number is prime."
+    EXTRACT: { entity: "p-adic norm", stance: "ASSERT", proposition: "The p-adic norm gets smaller when a number is prime." }
+    Reasoning: the draft asserts a specific property of a named entity. Even though framed as "based on the text", the proposition is a checkable claim about p-adic-norm + prime — and grounding will verify whether the source actually says that (it doesn't — the source says "multiplied by p"). DO extract.
+
 If nothing qualifies, return { pairs: [] }.
 
 Draft:
