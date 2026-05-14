@@ -3121,9 +3121,28 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             hedges: verdict.pairs.filter((p) => p.stance === "HEDGE").length,
             speculates: verdict.pairs.filter((p) => p.stance === "SPECULATE").length,
           };
+          // P-α.5: when counter-evidence pull ran but found NOTHING in KB
+          // for any grounded pair this turn, surface a web-counter-search
+          // suggestion. The 44% KB-miss rate from the 2026-05-14 dogfood
+          // baseline says most relevant counter-evidence is NOT in KB —
+          // agent should be prompted to check the web for limitations /
+          // criticism. Renders only when env=1 was set and grounded
+          // ASSERTs existed; suppressed when counter-evidence was found
+          // (the P-α line carries the load there).
+          const paEnabled = process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1";
+          const groundedAsserts = verdict.pairs.filter(
+            (p) => p.stance === "ASSERT" && p.grounded,
+          );
+          const anyKbCounter = verdict.pairs.some(
+            (p) => (p.counter_evidence?.length ?? 0) > 0,
+          );
+          const paWebSuggestion =
+            paEnabled && groundedAsserts.length > 0 && !anyKbCounter
+              ? `[vouch-gate] P-α: ${groundedAsserts.length} grounded ASSERT(s) this turn cleared KB counter-evidence. KB miss is 44% on the dogfood baseline — consider \`vouch search "<entity> limitations" --provider ddg\` for web counter-check on load-bearing claims.\n`
+              : "";
           const sessionMsg = sessionTid
-            ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn, thisTurnStances)
-            : "";
+            ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn, thisTurnStances) + paWebSuggestion
+            : paWebSuggestion;
 
           // #50 (A) Stage 3: opt-in enforcement. When
           // VOUCH_GATE_ESCALATE_UNADDRESSED=1 AND Stage 2's reviseCheck
