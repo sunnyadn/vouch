@@ -27,3 +27,4 @@ bench/dogfood/fires-*.jsonl
 # Hand-classification samples embed the same private (proposition, KB-claim)
 # pairs as fires-*.jsonl.
 bench/dogfood/p-alpha-judge-study-sample.tsv
+bench/dogfood/p-alpha-judge-study-crossvalidate.jsonl
