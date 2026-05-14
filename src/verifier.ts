@@ -191,19 +191,13 @@ async function retrieveRelevant(content: string, claim: string, k = RETRIEVAL_K)
   const claimEmb = embs[embs.length - 1]!;
   const sims = embs.slice(0, -1).map((e, i) => ({
     i,
-    sim: cosine(e, claimEmb),
+    sim: store.cosine(e, claimEmb),
   }));
   sims.sort((a, b) => b.sim - a.sim);
   const chosen = sims.slice(0, k).map((s) => s.i).sort((a, b) => a - b);
   return chosen.map((i) => chunks[i]!).join("\n\n---\n\n");
 }
 
-function cosine(a: Float32Array, b: Float32Array): number {
-  const n = Math.min(a.length, b.length);
-  let dot = 0;
-  for (let i = 0; i < n; i++) dot += a[i]! * b[i]!;
-  return dot;
-}
 
 export async function verifyClaimAgainstSource(
   claim: string,

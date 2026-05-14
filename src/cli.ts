@@ -967,7 +967,7 @@ program
       console.log(`    SPECULATE        ${c.speculates.toString().padStart(4)}`);
       console.log(`    Humility ratio   ${hed}/${truth} = ${humility} explicit-uncertainty`);
       console.log(``);
-      console.log(`  Revise backlog:      ${c.awaiting_revise}  (fired entities awaiting verification — #50 A Stage 1)`);
+      console.log(`  Revise backlog:      ${c.awaiting_revise}  (fired entities awaiting verification)`);
       console.log(``);
       console.log(`  Strict env state:`);
       console.log(`    VOUCH_GATE_ESCALATE_UNADDRESSED  ${escalate ? "ON" : "OFF (default)"}`);

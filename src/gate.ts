@@ -254,11 +254,11 @@ export interface GroundedPair extends ExtractedPair {
     nli_reason: string;
     nli_score: number;
   }>;
-  /** P-α counter-evidence pull: KB claims that CONTRADICT this proposition
-   *  (high-confidence verifyContradiction score). Surfaced in the fire
+  /** Counter-evidence: KB claims that CONTRADICT this proposition with
+   *  high-confidence `verifyContradiction` score. Surfaced in the fire
    *  message even when the pair was otherwise grounded — agent must
-   *  reconcile or hedge. This is the "comprehensiveness" primitive (search
-   *  for counter-evidence, not just confirming evidence). */
+   *  reconcile, supersede, or hedge before passing. Only populated when
+   *  VOUCH_GATE_COUNTER_EVIDENCE=1. */
   counter_evidence?: Array<{
     claim_id: number;
     claim_text: string;
@@ -276,12 +276,13 @@ export interface GateVerdict {
    *  PASSING draft (block-check first; if passing, harvest) and only when there
    *  was something to report. See `harvestDerivedClaims`. */
   harvest?: HarvestResult;
-  /** #50 (A) Stage 2 + 3.5 result: classification of how this turn's draft
-   *  addressed prior-turn fires that were awaiting_revise=1. Per-action
-   *  counts plus the list of entities still un-addressed (= candidate
-   *  dodge surface). suspectedSilentRephrase: Stage 3.5 sub-count of
-   *  'remove' outcomes that look like (4b) silent-rephrase dodges via
-   *  high-cosine proposition match. */
+  /** Revise-check: how this turn's draft addressed prior-turn fires
+   *  flagged `awaiting_revise=1`. Per-action counts plus the list of
+   *  entities still unaddressed (the candidate-dodge surface).
+   *  `suspectedSilentRephrase` is a sub-count of would-be `remove`
+   *  outcomes that look like the entity was excised but the underlying
+   *  claim re-asserted in different wording (cosine ≥
+   *  SILENT_REPHRASE_COSINE between fired and a new proposition). */
   reviseCheck?: {
     addressedFetch: number;
     addressedHedge: number;
@@ -655,10 +656,22 @@ const WIDER_TOPK = 8;
 const COSINE_SHORTCUT = 0.95;
 const COSINE_SECONDARY = 0.92;
 
-// P-α counter-evidence thresholds (mirror SESSION_CONTRADICTION_*).
+// KB counter-evidence thresholds — mirror SESSION_CONTRADICTION_* so the
+// two contradiction-detection paths (KB-wide vs same-session) stay tuned
+// together.
 const COUNTER_EVIDENCE_TOPK = 5;
 const COUNTER_EVIDENCE_MIN_COS = 0.55;
 const COUNTER_EVIDENCE_FIRE_SCORE = 0.75;
+
+/** Cosine threshold above which a NEW proposition this turn is treated as
+ *  semantically the same claim as a prior fired one — used to distinguish
+ *  legitimate topic-drop from "entity removed but claim re-asserted in
+ *  different wording" (the silent-rephrase dodge shape). */
+const SILENT_REPHRASE_COSINE = 0.85;
+
+/** Per-turn over-confidence advisory thresholds. */
+const OVER_CONFIDENT_ASSERT_FLOOR = 3;     // ≥ N asserts this turn triggers the flag check
+const HUMILITY_DISPLAY_MIN_TRUTH = 10;     // floor for showing humility ratio (avoid noisy small-N)
 
 export async function checkGrounding(
   pair: ExtractedPair,
@@ -899,10 +912,10 @@ async function batchGroundAssertions(
 
     try {
       const batchResults = await verifyClaimsBatch(batchItems);
-      // #50 (E): collect non-entailing candidates per pair so the fire
-      // message can surface them inline. Buffer here, prune+sort once after
-      // the batch settles (so a candidate that DID entail can short-circuit
-      // its pair to grounded:true without polluting kb_candidates).
+      // Collect non-entailing candidates per pair so the fire message
+      // can surface them inline. Buffer here, prune+sort once after the
+      // batch settles (a candidate that DID entail can short-circuit its
+      // pair to grounded:true without polluting kb_candidates).
       const candidateBuffer = new Map<number, GroundedPair["kb_candidates"]>();
       for (let i = 0; i < candidates.length; i++) {
         const c = candidates[i]!;
@@ -916,7 +929,7 @@ async function batchGroundAssertions(
           };
           continue;
         }
-        // Non-supported — capture for #50 (E) surfacing IF this pair is
+        // Non-supported — capture for inline-KB-candidate surfacing IF this pair is
         // still ungrounded at the end. Note: source_passage carries the
         // verifier's natural-language reason for unsupported claims (the
         // post-#49 invariant: only `supported` paths store verbatim quote).
@@ -952,16 +965,12 @@ async function batchGroundAssertions(
     }
   }
 
-  // P-α: counter-evidence pull. For each pair grounded by Phase 1+2, search
-  // the KB for claims that CONTRADICT the proposition. If contradiction
-  // verifier returns high confidence, flip the pair to ungrounded with a
-  // counter_evidence payload. This is the "comprehensiveness" primitive —
-  // confirming evidence alone is insufficient; the gate also tests for
-  // strong opposing claims and forces the agent to reconcile or hedge.
-  //
-  // Opt-in by env var (default off) — same shape as Stage 3 enforcement.
-  // Each grounded pair costs +1 embed + 1 search + up to 3 verifyContradiction
-  // calls. With ~5 grounded pairs/turn and concurrency, overhead is ~5-10s.
+  // Counter-evidence pull: for each grounded pair, also check whether the KB
+  // contains a STRONG CONTRADICTING claim on the same entity. Confirming
+  // evidence alone is insufficient — if a comparably-supported counter-claim
+  // exists, flip to ungrounded so the agent must reconcile, supersede, or
+  // hedge. Opt-in because each grounded pair adds an embed + search +
+  // up to COUNTER_EVIDENCE_TOPK verifyContradiction calls (~5-10s/turn).
   if (process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1" && !abortRef?.aborted) {
     const groundedIdx = results.flatMap((p, i) => (p.grounded ? [i] : []));
     if (groundedIdx.length) {
@@ -2083,22 +2092,10 @@ interface SessionLedgerOutcome {
 
 /** Heuristic entity-match for RETRACT auto-mark. Entities are loose strings;
  *  do a normalized contains check both ways. */
-// ---------------------------------------------------------------------------
-// P-γ.5: blind-spot enumeration. Agent surfaces explicit gaps in their
-// knowledge per turn — either via the explicit `[gap: ...]` marker or via
-// natural-language patterns we can deterministically detect. Counting these
-// per turn (and per session) gives the user a HUMILITY signal distinct from
-// hedge-tag-on-individual-claim: it asks "did you enumerate what you DON'T
-// know?", not "did you hedge what you DO know?"
-//
-// Two detector layers:
-//   1. Explicit marker:  [gap: <text>] or (gap: <text>) — agent-authored.
-//   2. Natural phrases:  "I didn't check X" / "I haven't verified Y" /
-//                        "I don't know Z" / "I'm not sure about W" /
-//                        "worth checking U" / "I should also look at V"
-//
-// Both are counted; visibility-only in this Stage 1 ship.
-// ---------------------------------------------------------------------------
+// Blind-spot enumeration: counts of explicit `[gap: ...]` markers + natural-
+// language uncertainty phrases the agent surfaced this turn. Distinct from
+// HEDGE-tag-near-entity (per-claim) — this is per-turn "did you enumerate
+// what you DON'T know?". Visibility-only.
 
 const GAP_MARKER_RE = /[\[(]gap:\s*([^\])]+)[\])]/gi;
 const GAP_PHRASE_RES: RegExp[] = [
@@ -2129,24 +2126,17 @@ function entitiesMatch(a: string, b: string): boolean {
   return na.includes(nb) || nb.includes(na);
 }
 
-// ---------------------------------------------------------------------------
-// #50 (A) Stage 2 — detection of revise actions on prior-turn fires.
+// Revise-action classifier: given a fired-but-unaddressed entity and this
+// turn's draft + extracted pairs, return which of three productive revise
+// shapes the agent took, or null:
+//   'fetch'  — agent invoked a verification tool referencing the entity
+//   'hedge'  — explicit uncertainty tag adjacent to the entity
+//   'remove' — entity absent from any new extracted proposition
+//   null     — none of the above (still a candidate dodge)
 //
-// Given a fired-but-unaddressed entity and the current turn's draft +
-// extracted pairs, classify which of the three productive revise shapes
-// (or none) the agent took:
-//   - 'fetch' : agent invoked a verification tool referencing the entity
-//   - 'hedge' : explicit uncertainty tag adjacent to the entity
-//   - 'remove': entity not present in any new extracted proposition this turn
-//   - null    : none of the above → still a dodge (Stage 3 promotes to fire)
-//
-// Detection is deterministic regex + windowed proximity. False positives
-// would mark a real dodge as "addressed" prematurely; false negatives
-// would push a legitimate revise to "still unaddressed." The windows
-// (300 chars) and the explicit token lists are conservative; we lean
-// toward false NEGATIVES (over-flagging dodge) since Stage 2 ships as
-// advisory-only — the user sees the classification and can correct.
-// ---------------------------------------------------------------------------
+// Deterministic regex + windowed proximity. Lean toward false NEGATIVES
+// (over-flag dodge) so the advisory stays visible until a real productive
+// revise happens.
 
 const TOOL_CALL_RE =
   /\b(vouch\s+(?:fetch|claim|search|attest)|WebFetch|WebSearch|gh\s+api|gh\s+\w+\s+view|git\s+show|curl\s+-[sLI]?\s|npm\s+view|pip\s+show)\b/gi;
@@ -2217,7 +2207,8 @@ export function classifyReviseAction(
   // turn. NOTE: this is the most contested shape — silent removal is the
   // (4b) dodge per #50. We classify it as 'remove' (action taken) but Stage
   // 3's enforcement message will explicitly call out silent-rephrase as
-  // dodge-shaped. Stage 2 just records the action class.
+  // dodge-shaped. This classifier just records the action class; the
+  // silent-rephrase detector upstream distinguishes the two via cosine.
   const entityPresent = currentExtractedPairs.some((p) => entitiesMatch(p.entity, entity));
   if (!entityPresent) return "remove";
 
@@ -2236,10 +2227,10 @@ export async function applySessionLedger(
   transcriptPath: string,
   pairs: GroundedPair[],
   abortRef?: { aborted: boolean },
-  /** Current turn's raw draft text. Required for Stage 2 of #50 (A):
-   *  detection of revise actions (tool-call / hedge-tag / removal) against
-   *  prior-turn fires that are still awaiting_revise=1. Omit and the Stage 2
-   *  pass is skipped (legacy behavior). */
+  /** Current turn's raw draft. Required for the revise-action check —
+   *  classification of tool-call / hedge-tag / removal against prior-turn
+   *  fires flagged `awaiting_revise=1`. Omit to skip the check entirely
+   *  (legacy behavior, used by tests that don't supply a draft). */
   draft?: string,
 ): Promise<{
   pairs: GroundedPair[];
@@ -2255,7 +2246,7 @@ export async function applySessionLedger(
   const transcript_id = transcriptIdFromPath(transcriptPath);
   const turn_idx = store.getNextSessionTurnIdx(transcript_id);
 
-  // ----- 0. #50 (A) Stage 2: detect-and-clear revise actions on prior fires.
+  // ----- 0. Revise-action check on prior fires.
   // Runs BEFORE this turn's pairs are processed, so the awaiting-set reflects
   // the state going INTO this turn. Results feed an advisory line rendered
   // in formatSessionSummary.
@@ -2263,9 +2254,9 @@ export async function applySessionLedger(
     addressedFetch: number;
     addressedHedge: number;
     addressedRemove: number;
-    /** Stage 3.5 sub-count: of `remove` outcomes, how many had a NEW
-     *  high-cosine proposition in this turn (suspected silent-rephrase
-     *  dodge per #50 (4b))? When >0 the advisory line names them. */
+    /** Sub-count of `remove` outcomes: how many had a NEW high-cosine
+     *  proposition in this turn (suspected silent-rephrase
+     *  dodge)? When >0 the advisory line names them. */
     suspectedSilentRephrase: number;
     stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
   } | undefined;
@@ -2277,11 +2268,10 @@ export async function applySessionLedger(
       let addressedRemove = 0;
       let suspectedSilentRephrase = 0;
       const stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }> = [];
-      // Stage 3.5: pre-embed each new pair's proposition for the silent-
-      // rephrase cosine check. Skip pairs with missing embeddings (the
-      // embedOne call below catches transient errors). Cached per turn.
+      // Lazy cache: new-pair embeddings, populated the first time a
+      // `remove` outcome needs the silent-rephrase cosine check and
+      // reused across remaining awaiting rows.
       const newPairEmbeddings: Array<{ idx: number; emb: Float32Array }> = [];
-      const STAGE_35_COSINE = 0.85; // threshold for "semantically the same claim"
       for (const row of awaiting) {
         // Skip entries from THIS same turn (they're being processed now, not
         // "prior-turn fires"). Compare turn_idx.
@@ -2294,30 +2284,29 @@ export async function applySessionLedger(
           addressedHedge++;
           store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "hedge", turn_idx);
         } else if (via === "remove") {
-          // Stage 3.5: check whether 'remove' is legitimate topic-drop or
-          // silent-rephrase. If a NEW pair this turn has a proposition
-          // semantically very close to the fired one (cosine >= 0.85), the
-          // agent kept the claim but excised the entity name — (4b) dodge.
-          // Compare against the fired proposition's stored embedding.
+          // Distinguish legitimate topic-drop from silent-rephrase: if any
+          // new pair this turn has a proposition semantically near the
+          // fired one (cosine ≥ SILENT_REPHRASE_COSINE), the agent kept
+          // the claim but excised the entity name. Compare against the
+          // fired proposition's stored embedding.
           let suspectedRephrase = false;
           if (row.embedding && pairs.length) {
-            // Lazy-embed new pairs the first time we need them.
+            // Lazy-embed once per turn in parallel; cache reused across
+            // subsequent `remove` checks in the same turn.
             if (newPairEmbeddings.length === 0) {
-              for (let pi = 0; pi < pairs.length; pi++) {
-                try {
-                  const e = await embedOne(pairs[pi]!.proposition);
-                  newPairEmbeddings.push({ idx: pi, emb: e });
-                } catch {
-                  // skip
-                }
-              }
+              const embedded = await Promise.all(
+                pairs.map(async (p, pi) => {
+                  try {
+                    return { idx: pi, emb: await embedOne(p.proposition) };
+                  } catch {
+                    return null;
+                  }
+                }),
+              );
+              for (const e of embedded) if (e) newPairEmbeddings.push(e);
             }
             for (const { emb } of newPairEmbeddings) {
-              // Compute cosine inline (avoid importing yet another helper).
-              const n = Math.min(row.embedding.length, emb.length);
-              let dot = 0;
-              for (let k = 0; k < n; k++) dot += row.embedding[k]! * emb[k]!;
-              if (dot >= STAGE_35_COSINE) {
+              if (store.cosine(row.embedding, emb) >= SILENT_REPHRASE_COSINE) {
                 suspectedRephrase = true;
                 break;
               }
@@ -2607,11 +2596,11 @@ export async function runGate(opts: {
   }
   // extracted.length === 0 → nothing to ground → blocked stays false.
 
-  // #50 (A) Stage 2: zero-proposition turns need their own Stage 2 pass —
-  // the standard branch above only runs when pairs.length > 0. The
-  // silent-rephrase dodge (4b) typically produces drafts with NO new
-  // claims, which means "entity not in new pairs" IS the removal signal.
-  // Skip silently if applySessionLedger fails — Stage 2 is advisory.
+  // Zero-proposition turns need their own revise-check pass — the
+  // standard branch above only runs when pairs.length > 0. Silent-
+  // rephrase dodges typically produce drafts with NO new claims, so
+  // "entity not in new pairs" IS the removal signal. Skip silently
+  // if applySessionLedger fails (advisory).
   if (
     !classifierError &&
     !incomplete &&
@@ -2902,13 +2891,14 @@ function writeGateLog(entry: AuditEntry) {
  *  human/judge pass via classify_fires.ts. This line surfaces the raw
  *  pressure: a fire count that climbs without a matching grounded count
  *  is the dodge-accumulation signal the user can act on. */
-/** #50 (A) Stage 3 — escalated block message rendered when this turn passed
- *  its own gate but Stage 2 detected unaddressed prior-turn fires. Names the
- *  lingering entities and points at the productive paths. */
+/** Escalated block message: rendered when this turn passed its own gate
+ *  but the revise-check detected unaddressed prior-turn fires (opt-in via
+ *  VOUCH_GATE_ESCALATE_UNADDRESSED). Names the lingering entities and
+ *  points at the productive paths. */
 function formatEscalatedBlockMessage(verdict: GateVerdict, draft: string): string {
   const lines: string[] = [];
   lines.push(
-    `[vouch-gate] Detected unaddressed prior-turn fires — your previous draft fired on entit(y|ies) below, but this revise neither verified, hedged, nor removed them (#50 A Stage 3, VOUCH_GATE_ESCALATE_UNADDRESSED=1).`,
+    `[vouch-gate] Detected unaddressed prior-turn fires — your previous draft fired on entit(y|ies) below, but this revise neither verified, hedged, nor removed them. (Enabled by VOUCH_GATE_ESCALATE_UNADDRESSED=1.)`,
   );
   for (const u of verdict.reviseCheck?.stillUnaddressed ?? []) {
     lines.push(
@@ -2951,11 +2941,11 @@ function formatSessionSummary(
   if (c.retracted > 0) resolvedNotes.push(`${c.retracted} retracted`);
   const resolvedStr = resolvedNotes.length ? ` · ${resolvedNotes.join(" / ")}` : "";
 
-  // #50 (A) Stage 2 + 3.5: classify how THIS turn addressed prior-turn
-  // fires. Render lines: (a) cleared-this-turn breakdown, (b) suspected
-  // silent-rephrase count (Stage 3.5), (c) still-unaddressed list (the
-  // candidate dodge surface). Advisory only — no re-fire yet.
-  let stage2Lines = "";
+  // Render the revise-check breakdown: (a) cleared-this-turn counts,
+  // (b) suspected silent-rephrase count, (c) still-unaddressed list.
+  // Advisory only — escalation lives in runGateCli behind the opt-in
+  // env flag.
+  let reviseCheckLines = "";
   if (reviseCheck) {
     const cleared =
       reviseCheck.addressedFetch + reviseCheck.addressedHedge + reviseCheck.addressedRemove;
@@ -2964,12 +2954,12 @@ function formatSessionSummary(
     if (reviseCheck.addressedHedge > 0) clearedParts.push(`${reviseCheck.addressedHedge} hedge`);
     if (reviseCheck.addressedRemove > 0) clearedParts.push(`${reviseCheck.addressedRemove} remove`);
     if (cleared > 0) {
-      stage2Lines +=
-        `[vouch-gate] revise check (#50 A Stage 2): ${cleared} prior fire(s) addressed this turn (${clearedParts.join(" / ")})\n`;
+      reviseCheckLines +=
+        `[vouch-gate] revise check: ${cleared} prior fire(s) addressed this turn (${clearedParts.join(" / ")})\n`;
     }
     if (reviseCheck.suspectedSilentRephrase > 0) {
-      stage2Lines +=
-        `⚠ [vouch-gate] silent-rephrase suspected (#50 A Stage 3.5): ${reviseCheck.suspectedSilentRephrase} prior fire(s) had the entity removed but the underlying claim recurred at high cosine (≥0.85) in this turn — kept on the awaiting backlog\n`;
+      reviseCheckLines +=
+        `⚠ [vouch-gate] silent-rephrase suspected: ${reviseCheck.suspectedSilentRephrase} prior fire(s) had the entity removed but the underlying claim recurred at high cosine (≥${SILENT_REPHRASE_COSINE}) in this turn — kept on the awaiting backlog\n`;
     }
     if (reviseCheck.stillUnaddressed.length > 0) {
       const entityList = reviseCheck.stillUnaddressed
@@ -2980,38 +2970,36 @@ function formatSessionSummary(
         reviseCheck.stillUnaddressed.length > 5
           ? ` + ${reviseCheck.stillUnaddressed.length - 5} more`
           : "";
-      stage2Lines +=
-        `⚠ [vouch-gate] revise check (#50 A Stage 2): ${reviseCheck.stillUnaddressed.length} prior fire(s) still unaddressed in this turn — ${entityList}${more}\n` +
+      reviseCheckLines +=
+        `⚠ [vouch-gate] revise check: ${reviseCheck.stillUnaddressed.length} prior fire(s) still unaddressed in this turn — ${entityList}${more}\n` +
         `   (advisory: this revise neither verified, hedged, nor removed these entities — candidate dodge surface)\n`;
     }
   }
 
-  // Stage 1 backlog line: total awaiting_revise (counts entries that haven't
-  // been addressed in any later turn). With Stage 2 active, this number
-  // should generally DROP turn-over-turn as detection clears entries.
+  // Backlog: total awaiting_revise (entries not yet addressed in any
+  // later turn). With the revise-action classifier active this number
+  // should drop turn-over-turn as detection clears entries.
   const awaitingLine =
     c.awaiting_revise > 0
-      ? `[vouch-gate] revise backlog: ${c.awaiting_revise} fired entit${c.awaiting_revise === 1 ? "y" : "ies"} from prior turns awaiting revise verification (#50 A Stage 1)\n`
+      ? `[vouch-gate] revise backlog: ${c.awaiting_revise} fired entit${c.awaiting_revise === 1 ? "y" : "ies"} from prior turns awaiting revise verification\n`
       : "";
 
-  // P-γ humility line: ratio of explicit-uncertainty stances (HEDGE +
-  // SPECULATE) to all truth-bearing stances (ASSERT + HEDGE + SPECULATE).
-  // A growing-confident agent has a falling humility rate; a chronically-
-  // hedging agent has a high one. Both are diagnostic signals the user
-  // can use to push back. Rendered only when there's meaningful volume
-  // (≥10 truth-bearing claims) to avoid noisy single-digit ratios.
+  // Humility ratio: explicit-uncertainty stances (HEDGE + SPECULATE) over
+  // all truth-bearing stances (ASSERT + HEDGE + SPECULATE). Diagnostic
+  // signal — falling rate flags drift toward over-confidence, chronically
+  // high rate flags over-hedging. HUMILITY_DISPLAY_MIN_TRUTH avoids
+  // noisy small-N display.
   const truthBearing = c.asserts + c.hedges + c.speculates;
   let humilityLine = "";
-  if (truthBearing >= 10) {
+  if (truthBearing >= HUMILITY_DISPLAY_MIN_TRUTH) {
     const hedged = c.hedges + c.speculates;
     const rate = ((hedged / truthBearing) * 100).toFixed(1);
     humilityLine =
       `[vouch-gate] humility: ${hedged}/${truthBearing} = ${rate}% explicit-uncertainty (${c.asserts} assert / ${c.hedges} hedge / ${c.speculates} speculate)\n`;
   }
 
-  // P-γ.5 blind-spot line: how many gaps the agent surfaced THIS turn.
-  // Always renders when blindSpotsThisTurn is provided so the agent and
-  // the user see a per-turn signal independent of session-level volume.
+  // Per-turn blind-spot count. Always renders when blindSpotsThisTurn
+  // is provided — signal is per-turn, not session-cumulative.
   let blindSpotLine = "";
   if (blindSpotsThisTurn) {
     const total = blindSpotsThisTurn.explicit + blindSpotsThisTurn.phrase;
@@ -3023,24 +3011,27 @@ function formatSessionSummary(
       `[vouch-gate] blind-spots this turn: ${total} enumerated${breakdown}\n`;
   }
 
-  // P-γ Stage 2: per-turn humility advisory. If THIS turn produced ≥3
-  // ASSERT claims AND 0 hedge/speculate AND 0 blind-spots, the agent is
-  // probably over-confident. Advisory only — does not change exit code.
-  // Threshold and message tuned to avoid noisy fires; intent is to give
-  // the user a single line they can push back on.
+  // Over-confidence advisory: ≥ OVER_CONFIDENT_ASSERT_FLOOR confident
+  // ASSERTs this turn AND 0 hedge/speculate stances AND 0 blind-spots
+  // enumerated → emit a single advisory line. Advisory only — exit code
+  // unchanged.
   let overConfidentLine = "";
   if (thisTurnStances && blindSpotsThisTurn) {
     const blindTotal = blindSpotsThisTurn.explicit + blindSpotsThisTurn.phrase;
     const uncertainCount = thisTurnStances.hedges + thisTurnStances.speculates;
-    if (thisTurnStances.asserts >= 3 && uncertainCount === 0 && blindTotal === 0) {
+    if (
+      thisTurnStances.asserts >= OVER_CONFIDENT_ASSERT_FLOOR &&
+      uncertainCount === 0 &&
+      blindTotal === 0
+    ) {
       overConfidentLine =
-        `⚠ [vouch-gate] over-confidence flag (P-γ Stage 2): ${thisTurnStances.asserts} confident ASSERTs this turn with 0 hedges/speculates and 0 blind-spots enumerated. Consider hedging at least one uncertain claim or adding [gap: <specific thing you didn't check>].\n`;
+        `⚠ [vouch-gate] over-confidence flag: ${thisTurnStances.asserts} confident ASSERTs this turn with 0 hedges/speculates and 0 blind-spots enumerated. Consider hedging at least one uncertain claim or adding [gap: <specific thing you didn't check>].\n`;
     }
   }
 
   return (
     `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n` +
-    stage2Lines +
+    reviseCheckLines +
     awaitingLine +
     humilityLine +
     blindSpotLine +
@@ -3172,24 +3163,21 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             : opts.sessionContext
               ? transcriptIdFromPath(opts.sessionContext)
               : null;
-          // P-γ.5: count blind-spot markers in this turn's draft.
+          // Count blind-spot markers in this turn's draft.
           const blindSpotsThisTurn = draft ? countBlindSpots(draft) : { explicit: 0, phrase: 0 };
-          // P-γ Stage 2: count THIS turn's stance distribution for the
-          // per-turn over-confidence flag (separate from session-level
-          // humility ratio).
+          // Count THIS turn's stance distribution for the over-confidence
+          // flag (separate from session-level humility ratio).
           const thisTurnStances = {
             asserts: verdict.pairs.filter((p) => p.stance === "ASSERT").length,
             hedges: verdict.pairs.filter((p) => p.stance === "HEDGE").length,
             speculates: verdict.pairs.filter((p) => p.stance === "SPECULATE").length,
           };
-          // P-α.5: when counter-evidence pull ran but found NOTHING in KB
-          // for any grounded pair this turn, surface a web-counter-search
-          // suggestion. The 44% KB-miss rate from the 2026-05-14 dogfood
-          // baseline says most relevant counter-evidence is NOT in KB —
-          // agent should be prompted to check the web for limitations /
-          // criticism. Renders only when env=1 was set and grounded
-          // ASSERTs existed; suppressed when counter-evidence was found
-          // (the P-α line carries the load there).
+          // Web-counter-evidence suggestion: when the KB counter-check ran
+          // but found nothing for any grounded pair, prompt for a manual
+          // web counter-search. The 44% KB-miss rate on the dogfood
+          // baseline says most relevant counter-evidence isn't in KB.
+          // Suppressed when KB counter-evidence WAS found (the inline
+          // counter-evidence block carries the load there).
           const paEnabled = process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1";
           const groundedAsserts = verdict.pairs.filter(
             (p) => p.stance === "ASSERT" && p.grounded,
@@ -3199,21 +3187,19 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
           );
           const paWebSuggestion =
             paEnabled && groundedAsserts.length > 0 && !anyKbCounter
-              ? `[vouch-gate] P-α: ${groundedAsserts.length} grounded ASSERT(s) this turn cleared KB counter-evidence. KB miss is 44% on the dogfood baseline — consider \`vouch search "<entity> limitations" --provider ddg\` for web counter-check on load-bearing claims.\n`
+              ? `[vouch-gate] ${groundedAsserts.length} grounded ASSERT(s) this turn cleared the KB counter-evidence check with no contradictions found. The KB lacks a counter for ~44% of dodge-fire entities on the latest dogfood baseline — for load-bearing claims, consider \`vouch search "<entity> limitations" --provider ddg\` to check the web for contradicting sources.\n`
               : "";
           const sessionMsg = sessionTid
             ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn, thisTurnStances) + paWebSuggestion
             : paWebSuggestion;
 
-          // #50 (A) Stage 3: opt-in enforcement. When
-          // VOUCH_GATE_ESCALATE_UNADDRESSED=1 AND Stage 2's reviseCheck
-          // reports stillUnaddressed prior-turn fires AND we're in strict
-          // mode, escalate to a block even if THIS turn's draft didn't
-          // independently fire. The forcing function: the agent cannot pass
-          // a turn while leaving the previous fire's entity asserted-but-
-          // ungrounded. Default OFF — Stage 2 advisory is enough for
-          // user-mediated workflows. Opt-in for sessions where the user
-          // is not in the loop.
+          // Opt-in escalation: when VOUCH_GATE_ESCALATE_UNADDRESSED=1 and
+          // the revise-check reports stillUnaddressed prior-turn fires
+          // and we're in strict mode, escalate to a block even if THIS
+          // turn's draft didn't independently fire. Forcing function: an
+          // agent cannot pass a turn while leaving the prior fire's
+          // entity asserted-but-ungrounded. Default OFF — visibility-only
+          // is enough for user-in-loop sessions.
           const escalateOn = process.env.VOUCH_GATE_ESCALATE_UNADDRESSED === "1";
           const escalatedFromUnaddressed =
             escalateOn &&
@@ -3237,7 +3223,7 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             message = formatBlockMessage(verdict, true, draft || "") + deltaMsg + sessionMsg;
             exitCode = 0;
           } else if (escalatedFromUnaddressed && !verdict.blocked) {
-            // Strict-mode Stage 3 escalation: this turn passed its OWN gate
+            // Escalation: this turn passed its OWN gate
             // but a prior turn's fire is still unaddressed. Block with an
             // escalation message that names the lingering entities.
             message = formatEscalatedBlockMessage(verdict, draft || "") + deltaMsg + sessionMsg;
@@ -3343,18 +3329,15 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
       );
       continue;
     }
-    // #50 (E) — inline KB candidates the gate's own grounding step
-    // already considered. Counterfactual hit rate on the 2026-05-14
-    // dogfood baseline is 80% of dodge propositions (vs 0% for the
-    // provider-hint cascade), so this is where the load-bearing
-    // information lives. Render before the `vouch search` suggestion so
-    // the agent sees "re-claim against existing dossier" as the first
-    // option when the KB has anything close.
-    // P-α: surface counter-evidence FIRST when present — it's the strongest
-    // signal that the claim needs work. Even if the agent had confirming
-    // evidence, the counter-evidence forces a reconciliation choice.
+    // Surface counter-evidence FIRST when present — it's the strongest
+    // signal that the claim needs work. Even with confirming evidence, a
+    // strong counter forces a reconciliation choice. Then inline KB
+    // nearest candidates: the gate's own grounding step already considered
+    // these and the agent doesn't need to re-run `vouch search` to find
+    // them. Render before any `vouch search` suggestion so "re-claim
+    // against existing dossier" is offered before "fetch a fresh source".
     if (p.counter_evidence && p.counter_evidence.length > 0) {
-      lines.push(`      ⚠ counter-evidence in KB (P-α: this claim has BOTH supporting AND contradicting prior claims):`);
+      lines.push(`      ⚠ counter-evidence in KB — this claim has BOTH supporting AND contradicting prior claims:`);
       for (const c of p.counter_evidence) {
         const truncatedClaim = c.claim_text.length > 160
           ? c.claim_text.slice(0, 160) + "…"

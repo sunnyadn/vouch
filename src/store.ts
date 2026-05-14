@@ -859,7 +859,10 @@ export function supersedeClaim(oldId: number, newId: number, reason: string): bo
 // Hybrid search — cosine over claims.embedding ∪ dossiers.embedding
 // ---------------------------------------------------------------------------
 
-function cosine(a: Float32Array, b: Float32Array): number {
+/** Dot-product cosine over unit-norm Float32 embeddings. Caller is
+ *  responsible for ensuring inputs are unit-normalized — embedBatch /
+ *  embedOne return unit-norm vectors. */
+export function cosine(a: Float32Array, b: Float32Array): number {
   const n = Math.min(a.length, b.length);
   let dot = 0;
   for (let i = 0; i < n; i++) dot += a[i]! * b[i]!;
