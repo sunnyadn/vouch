@@ -8,9 +8,10 @@
  * (vouch gate always prints prose for the Stop hook.)
  */
 import { Command } from "commander";
-import { mkdirSync, appendFileSync } from "node:fs";
+import { mkdirSync, appendFileSync, readdirSync, statSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import * as store from "./store.ts";
 import { submitClaim, submitClaimBatch } from "./submit.ts";
@@ -864,16 +865,117 @@ program
 program
   .command("session")
   .description("Inspect the per-transcript session-claim ledger")
-  .argument("<subcommand>", 'subcommand: "show"')
-  .argument("<transcriptId>", "transcript_id (basename of the Claude Code transcript file, minus .jsonl)")
-  .option("--include-retracted", "Include retracted rows in the listing")
-  .option("--only-active", "Only show rows that are neither retracted nor superseded")
+  .argument("<subcommand>", 'subcommand: "show" | "status"')
+  .argument("[transcriptId]", "transcript_id (auto-detected from most-recently-modified Claude Code transcript if omitted)")
+  .option("--include-retracted", "Include retracted rows in the listing (show subcommand only)")
+  .option("--only-active", "Only show rows that are neither retracted nor superseded (show subcommand only)")
   .option("--format <fmt>", 'output format: "text" (default) or "json"', "text")
-  .action((subcommand: string, transcriptId: string, opts: any) => {
-    if (subcommand !== "show") {
-      console.error(`unknown session subcommand: ${subcommand} (expected: show)`);
+  .action((subcommand: string, transcriptId: string | undefined, opts: any) => {
+    if (subcommand !== "show" && subcommand !== "status") {
+      console.error(`unknown session subcommand: ${subcommand} (expected: show | status)`);
       process.exit(2);
     }
+    // Auto-detect transcript_id if omitted: most-recently-modified .jsonl
+    // under any of the user's Claude Code project dirs.
+    if (!transcriptId) {
+      try {
+        const root = join(homedir(), ".claude", "projects");
+        const dirs = readdirSync(root);
+        let bestPath: string | null = null;
+        let bestMtime = 0;
+        for (const d of dirs) {
+          const fullDir = join(root, d);
+          let stat: Stats;
+          try {
+            stat = statSync(fullDir);
+          } catch {
+            continue;
+          }
+          if (!stat.isDirectory()) continue;
+          let files: string[];
+          try {
+            files = readdirSync(fullDir);
+          } catch {
+            continue;
+          }
+          for (const f of files) {
+            if (!f.endsWith(".jsonl")) continue;
+            const fullPath = join(fullDir, f);
+            try {
+              const fstat = statSync(fullPath);
+              if (fstat.mtimeMs > bestMtime) {
+                bestMtime = fstat.mtimeMs;
+                bestPath = fullPath;
+              }
+            } catch {}
+          }
+        }
+        if (!bestPath) {
+          console.error("could not auto-detect transcript_id (no .jsonl files under ~/.claude/projects/)");
+          process.exit(2);
+        }
+        transcriptId = basename(bestPath, ".jsonl");
+        console.error(`(auto-detected transcript_id: ${transcriptId})`);
+      } catch (e: any) {
+        console.error(`auto-detect failed: ${e?.message || e}`);
+        process.exit(2);
+      }
+    }
+
+    if (subcommand === "status") {
+      const c = store.getSessionFireCounts(transcriptId);
+      if (c.total === 0) {
+        console.log(`(no session claims for transcript_id ${transcriptId})`);
+        return;
+      }
+      if (opts.format === "json") {
+        const escalate = process.env.VOUCH_GATE_ESCALATE_UNADDRESSED === "1";
+        const counter = process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1";
+        process.stdout.write(JSON.stringify({
+          transcript_id: transcriptId,
+          ...c,
+          truth_bearing: c.asserts + c.hedges + c.speculates,
+          humility_pct: c.asserts + c.hedges + c.speculates > 0
+            ? Number((((c.hedges + c.speculates) / (c.asserts + c.hedges + c.speculates)) * 100).toFixed(1))
+            : null,
+          env: {
+            VOUCH_GATE_ESCALATE_UNADDRESSED: escalate,
+            VOUCH_GATE_COUNTER_EVIDENCE: counter,
+          },
+        }, null, 2) + "\n");
+        return;
+      }
+      // Text format — formatted like the gate's stderr lines but as a
+      // standalone diagnostic.
+      const truth = c.asserts + c.hedges + c.speculates;
+      const hed = c.hedges + c.speculates;
+      const humility = truth > 0 ? `${((hed / truth) * 100).toFixed(1)}%` : "—";
+      const escalate = process.env.VOUCH_GATE_ESCALATE_UNADDRESSED === "1";
+      const counter = process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1";
+      console.log(`Session status: ${transcriptId}`);
+      console.log(``);
+      console.log(`  Total claims seen:   ${c.total}`);
+      console.log(`  Verdict breakdown:`);
+      console.log(`    grounded         ${c.grounded.toString().padStart(4)}`);
+      console.log(`    ungrounded       ${c.ungrounded.toString().padStart(4)}  (fires)`);
+      console.log(`    reclassified     ${c.reclassified.toString().padStart(4)}`);
+      console.log(`    retracted        ${c.retracted.toString().padStart(4)}`);
+      console.log(``);
+      console.log(`  Stance breakdown (truth-bearing):`);
+      console.log(`    ASSERT           ${c.asserts.toString().padStart(4)}`);
+      console.log(`    HEDGE            ${c.hedges.toString().padStart(4)}`);
+      console.log(`    SPECULATE        ${c.speculates.toString().padStart(4)}`);
+      console.log(`    Humility ratio   ${hed}/${truth} = ${humility} explicit-uncertainty`);
+      console.log(``);
+      console.log(`  Revise backlog:      ${c.awaiting_revise}  (fired entities awaiting verification — #50 A Stage 1)`);
+      console.log(``);
+      console.log(`  Strict env state:`);
+      console.log(`    VOUCH_GATE_ESCALATE_UNADDRESSED  ${escalate ? "ON" : "OFF (default)"}`);
+      console.log(`    VOUCH_GATE_COUNTER_EVIDENCE      ${counter ? "ON" : "OFF (default)"}`);
+      return;
+    }
+
+    // subcommand === "show"
     const rows = store.listSessionClaims(transcriptId, {
       include_retracted: !!opts.includeRetracted,
       only_active: !!opts.onlyActive,
