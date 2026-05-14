@@ -13,7 +13,14 @@ bench/phase0/.minicheck_cache/
 bench/phase0/__pycache__/
 *.pyc
 
-# bench/gate-recall — PRIVATE: contains extracts of sunny's own Claude Code conversation
+# bench/gate-recall — PRIVATE: contains extracts of the author's own Claude Code conversation
 # transcripts (corpus/cc-*.md and the frozen_extractions/labels that embed them). Never commit.
 # A publishable benchmark (synthetic-only) gets reconstructed separately.
 bench/gate-recall/
+
+# bench/dogfood — PRIVATE: live dogfooding gate-fire mining. `extract_fires.ts` itself
+# is tracked, but the harvested `fires-*.jsonl` contains user-private session content
+# (drafts + prior-user turns from real Claude Code conversations) and is never
+# committed. A publishable distribution gets reconstructed separately via manual
+# classification of a sanitized subset.
+bench/dogfood/fires-*.jsonl
