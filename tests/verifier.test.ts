@@ -429,6 +429,113 @@ describe("verifyClaim temporal qualifier", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Quote-in-dossier invariant (#49)
+//
+// For supported claims, the stored `source_passage` must be a substring of
+// the dossier's content — NOT the verifier's natural-language reason. This
+// is vouch's anti-fabrication primitive: downstream consumers (gate session
+// autoground, --include-quotes, dogfood precision metric) rely on
+// claim.quote tracing to source content vouch can see.
+// ---------------------------------------------------------------------------
+
+/** Whitespace-normalize for substring check (matches findQuoteInContent's
+ *  "normalized" tier — collapses runs of whitespace, preserves words). */
+function normWs(s: string): string {
+  return s.replace(/\s+/g, " ").trim();
+}
+
+describe("quote-in-dossier invariant (#49)", () => {
+  it("supported claim with --source-quote: stored source_passage is verbatim from dossier", async () => {
+    const content = "GitHub Repository: x/y\nStars: 4\nForks: 0\nLanguage: TypeScript";
+    const slug = store.writeDossier({
+      source_url: "https://github.com/x/y",
+      source_type: "github",
+      verbatim_content: content,
+      captured_at: "2026-05-14T10:00:00Z",
+    });
+
+    // Verifier returns reason that does NOT appear in the dossier — if the bug
+    // were still present, the assertion would catch the reasoning text leaking
+    // into source_passage.
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          supported: true,
+          score: 1.0,
+          reason: "The source mentions stars count of 4 confirming the claim.",
+        },
+      }),
+    );
+
+    const result = await verifier.verifyClaim("x/y has 4 stars", slug, {
+      source_quote: "Stars: 4",
+    });
+    expect(result.status).toBe("supported");
+
+    const stored = store.getClaim(result.claim_id);
+    expect(stored).not.toBeNull();
+    expect(stored!.source_passage).toBe("Stars: 4");
+    // Substring-in-dossier invariant — the stronger general form
+    expect(normWs(content)).toContain(normWs(stored!.source_passage || ""));
+    // And the returned object surfaces the same value (API consistency)
+    expect(result.source_passage).toBe("Stars: 4");
+  });
+
+  it("unsupported claim: source_passage carries verifier reason (no entailing passage to point at)", async () => {
+    const slug = store.writeDossier({
+      source_url: "https://github.com/x/y",
+      source_type: "github",
+      verbatim_content: "GitHub Repository: x/y\nStars: 4",
+      captured_at: "2026-05-14T10:00:00Z",
+    });
+
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: {
+          supported: false,
+          score: 0.1,
+          reason: "source does not mention forks count",
+        },
+      }),
+    );
+
+    const result = await verifier.verifyClaim("x/y has 99 forks", slug, {
+      source_quote: "Stars: 4",
+    });
+    expect(result.status).toBe("unsupported");
+
+    const stored = store.getClaim(result.claim_id);
+    expect(stored!.source_passage).toBe("source does not mention forks count");
+  });
+
+  it("supported via small-dossier fallback (no source_quote): stored quote is the dossier slice NLI saw", async () => {
+    const content = "Concise dossier. Title: foo. Body: foo has property X.";
+    const slug = store.writeDossier({
+      source_url: "https://example.com/foo",
+      source_type: "agent-quote",
+      verbatim_content: content,
+      captured_at: "2026-05-14T10:00:00Z",
+    });
+
+    generateObjectMock.mockImplementation(() =>
+      Promise.resolve({
+        object: { supported: true, score: 0.9, reason: "directly stated" },
+      }),
+    );
+
+    // No source_quote → verifier.ts takes the `content` branch (length ≤ 2*CHUNK_SIZE).
+    const result = await verifier.verifyClaim("foo has property X", slug);
+    expect(result.status).toBe("supported");
+
+    const stored = store.getClaim(result.claim_id);
+    // Stored passage IS the dossier content (the verbatim slice NLI saw),
+    // NOT the verifier's "directly stated" reason.
+    expect(stored!.source_passage).toBe(content);
+    expect(normWs(content)).toContain(normWs(stored!.source_passage || ""));
+  });
+});
+
+// ---------------------------------------------------------------------------
 // verifyClaimAgainstSource whole-claim entailment (#41)
 // ---------------------------------------------------------------------------
 

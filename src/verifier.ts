@@ -478,6 +478,11 @@ export async function verifyClaim(
   // claim for asserting a date not present in the source body.
   const temporal = analyzeTemporalQualifier(claim, dossier);
   let result: VerifyResult;
+  // #49: the verbatim passage NLI saw — distinct from `result.source_passage`,
+  // which currently holds the verifier's natural-language `reason`. We persist
+  // THIS as the claim's quote when the claim is supported, so the
+  // quote-in-dossier invariant holds (claim.quote ⊂ dossier.content).
+  let nliSource: string | null = null;
   if (temporal.mismatchReason) {
     result = {
       status: "unsupported",
@@ -502,6 +507,7 @@ export async function verifyClaim(
     } else {
       source = await retrieveRelevant(content, claim);
     }
+    nliSource = source;
     const claimForNli = temporal.qualifiers.length > 0 ? temporal.strippedClaim : claim;
     result = await verifyClaimAgainstSource(claimForNli, source);
   }
@@ -525,12 +531,21 @@ export async function verifyClaim(
     // Embedding failure is non-fatal — claim still gets stored, just won't be searchable
   }
 
+  // #49: quote-in-dossier invariant. For supported claims, store the verbatim
+  // passage NLI saw (the auto-selected quote OR retrieved chunk — verified to
+  // appear in dossier.content upstream). For unsupported / insufficient /
+  // temporal-mismatch / dossier-not-found, `result.source_passage` carries the
+  // verifier's reason or a diagnostic string, which IS the useful payload
+  // (there is no entailing passage to point at).
+  const storedSourcePassage =
+    result.status === "supported" && nliSource !== null ? nliSource : result.source_passage;
+
   const cid = store.recordClaim({
     dossier_slug: dossierSlug,
     claim_text: claim,
     score: result.score,
     status: result.status,
-    source_passage: result.source_passage,
+    source_passage: storedSourcePassage,
     claim_type: opts.claim_type || "ATOMIC",
     topic: opts.topic ?? null,
     author: opts.author ?? null,
@@ -541,7 +556,7 @@ export async function verifyClaim(
     verification: "nli-quote",
   });
 
-  return { ...result, claim_id: cid };
+  return { ...result, source_passage: storedSourcePassage, claim_id: cid };
 }
 
 // ---------------------------------------------------------------------------

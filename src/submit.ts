@@ -403,12 +403,17 @@ export async function submitClaimBatch(items: BatchSubmissionItem[]): Promise<an
     const attribution = v.attribution || v.dossier?.author_attribution || null;
     const claimEmbedding = allEmbeddings[i] || null;
 
+    // #49: store the verbatim quote NLI saw (already verified to appear in the
+    // dossier upstream via findQuoteInContent), not the verifier's reason. For
+    // unsupported, the verifier reason IS the useful payload.
+    const storedSourcePassage = r.status === "supported" ? v.source_passage : r.source_passage;
+
     const cid = store.recordClaim({
       dossier_slug: v.dossier_slug,
       claim_text: v.text,
       score: r.score,
       status: r.status,
-      source_passage: r.source_passage,
+      source_passage: storedSourcePassage,
       claim_type: "ATOMIC",
       topic: v.topic ?? null,
       author: v.author ?? null,
@@ -421,6 +426,7 @@ export async function submitClaimBatch(items: BatchSubmissionItem[]): Promise<an
 
     out.push({
       ...r,
+      source_passage: storedSourcePassage,
       claim_id: cid,
       dossier_slug: v.dossier_slug,
       quote_match: v.matchType,
