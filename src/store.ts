@@ -109,6 +109,32 @@ function initSchema(db: Database) {
     CREATE INDEX IF NOT EXISTS idx_session_claims_active
       ON session_claims(transcript_id, retracted, superseded_by_turn);
   `);
+  // #50 (A) Stage 1: per-entity revise tracking. When a claim fires
+  // (verdict='ungrounded' on an ASSERT), we set awaiting_revise=1. The
+  // intent is to check, on subsequent turns, whether the agent (a) ran a
+  // verification tool referencing the entity, (b) added an explicit hedge
+  // tag adjacent to it, or (c) removed the entity from any new claim. The
+  // outcome is recorded via addressed_via ∈ {'fetch','hedge','remove',null}
+  // and addressed_in_turn. Stage 1 only writes awaiting_revise; the
+  // detection/clearing logic ships in Stage 2.
+  const sessionCols = db
+    .prepare("PRAGMA table_info(session_claims)")
+    .all() as Array<{ name: string }>;
+  const colNames = new Set(sessionCols.map((c) => c.name));
+  if (!colNames.has("awaiting_revise")) {
+    db.exec("ALTER TABLE session_claims ADD COLUMN awaiting_revise INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!colNames.has("addressed_via")) {
+    db.exec("ALTER TABLE session_claims ADD COLUMN addressed_via TEXT");
+  }
+  if (!colNames.has("addressed_in_turn")) {
+    db.exec("ALTER TABLE session_claims ADD COLUMN addressed_in_turn INTEGER");
+  }
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS idx_session_claims_awaiting
+       ON session_claims(transcript_id, awaiting_revise)
+       WHERE awaiting_revise = 1`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -928,6 +954,11 @@ export interface RecordSessionClaimInput {
   verdict: string;
   reason?: string | null;
   embedding?: Float32Array | null;
+  /** #50 (A) Stage 1: set to 1 when this is a fire (verdict='ungrounded'
+   *  on stance='ASSERT'). Cleared in subsequent turns by detection logic
+   *  (Stage 2 / 3) when the revise satisfies one of: tool-call referencing
+   *  entity / hedge-tag near entity / demonstrable removal. */
+  awaiting_revise?: 0 | 1;
 }
 
 /** Return the next unused turn_idx for this transcript (0 if no rows yet). */
@@ -956,6 +987,7 @@ export function getSessionFireCounts(transcript_id: string): {
   grounded: number;
   reclassified: number;
   retracted: number;
+  awaiting_revise: number;
 } {
   const row = getDb()
     .prepare(
@@ -964,12 +996,20 @@ export function getSessionFireCounts(transcript_id: string): {
          SUM(CASE WHEN verdict = 'ungrounded' THEN 1 ELSE 0 END) AS ungrounded,
          SUM(CASE WHEN verdict = 'grounded' THEN 1 ELSE 0 END) AS grounded,
          SUM(CASE WHEN verdict = 'reclassified' THEN 1 ELSE 0 END) AS reclassified,
-         SUM(CASE WHEN retracted = 1 THEN 1 ELSE 0 END) AS retracted
+         SUM(CASE WHEN retracted = 1 THEN 1 ELSE 0 END) AS retracted,
+         SUM(CASE WHEN awaiting_revise = 1 THEN 1 ELSE 0 END) AS awaiting_revise
        FROM session_claims
        WHERE transcript_id = ?`,
     )
     .get(transcript_id) as
-    | { total: number; ungrounded: number; grounded: number; reclassified: number; retracted: number }
+    | {
+        total: number;
+        ungrounded: number;
+        grounded: number;
+        reclassified: number;
+        retracted: number;
+        awaiting_revise: number;
+      }
     | undefined;
   return {
     total: row?.total ?? 0,
@@ -977,18 +1017,25 @@ export function getSessionFireCounts(transcript_id: string): {
     grounded: row?.grounded ?? 0,
     reclassified: row?.reclassified ?? 0,
     retracted: row?.retracted ?? 0,
+    awaiting_revise: row?.awaiting_revise ?? 0,
   };
 }
 
 export function recordSessionClaim(input: RecordSessionClaimInput): void {
   const ts = new Date().toISOString();
   const embBlob = input.embedding ? embToBlob(input.embedding) : null;
+  // #50 (A) Stage 1: when caller doesn't pass awaiting_revise, derive it —
+  // a fire (verdict='ungrounded' + stance='ASSERT') needs revise tracking.
+  // Other shapes (RETRACT, REFER, WORKSPACE, etc.) don't.
+  const awaiting =
+    input.awaiting_revise ??
+    (input.verdict === "ungrounded" && input.stance === "ASSERT" ? 1 : 0);
   getDb()
     .prepare(
       `INSERT OR REPLACE INTO session_claims
        (transcript_id, turn_idx, claim_idx, proposition, entity, stance, verdict, reason,
-        embedding, ts, superseded_by_turn, superseded_by_claim, retracted)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0)`,
+        embedding, ts, superseded_by_turn, superseded_by_claim, retracted, awaiting_revise)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?)`,
     )
     .run(
       input.transcript_id,
@@ -1001,6 +1048,7 @@ export function recordSessionClaim(input: RecordSessionClaimInput): void {
       input.reason ?? null,
       embBlob,
       ts,
+      awaiting,
     );
 }
 

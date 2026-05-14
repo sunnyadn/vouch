@@ -2528,8 +2528,17 @@ function formatSessionSummary(transcript_id: string): string {
   if (c.reclassified > 0) resolvedNotes.push(`${c.reclassified} reclassified`);
   if (c.retracted > 0) resolvedNotes.push(`${c.retracted} retracted`);
   const resolvedStr = resolvedNotes.length ? ` · ${resolvedNotes.join(" / ")}` : "";
+  // #50 (A) Stage 1: surface the awaiting-revise backlog. This count
+  // climbs whenever a fire happens and only drops when Stage-2/3 detection
+  // logic clears it (or, today, when the row is manually marked addressed).
+  // A growing backlog is the dodge-accumulation signal made visible.
+  const awaitingLine =
+    c.awaiting_revise > 0
+      ? `[vouch-gate] revise backlog: ${c.awaiting_revise} fired entit${c.awaiting_revise === 1 ? "y" : "ies"} from prior turns awaiting revise verification (#50 A Stage 1)\n`
+      : "";
   return (
-    `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n`
+    `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n` +
+    awaitingLine
   );
 }
 
