@@ -47,7 +47,8 @@ Output goes to `bench/dogfood/fires-last<N>d.jsonl` by default. Per-row schema:
   ],
   "draft": "…",                                // assistant text that fired
   "prior_user": "…",                           // user turn that triggered the draft
-  "manual_label": null                         // human-pass classification slot
+  "post_fire_draft": "…",                      // the revise — used to classify shape
+  "manual_label": null                         // filled by classify_fires.ts
 }
 ```
 
@@ -55,17 +56,64 @@ The summary printed to stderr includes per-repo counts and top entities, which
 already exposes some patterns at the bird's-eye level (e.g. high counts on
 workspace-internal entity names = workspace-postfilter coverage gaps).
 
-## Manual classification workflow (TODO)
+## Manual classification — `classify_fires.ts`
 
-The current harness emits 200+ fires in ~14 days of live use. Next steps:
+Keypress TUI that walks unlabeled fires and writes labels to
+`fires-labeled.jsonl` (gitignored, append-only). Re-running picks up where
+you left off (skips rows whose `transcript_id|ts` is already labeled).
 
-1. Build a small CLI (or notebook) that walks rows interactively, prompts
-   true-positive / false-positive / pattern-tag, and writes back to the JSONL.
-2. Aggregate into a frequency table: per-pattern fire count, per-entity-class
-   fire count, fire-by-repo distribution.
-3. Use the high-frequency false-positive patterns as the priority queue for
-   gate refinements; use the true-positive patterns as the "vouch saved me
-   from N hallucinations this week" launch evidence.
+```sh
+./classify_fires.ts                            # default input fires-last14d.jsonl
+./classify_fires.ts --filter-repo redacted-meta   # only fires from this project
+./classify_fires.ts --filter-from 2026-05-13   # only fires after this ISO date
+./classify_fires.ts --stats                    # no TUI, just print metrics
+```
+
+### Label vocabulary (single keystroke)
+
+| key | class              | meaning                                                                                |
+|-----|--------------------|----------------------------------------------------------------------------------------|
+| A   | `verified`         | TP fire. Agent ran `vouch fetch` / `vouch claim` and the revise cites the new dossier. |
+| H   | `hedged`           | TP fire. Agent kept the claim with explicit `(Unverified, from training memory)` tag. |
+| C   | `continued-confab` | TP fire. Agent ignored the fire and repeated the same ungrounded claim.               |
+| D   | `dodge`            | TP fire. Agent silently rephrased to remove the entity, OR argued the fire was FP without verifying. The #50 binding pattern. |
+| F   | `false-positive`   | Fire was wrong (extractor over-fire / workspace-meta misjudge / NLI too strict).      |
+| S   | `skip`             | Defer (ambiguous, multi-claim mixed verdicts, needs more transcript context).         |
+| U   | undo               | Walk the last label back, both in-memory and on disk.                                  |
+| Q   | quit               | Save and exit (progress always saves on every label).                                  |
+
+### Derived metrics (printed on quit / via `--stats`)
+
+```
+gate_lift_rate = (A + H) / (A + H + C + D)
+  Of true-positive fires, fraction that produced grounded or explicit-
+  uncertainty output. Phase 1 bench result claims ~70% under controlled
+  prompts; this measures it in real-world dogfood.
+
+dodge_rate     = D / (A + H + C + D)
+  #50 binding metric — the gap a tighter forcing function must close.
+
+confab_persist = C / TP
+  How often a fire failed to alter agent output.
+
+fp_rate        = F / total
+  Inverse of vouch's gate precision in dogfood corpus.
+```
+
+### Week-over-week measurement loop
+
+The intended cadence:
+
+1. Each weekend, run `extract_fires.ts --days 7` to get the new week's fires.
+2. Run `classify_fires.ts` and label them (target: ≤30min if the week has
+   ~30–50 fires).
+3. Run `--stats` to print the metric row; record it in a tracking file
+   (e.g. `fires-weekly-metrics.csv`, gitignored).
+4. Compare week-over-week. After a gate fix lands, the metric move tells you
+   whether the change actually shifted behavior in the wild.
+
+This is the measurement infrastructure for the #50 forcing-function work and
+the launch claim's "reduces confabulation in agent workflows" assertion.
 
 A sanitized subset (entities + propositions only, no draft content) may be
 publishable as `bench/gate-precision-public/` for a public benchmark — that

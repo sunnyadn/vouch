@@ -9,11 +9,14 @@
  * ungrounded" block), and emits one JSONL row per fire with:
  *
  *   ts, transcript_id, repo (dir basename), git_branch, cwd,
- *   fire_text       — the full gate stderr block (for human classification)
- *   propositions[]  — { entity, proposition, candidates_count, reason }
- *   draft           — the assistant text that fired (preceding assistant turn)
- *   prior_user      — the user turn that preceded the draft (context)
- *   manual_label    — placeholder for human pass (true-positive / false-positive / pattern)
+ *   fire_text         — the full gate stderr block (for human classification)
+ *   propositions[]    — { entity, proposition, candidates_count, reason }
+ *   draft             — the assistant text that fired (preceding assistant turn)
+ *   prior_user        — the user turn that preceded the draft (context)
+ *   post_fire_draft   — the FIRST assistant text turn after the fire = the
+ *                       revise. Needed to classify revise shape per #50:
+ *                       verified / hedged / continued-confab / dodge.
+ *   manual_label      — placeholder for human pass (filled by classify_fires.ts)
  *
  * Output: bench/dogfood/fires-<from>--<to>.jsonl (gitignored — contains
  * user-private session content).
@@ -114,7 +117,10 @@ interface FireRow {
   propositions: ReturnType<typeof parseFireText>;
   draft: string;
   prior_user: string;
-  manual_label: null;
+  /** First assistant text turn AFTER the fire — the revise. Empty if the
+   *  session ended at the fire (rare: harness sometimes truncates). */
+  post_fire_draft: string;
+  manual_label: { class: string; notes?: string } | null;
 }
 
 function extractFromTranscript(path: string): FireRow[] {
@@ -173,6 +179,19 @@ function extractFromTranscript(path: string): FireRow[] {
       }
     }
 
+    // Look forward for the FIRST assistant text turn after the fire — this
+    // is the revise that determines the label class. Cap the search window
+    // to ~50 events (typical revise lands within a handful of turns).
+    let post_fire_draft = "";
+    for (let j = i + 1; j < events.length && j <= i + 50; j++) {
+      const pe = events[j];
+      if (pe?.type !== "assistant") continue;
+      const text = getEventText(pe);
+      if (!text) continue;
+      post_fire_draft = text;
+      break;
+    }
+
     rows.push({
       ts: ev.timestamp || "",
       transcript_id,
@@ -183,6 +202,7 @@ function extractFromTranscript(path: string): FireRow[] {
       propositions,
       draft,
       prior_user,
+      post_fire_draft,
       manual_label: null,
     });
   }
