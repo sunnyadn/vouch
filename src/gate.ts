@@ -73,6 +73,7 @@ import { getLanguageModel } from "./providers.ts";
 import { embedOne } from "./embedder.ts";
 import { classifyError, verifyClaimAgainstSource, verifyClaimsBatch, verifyContradiction } from "./verifier.ts";
 import * as store from "./store.ts";
+import { suggestVerification, renderSuggestionLine } from "./suggest.ts";
 import type { ClaimType } from "./types.ts";
 
 export const DEFAULT_GATE_MODEL =
@@ -2586,10 +2587,10 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             message = msgs.join("");
             exitCode = 0;
           } else if (!opts.strict) {
-            message = formatBlockMessage(verdict, true) + deltaMsg;
+            message = formatBlockMessage(verdict, true, draft || "") + deltaMsg;
             exitCode = 0;
           } else {
-            message = formatBlockMessage(verdict, false) + deltaMsg;
+            message = formatBlockMessage(verdict, false, draft || "") + deltaMsg;
             exitCode = 2;
           }
         }
@@ -2672,7 +2673,7 @@ function formatHarvestMessage(h: HarvestResult): string {
   return out.join("");
 }
 
-function formatBlockMessage(verdict: GateVerdict, advisory: boolean): string {
+function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: string): string {
   const ungrounded = verdict.pairs.filter((p) => !p.grounded);
   const lines: string[] = [];
   for (const p of ungrounded) {
@@ -2687,6 +2688,15 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean): string {
         `      — looks like a session observation (you ran \`${p.hint.uri}\` this session): ` +
           `\`vouch attest --from-session-tool ${p.hint.tool_use_id} --stance observation --claim "${safeProp}"\` to record it`,
       );
+    } else {
+      // #50 (B) — pre-suggest `vouch search "<entity>" [--provider X]`. The
+      // search primitive already does KB-first + web fallback (cli.ts:957);
+      // we just add a `--provider` hint when the RAW DRAFT carries a
+      // structural signal (arxiv id / PMID / DOI). Skip when the session-
+      // observation hint above already supplied a more specific command —
+      // two competing suggestions per entity would be noise.
+      const sug = suggestVerification(p.entity, draft);
+      lines.push(renderSuggestionLine(sug));
     }
   }
   const anySessionChecked = ungrounded.some((p) => (p.session_sources_checked ?? 0) > 0);
