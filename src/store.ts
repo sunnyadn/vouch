@@ -1052,6 +1052,47 @@ export function recordSessionClaim(input: RecordSessionClaimInput): void {
     );
 }
 
+/** List session_claims rows that are flagged awaiting_revise=1 (= fires
+ *  from prior turns that haven't been classified as fetched / hedged /
+ *  removed yet). Sorted oldest-first so the agent can see what's been
+ *  outstanding longest. #50 (A) Stage 2 consumes this. */
+export function listAwaitingReviseClaims(transcript_id: string): SessionClaimRow[] {
+  return (
+    getDb()
+      .prepare(
+        `SELECT * FROM session_claims
+         WHERE transcript_id = ? AND awaiting_revise = 1 AND retracted = 0
+         ORDER BY turn_idx ASC, claim_idx ASC`,
+      )
+      .all(transcript_id) as any[]
+  ).map((r) => {
+    r.embedding = blobToEmb(r.embedding);
+    return r as SessionClaimRow;
+  });
+}
+
+/** Mark a session_claims row as addressed by a subsequent turn's revise.
+ *  via ∈ {'fetch','hedge','remove'} — the classification of how the agent
+ *  resolved the prior fire. Clears awaiting_revise to 0 so it stops
+ *  appearing in the backlog. #50 (A) Stage 2. */
+export function markAddressedAwaiting(
+  transcript_id: string,
+  turn_idx: number,
+  claim_idx: number,
+  via: "fetch" | "hedge" | "remove",
+  addressed_in_turn: number,
+): void {
+  getDb()
+    .prepare(
+      `UPDATE session_claims
+         SET awaiting_revise = 0,
+             addressed_via = ?,
+             addressed_in_turn = ?
+       WHERE transcript_id = ? AND turn_idx = ? AND claim_idx = ?`,
+    )
+    .run(via, addressed_in_turn, transcript_id, turn_idx, claim_idx);
+}
+
 export function getSessionClaim(
   transcript_id: string,
   turn_idx: number,

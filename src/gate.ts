@@ -264,6 +264,15 @@ export interface GateVerdict {
    *  PASSING draft (block-check first; if passing, harvest) and only when there
    *  was something to report. See `harvestDerivedClaims`. */
   harvest?: HarvestResult;
+  /** #50 (A) Stage 2 result: classification of how this turn's draft addressed
+   *  prior-turn fires that were awaiting_revise=1. Per-action counts plus the
+   *  list of entities still un-addressed (= candidate dodge surface). */
+  reviseCheck?: {
+    addressedFetch: number;
+    addressedHedge: number;
+    addressedRemove: number;
+    stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
+  };
   /** True when the watchdog budget was exceeded before all propositions could
    *  be checked. The pairs array contains only the propositions processed so
    *  far; remaining propositions were not checked. */
@@ -1988,6 +1997,102 @@ function entitiesMatch(a: string, b: string): boolean {
   return na.includes(nb) || nb.includes(na);
 }
 
+// ---------------------------------------------------------------------------
+// #50 (A) Stage 2 — detection of revise actions on prior-turn fires.
+//
+// Given a fired-but-unaddressed entity and the current turn's draft +
+// extracted pairs, classify which of the three productive revise shapes
+// (or none) the agent took:
+//   - 'fetch' : agent invoked a verification tool referencing the entity
+//   - 'hedge' : explicit uncertainty tag adjacent to the entity
+//   - 'remove': entity not present in any new extracted proposition this turn
+//   - null    : none of the above → still a dodge (Stage 3 promotes to fire)
+//
+// Detection is deterministic regex + windowed proximity. False positives
+// would mark a real dodge as "addressed" prematurely; false negatives
+// would push a legitimate revise to "still unaddressed." The windows
+// (300 chars) and the explicit token lists are conservative; we lean
+// toward false NEGATIVES (over-flagging dodge) since Stage 2 ships as
+// advisory-only — the user sees the classification and can correct.
+// ---------------------------------------------------------------------------
+
+const TOOL_CALL_RE =
+  /\b(vouch\s+(?:fetch|claim|search|attest)|WebFetch|WebSearch|gh\s+api|gh\s+\w+\s+view|git\s+show|curl\s+-[sLI]?\s|npm\s+view|pip\s+show)\b/gi;
+
+const HEDGE_TAG_RE =
+  /(\((?:un|not\s+)?verified|from\s+(?:training\s+)?memory|haven['']?t\s+verified|not\s+yet\s+(?:verified|checked|grounded)|unsubstantiated|to\s+be\s+verified)/gi;
+
+const PROXIMITY_WINDOW = 300;
+
+/** Find all index positions in `text` where the regex matches, ignoring
+ *  zero-width matches and resetting the regex's lastIndex between calls. */
+function findAllMatchIndices(re: RegExp, text: string): number[] {
+  const indices: number[] = [];
+  if (!text) return indices;
+  const r = new RegExp(re.source, re.flags.includes("g") ? re.flags : re.flags + "g");
+  let m: RegExpExecArray | null;
+  while ((m = r.exec(text)) !== null) {
+    indices.push(m.index);
+    if (m.index === r.lastIndex) r.lastIndex++; // guard zero-width
+  }
+  return indices;
+}
+
+/** True iff `entity` (case- and punct-folded) appears within
+ *  PROXIMITY_WINDOW chars of any anchor in `anchorIndices`. */
+function entityNearAnchor(
+  entity: string,
+  text: string,
+  anchorIndices: number[],
+): boolean {
+  if (!anchorIndices.length) return false;
+  const ent = entity.toLowerCase().trim();
+  if (!ent) return false;
+  const lower = text.toLowerCase();
+  for (const a of anchorIndices) {
+    const start = Math.max(0, a - PROXIMITY_WINDOW);
+    const end = Math.min(text.length, a + PROXIMITY_WINDOW);
+    if (lower.slice(start, end).includes(ent)) return true;
+  }
+  return false;
+}
+
+export type ReviseAction = "fetch" | "hedge" | "remove";
+
+/** Classify how (if at all) the current turn's draft addresses a prior-turn
+ *  fire on `entity`. `currentExtractedPairs` is this turn's extractor output
+ *  (used for 'remove' detection: entity absent from all new propositions). */
+export function classifyReviseAction(
+  entity: string,
+  draft: string,
+  currentExtractedPairs: ExtractedPair[],
+): ReviseAction | null {
+  if (!entity) return null;
+
+  // (a) Tool-call referencing the entity. Most specific path → check first.
+  const toolMatches = findAllMatchIndices(TOOL_CALL_RE, draft);
+  if (toolMatches.length && entityNearAnchor(entity, draft, toolMatches)) {
+    return "fetch";
+  }
+
+  // (b) Hedge tag adjacent to the entity. Acceptable provenance disclosure.
+  const hedgeMatches = findAllMatchIndices(HEDGE_TAG_RE, draft);
+  if (hedgeMatches.length && entityNearAnchor(entity, draft, hedgeMatches)) {
+    return "hedge";
+  }
+
+  // (c) Removal — entity not present in any new extracted proposition this
+  // turn. NOTE: this is the most contested shape — silent removal is the
+  // (4b) dodge per #50. We classify it as 'remove' (action taken) but Stage
+  // 3's enforcement message will explicitly call out silent-rephrase as
+  // dodge-shaped. Stage 2 just records the action class.
+  const entityPresent = currentExtractedPairs.some((p) => entitiesMatch(p.entity, entity));
+  if (!entityPresent) return "remove";
+
+  // Entity reappears in a new claim with no hedge / no tool — unaddressed.
+  return null;
+}
+
 /** Per-turn session-ledger pass:
  *  1. RETRACT-stance pairs in this turn → mark matching prior ledger entries as retracted.
  *  2. For each new ASSERT (or escalated ASSERT) → embed, find cosine candidates, run
@@ -1999,9 +2104,66 @@ export async function applySessionLedger(
   transcriptPath: string,
   pairs: GroundedPair[],
   abortRef?: { aborted: boolean },
-): Promise<{ pairs: GroundedPair[]; contradictionFire: boolean }> {
+  /** Current turn's raw draft text. Required for Stage 2 of #50 (A):
+   *  detection of revise actions (tool-call / hedge-tag / removal) against
+   *  prior-turn fires that are still awaiting_revise=1. Omit and the Stage 2
+   *  pass is skipped (legacy behavior). */
+  draft?: string,
+): Promise<{
+  pairs: GroundedPair[];
+  contradictionFire: boolean;
+  reviseCheck?: {
+    addressedFetch: number;
+    addressedHedge: number;
+    addressedRemove: number;
+    stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
+  };
+}> {
   const transcript_id = transcriptIdFromPath(transcriptPath);
   const turn_idx = store.getNextSessionTurnIdx(transcript_id);
+
+  // ----- 0. #50 (A) Stage 2: detect-and-clear revise actions on prior fires.
+  // Runs BEFORE this turn's pairs are processed, so the awaiting-set reflects
+  // the state going INTO this turn. Results feed an advisory line rendered
+  // in formatSessionSummary.
+  let reviseCheck: {
+    addressedFetch: number;
+    addressedHedge: number;
+    addressedRemove: number;
+    stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
+  } | undefined;
+  if (draft) {
+    const awaiting = store.listAwaitingReviseClaims(transcript_id);
+    if (awaiting.length) {
+      let addressedFetch = 0;
+      let addressedHedge = 0;
+      let addressedRemove = 0;
+      const stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }> = [];
+      for (const row of awaiting) {
+        // Skip entries from THIS same turn (they're being processed now, not
+        // "prior-turn fires"). Compare turn_idx.
+        if (row.turn_idx >= turn_idx) continue;
+        const via = classifyReviseAction(row.entity, draft, pairs);
+        if (via === "fetch") {
+          addressedFetch++;
+          store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "fetch", turn_idx);
+        } else if (via === "hedge") {
+          addressedHedge++;
+          store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "hedge", turn_idx);
+        } else if (via === "remove") {
+          addressedRemove++;
+          store.markAddressedAwaiting(transcript_id, row.turn_idx, row.claim_idx, "remove", turn_idx);
+        } else {
+          stillUnaddressed.push({
+            entity: row.entity,
+            turn_idx: row.turn_idx,
+            proposition: row.proposition,
+          });
+        }
+      }
+      reviseCheck = { addressedFetch, addressedHedge, addressedRemove, stillUnaddressed };
+    }
+  }
 
   // ----- 1. RETRACT-stance pairs in this turn → mark prior matches retracted.
   for (const p of pairs) {
@@ -2111,7 +2273,7 @@ export async function applySessionLedger(
     });
   }
 
-  return { pairs: outPairs, contradictionFire };
+  return { pairs: outPairs, contradictionFire, reviseCheck };
 }
 
 export async function runGate(opts: {
@@ -2132,6 +2294,14 @@ export async function runGate(opts: {
   let classifierError: string | undefined;
   let blocked = false;
   let incomplete = false;
+  let reviseCheck:
+    | {
+        addressedFetch: number;
+        addressedHedge: number;
+        addressedRemove: number;
+        stillUnaddressed: Array<{ entity: string; turn_idx: number; proposition: string }>;
+      }
+    | undefined;
 
   const extracted = opts.extractedPairs !== undefined ? opts.extractedPairs : await extractPairs(opts.draft, opts.model);
   const pairsToCheck = extracted
@@ -2236,8 +2406,10 @@ export async function runGate(opts: {
           opts.sessionTranscriptPath,
           pairs,
           opts.abortRef,
+          opts.draft,
         );
         pairs = ledger.pairs;
+        reviseCheck = ledger.reviseCheck;
       } catch (e) {
         // Ledger errors fail OPEN — never let a session-DB hiccup block.
         classifierError = classifierErrorMessage(e);
@@ -2250,6 +2422,31 @@ export async function runGate(opts: {
   }
   // extracted.length === 0 → nothing to ground → blocked stays false.
 
+  // #50 (A) Stage 2: zero-proposition turns need their own Stage 2 pass —
+  // the standard branch above only runs when pairs.length > 0. The
+  // silent-rephrase dodge (4b) typically produces drafts with NO new
+  // claims, which means "entity not in new pairs" IS the removal signal.
+  // Skip silently if applySessionLedger fails — Stage 2 is advisory.
+  if (
+    !classifierError &&
+    !incomplete &&
+    opts.sessionTranscriptPath &&
+    (extracted?.length ?? 0) === 0 &&
+    !reviseCheck
+  ) {
+    try {
+      const ledger = await applySessionLedger(
+        opts.sessionTranscriptPath,
+        [],
+        opts.abortRef,
+        opts.draft,
+      );
+      reviseCheck = ledger.reviseCheck;
+    } catch {
+      // advisory only
+    }
+  }
+
   // Second pass: a passing draft gets its tagged derived claims harvested.
   const harvest = (!blocked && !incomplete) ? await safeHarvest(opts.draft) : undefined;
 
@@ -2259,6 +2456,7 @@ export async function runGate(opts: {
     ...(classifierError ? { classifier_error: classifierError } : {}),
     ...(harvest ? { harvest } : {}),
     ...(incomplete ? { incomplete: true } : {}),
+    ...(reviseCheck ? { reviseCheck } : {}),
   };
 }
 
@@ -2519,7 +2717,10 @@ function writeGateLog(entry: AuditEntry) {
  *  human/judge pass via classify_fires.ts. This line surfaces the raw
  *  pressure: a fire count that climbs without a matching grounded count
  *  is the dodge-accumulation signal the user can act on. */
-function formatSessionSummary(transcript_id: string): string {
+function formatSessionSummary(
+  transcript_id: string,
+  reviseCheck?: GateVerdict["reviseCheck"],
+): string {
   const c = store.getSessionFireCounts(transcript_id);
   if (c.total === 0) return "";
   const unresolved = c.ungrounded;
@@ -2528,16 +2729,48 @@ function formatSessionSummary(transcript_id: string): string {
   if (c.reclassified > 0) resolvedNotes.push(`${c.reclassified} reclassified`);
   if (c.retracted > 0) resolvedNotes.push(`${c.retracted} retracted`);
   const resolvedStr = resolvedNotes.length ? ` · ${resolvedNotes.join(" / ")}` : "";
-  // #50 (A) Stage 1: surface the awaiting-revise backlog. This count
-  // climbs whenever a fire happens and only drops when Stage-2/3 detection
-  // logic clears it (or, today, when the row is manually marked addressed).
-  // A growing backlog is the dodge-accumulation signal made visible.
+
+  // #50 (A) Stage 2: classify how THIS turn addressed prior-turn fires.
+  // Render two lines: (a) the cleared-this-turn breakdown, (b) the still-
+  // unaddressed list (the candidate dodge surface). Advisory only — no
+  // re-fire yet. Stage 3 promotes (b) to escalated fires.
+  let stage2Lines = "";
+  if (reviseCheck) {
+    const cleared =
+      reviseCheck.addressedFetch + reviseCheck.addressedHedge + reviseCheck.addressedRemove;
+    const clearedParts: string[] = [];
+    if (reviseCheck.addressedFetch > 0) clearedParts.push(`${reviseCheck.addressedFetch} fetch`);
+    if (reviseCheck.addressedHedge > 0) clearedParts.push(`${reviseCheck.addressedHedge} hedge`);
+    if (reviseCheck.addressedRemove > 0) clearedParts.push(`${reviseCheck.addressedRemove} remove`);
+    if (cleared > 0) {
+      stage2Lines +=
+        `[vouch-gate] revise check (#50 A Stage 2): ${cleared} prior fire(s) addressed this turn (${clearedParts.join(" / ")})\n`;
+    }
+    if (reviseCheck.stillUnaddressed.length > 0) {
+      const entityList = reviseCheck.stillUnaddressed
+        .slice(0, 5)
+        .map((u) => `"${u.entity}" (turn ${u.turn_idx})`)
+        .join(", ");
+      const more =
+        reviseCheck.stillUnaddressed.length > 5
+          ? ` + ${reviseCheck.stillUnaddressed.length - 5} more`
+          : "";
+      stage2Lines +=
+        `⚠ [vouch-gate] revise check (#50 A Stage 2): ${reviseCheck.stillUnaddressed.length} prior fire(s) still unaddressed in this turn — ${entityList}${more}\n` +
+        `   (advisory: this revise neither verified, hedged, nor removed these entities — candidate dodge surface)\n`;
+    }
+  }
+
+  // Stage 1 backlog line: total awaiting_revise (counts entries that haven't
+  // been addressed in any later turn). With Stage 2 active, this number
+  // should generally DROP turn-over-turn as detection clears entries.
   const awaitingLine =
     c.awaiting_revise > 0
       ? `[vouch-gate] revise backlog: ${c.awaiting_revise} fired entit${c.awaiting_revise === 1 ? "y" : "ies"} from prior turns awaiting revise verification (#50 A Stage 1)\n`
       : "";
   return (
     `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n` +
+    stage2Lines +
     awaitingLine
   );
 }
@@ -2666,7 +2899,7 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             : opts.sessionContext
               ? transcriptIdFromPath(opts.sessionContext)
               : null;
-          const sessionMsg = sessionTid ? formatSessionSummary(sessionTid) : "";
+          const sessionMsg = sessionTid ? formatSessionSummary(sessionTid, verdict.reviseCheck) : "";
 
           if (!verdict.blocked) {
             const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
