@@ -1,0 +1,33 @@
+[audit] model=gemini-3.1-pro-preview N=30 -> audit-fresh.jsonl
+  [  1/30] 5a67a898 clean-unanswerable        conf=0.95
+  [  2/30] 5a1c8aed clean-unanswerable        conf=1.00
+  [  3/30] 5ad28098 bad-question              conf=0.95
+  [  4/30] 5ad4ea42 clean-unanswerable        conf=1.00
+  [  5/30] 5acfe91c clean-unanswerable        conf=1.00
+  [  6/30] 5ad50516 clean-unanswerable        conf=0.00
+  [  7/30] 5ad25af2 clean-unanswerable        conf=1.00
+  [  8/30] 5a2ec431 clean-unanswerable        conf=0.95
+  [  9/30] 5ad271c2 bad-question              conf=0.00
+  [ 10/30] 5a637878 clean-unanswerable        conf=1.00
+  [ 11/30] 5a5918ff clean-unanswerable        conf=1.00
+  [ 12/30] 5a38b5bc clean-unanswerable        conf=1.00
+  [ 13/30] 5a839654 clean-unanswerable        conf=1.00
+  [ 14/30] 5a3e3907 clean-unanswerable        conf=1.00
+  [ 15/30] 5a6681d1 clean-unanswerable        conf=1.00
+  [ 16/30] 5a6ce416 clean-unanswerable        conf=1.00
+  [ 17/30] 5a0c6d26 clean-unanswerable        conf=1.00
+  [ 18/30] 5a8235a9 clean-unanswerable        conf=1.00
+  [ 19/30] 5ad15676 clean-unanswerable        conf=1.00
+  [ 20/30] 5a668b1d clean-unanswerable        conf=1.00
+  [ 21/30] 5ad03228 clean-unanswerable        conf=1.00
+  [ 22/30] 5ad26257 clean-unanswerable        conf=0.95
+  [ 23/30] 5ad3ae4f clean-unanswerable        conf=1.00
+  [ 24/30] 5ad3ab70 clean-unanswerable        conf=1.00
+  [ 25/30] 5acfa235 clean-unanswerable        conf=1.00
+  [ 26/30] 5ad0403c clean-unanswerable        conf=1.00
+  [ 27/30] 5ad251d6 clean-unanswerable        conf=1.00
+  [ 28/30] 5ad04408 clean-unanswerable        conf=1.00
+  [ 29/30] 5a8933ed passage-contains-answer   conf=0.95
+  [ 30/30] 5a7b103b clean-unanswerable        conf=1.00
+[audit] wrote 30 -> audit-fresh.jsonl
+[audit] counts: {'clean-unanswerable': 27, 'bad-question': 2, 'passage-contains-answer': 1}
