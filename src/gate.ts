@@ -2079,6 +2079,44 @@ interface SessionLedgerOutcome {
 
 /** Heuristic entity-match for RETRACT auto-mark. Entities are loose strings;
  *  do a normalized contains check both ways. */
+// ---------------------------------------------------------------------------
+// P-γ.5: blind-spot enumeration. Agent surfaces explicit gaps in their
+// knowledge per turn — either via the explicit `[gap: ...]` marker or via
+// natural-language patterns we can deterministically detect. Counting these
+// per turn (and per session) gives the user a HUMILITY signal distinct from
+// hedge-tag-on-individual-claim: it asks "did you enumerate what you DON'T
+// know?", not "did you hedge what you DO know?"
+//
+// Two detector layers:
+//   1. Explicit marker:  [gap: <text>] or (gap: <text>) — agent-authored.
+//   2. Natural phrases:  "I didn't check X" / "I haven't verified Y" /
+//                        "I don't know Z" / "I'm not sure about W" /
+//                        "worth checking U" / "I should also look at V"
+//
+// Both are counted; visibility-only in this Stage 1 ship.
+// ---------------------------------------------------------------------------
+
+const GAP_MARKER_RE = /[\[(]gap:\s*([^\])]+)[\])]/gi;
+const GAP_PHRASE_RES: RegExp[] = [
+  /\b(?:i|we)\s+(?:didn['']?t|did\s+not)\s+(?:check|verify|test|measure|run|audit)\b/gi,
+  /\b(?:i|we)\s+(?:haven['']?t|have\s+not)\s+(?:checked|verified|tested|measured|run|audited)\b/gi,
+  /\b(?:i|we)\s+(?:don['']?t|do\s+not)\s+know\s+(?:if|whether|how|why|what|the)\b/gi,
+  /\b(?:i'?m|we'?re|i\s+am|we\s+are)\s+not\s+sure\s+(?:about|if|whether|how)\b/gi,
+  /\b(?:i|we)\s+should\s+(?:also\s+)?(?:check|verify|look\s+at|audit|investigate)\b/gi,
+  /\bworth\s+(?:checking|verifying|investigating|auditing)\b/gi,
+  /\b(?:open|unanswered)\s+question\b/gi,
+];
+
+export function countBlindSpots(draft: string): { explicit: number; phrase: number } {
+  if (!draft) return { explicit: 0, phrase: 0 };
+  const explicit = (draft.match(GAP_MARKER_RE) || []).length;
+  let phrase = 0;
+  for (const re of GAP_PHRASE_RES) {
+    phrase += (draft.match(re) || []).length;
+  }
+  return { explicit, phrase };
+}
+
 function entitiesMatch(a: string, b: string): boolean {
   const na = a.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
   const nb = b.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -2844,6 +2882,7 @@ function formatEscalatedBlockMessage(verdict: GateVerdict, draft: string): strin
 function formatSessionSummary(
   transcript_id: string,
   reviseCheck?: GateVerdict["reviseCheck"],
+  blindSpotsThisTurn?: { explicit: number; phrase: number },
 ): string {
   const c = store.getSessionFireCounts(transcript_id);
   if (c.total === 0) return "";
@@ -2908,11 +2947,26 @@ function formatSessionSummary(
       `[vouch-gate] humility: ${hedged}/${truthBearing} = ${rate}% explicit-uncertainty (${c.asserts} assert / ${c.hedges} hedge / ${c.speculates} speculate)\n`;
   }
 
+  // P-γ.5 blind-spot line: how many gaps the agent surfaced THIS turn.
+  // Always renders when blindSpotsThisTurn is provided so the agent and
+  // the user see a per-turn signal independent of session-level volume.
+  let blindSpotLine = "";
+  if (blindSpotsThisTurn) {
+    const total = blindSpotsThisTurn.explicit + blindSpotsThisTurn.phrase;
+    const breakdown =
+      blindSpotsThisTurn.explicit > 0 || blindSpotsThisTurn.phrase > 0
+        ? ` (${blindSpotsThisTurn.explicit} explicit [gap:] / ${blindSpotsThisTurn.phrase} natural phrase)`
+        : "";
+    blindSpotLine =
+      `[vouch-gate] blind-spots this turn: ${total} enumerated${breakdown}\n`;
+  }
+
   return (
     `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n` +
     stage2Lines +
     awaitingLine +
-    humilityLine
+    humilityLine +
+    blindSpotLine
   );
 }
 
@@ -3040,7 +3094,10 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             : opts.sessionContext
               ? transcriptIdFromPath(opts.sessionContext)
               : null;
-          const sessionMsg = sessionTid ? formatSessionSummary(sessionTid, verdict.reviseCheck) : "";
+          // P-γ.5: count blind-spot markers in this turn's draft for the
+          // session summary line.
+          const blindSpotsThisTurn = draft ? countBlindSpots(draft) : { explicit: 0, phrase: 0 };
+          const sessionMsg = sessionTid ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn) : "";
 
           // #50 (A) Stage 3: opt-in enforcement. When
           // VOUCH_GATE_ESCALATE_UNADDRESSED=1 AND Stage 2's reviseCheck
