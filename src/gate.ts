@@ -2883,6 +2883,7 @@ function formatSessionSummary(
   transcript_id: string,
   reviseCheck?: GateVerdict["reviseCheck"],
   blindSpotsThisTurn?: { explicit: number; phrase: number },
+  thisTurnStances?: { asserts: number; hedges: number; speculates: number },
 ): string {
   const c = store.getSessionFireCounts(transcript_id);
   if (c.total === 0) return "";
@@ -2961,12 +2962,28 @@ function formatSessionSummary(
       `[vouch-gate] blind-spots this turn: ${total} enumerated${breakdown}\n`;
   }
 
+  // P-γ Stage 2: per-turn humility advisory. If THIS turn produced ≥3
+  // ASSERT claims AND 0 hedge/speculate AND 0 blind-spots, the agent is
+  // probably over-confident. Advisory only — does not change exit code.
+  // Threshold and message tuned to avoid noisy fires; intent is to give
+  // the user a single line they can push back on.
+  let overConfidentLine = "";
+  if (thisTurnStances && blindSpotsThisTurn) {
+    const blindTotal = blindSpotsThisTurn.explicit + blindSpotsThisTurn.phrase;
+    const uncertainCount = thisTurnStances.hedges + thisTurnStances.speculates;
+    if (thisTurnStances.asserts >= 3 && uncertainCount === 0 && blindTotal === 0) {
+      overConfidentLine =
+        `⚠ [vouch-gate] over-confidence flag (P-γ Stage 2): ${thisTurnStances.asserts} confident ASSERTs this turn with 0 hedges/speculates and 0 blind-spots enumerated. Consider hedging at least one uncertain claim or adding [gap: <specific thing you didn't check>].\n`;
+    }
+  }
+
   return (
     `[vouch-gate] session so far: ${c.total} claim(s) seen · ${unresolved} fire(s) unresolved${resolvedStr}\n` +
     stage2Lines +
     awaitingLine +
     humilityLine +
-    blindSpotLine
+    blindSpotLine +
+    overConfidentLine
   );
 }
 
@@ -3094,10 +3111,19 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             : opts.sessionContext
               ? transcriptIdFromPath(opts.sessionContext)
               : null;
-          // P-γ.5: count blind-spot markers in this turn's draft for the
-          // session summary line.
+          // P-γ.5: count blind-spot markers in this turn's draft.
           const blindSpotsThisTurn = draft ? countBlindSpots(draft) : { explicit: 0, phrase: 0 };
-          const sessionMsg = sessionTid ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn) : "";
+          // P-γ Stage 2: count THIS turn's stance distribution for the
+          // per-turn over-confidence flag (separate from session-level
+          // humility ratio).
+          const thisTurnStances = {
+            asserts: verdict.pairs.filter((p) => p.stance === "ASSERT").length,
+            hedges: verdict.pairs.filter((p) => p.stance === "HEDGE").length,
+            speculates: verdict.pairs.filter((p) => p.stance === "SPECULATE").length,
+          };
+          const sessionMsg = sessionTid
+            ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn, thisTurnStances)
+            : "";
 
           // #50 (A) Stage 3: opt-in enforcement. When
           // VOUCH_GATE_ESCALATE_UNADDRESSED=1 AND Stage 2's reviseCheck
