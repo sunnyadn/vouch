@@ -254,6 +254,18 @@ export interface GroundedPair extends ExtractedPair {
     nli_reason: string;
     nli_score: number;
   }>;
+  /** P-α counter-evidence pull: KB claims that CONTRADICT this proposition
+   *  (high-confidence verifyContradiction score). Surfaced in the fire
+   *  message even when the pair was otherwise grounded — agent must
+   *  reconcile or hedge. This is the "comprehensiveness" primitive (search
+   *  for counter-evidence, not just confirming evidence). */
+  counter_evidence?: Array<{
+    claim_id: number;
+    claim_text: string;
+    dossier_slug: string | null;
+    contradiction_score: number;
+    contradiction_reason: string;
+  }>;
 }
 
 export interface GateVerdict {
@@ -639,6 +651,11 @@ const WIDER_TOPK = 8;
 const COSINE_SHORTCUT = 0.95;
 const COSINE_SECONDARY = 0.92;
 
+// P-α counter-evidence thresholds (mirror SESSION_CONTRADICTION_*).
+const COUNTER_EVIDENCE_TOPK = 5;
+const COUNTER_EVIDENCE_MIN_COS = 0.55;
+const COUNTER_EVIDENCE_FIRE_SCORE = 0.75;
+
 export async function checkGrounding(
   pair: ExtractedPair,
   topK = 8,
@@ -928,6 +945,79 @@ async function batchGroundAssertions(
     } catch (e) {
       // Transient/system error on the batch — re-throw so runGate can fail-open.
       throw e;
+    }
+  }
+
+  // P-α: counter-evidence pull. For each pair grounded by Phase 1+2, search
+  // the KB for claims that CONTRADICT the proposition. If contradiction
+  // verifier returns high confidence, flip the pair to ungrounded with a
+  // counter_evidence payload. This is the "comprehensiveness" primitive —
+  // confirming evidence alone is insufficient; the gate also tests for
+  // strong opposing claims and forces the agent to reconcile or hedge.
+  //
+  // Opt-in by env var (default off) — same shape as Stage 3 enforcement.
+  // Each grounded pair costs +1 embed + 1 search + up to 3 verifyContradiction
+  // calls. With ~5 grounded pairs/turn and concurrency, overhead is ~5-10s.
+  if (process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1" && !abortRef?.aborted) {
+    const groundedIdx = results.flatMap((p, i) => (p.grounded ? [i] : []));
+    if (groundedIdx.length) {
+      await Promise.all(
+        groundedIdx.map(async (idx) => {
+          if (abortRef?.aborted) return;
+          const pair = results[idx]!;
+          let queryEmb: Float32Array;
+          try {
+            queryEmb = await embedOne(`${pair.entity}. ${pair.proposition}`);
+          } catch {
+            return; // embed failure — skip counter-check for this pair
+          }
+          const hits = store
+            .searchHybrid(queryEmb, COUNTER_EVIDENCE_TOPK)
+            .filter((h) => h.kind === "claim");
+
+          const counter: NonNullable<GroundedPair["counter_evidence"]> = [];
+          for (const h of hits) {
+            if (abortRef?.aborted) break;
+            if (h.id == null) continue;
+            if (h.similarity < COUNTER_EVIDENCE_MIN_COS) continue;
+            const claim = store.getClaim(h.id);
+            if (!claim) continue;
+            if (claim.status !== "supported") continue;
+            if (claim.superseded_by != null) continue;
+            // Don't compare against itself if it's the entailing match.
+            if (claim.id === pair.matched_claim_id) continue;
+            // Filter to claims that share the firing entity (avoid false-
+            // positive contradictions on semantically-nearby but unrelated
+            // claims, same filter (E) uses).
+            if (!sharesPrimaryEntity(pair, claim.claim_text)) continue;
+            try {
+              const verdict = await verifyContradiction(pair.proposition, claim.claim_text);
+              if (verdict.contradicts && verdict.score >= COUNTER_EVIDENCE_FIRE_SCORE) {
+                counter.push({
+                  claim_id: claim.id,
+                  claim_text: claim.claim_text,
+                  dossier_slug: claim.dossier_slug || null,
+                  contradiction_score: verdict.score,
+                  contradiction_reason: verdict.reason,
+                });
+              }
+            } catch {
+              // transient/non-fatal — skip this candidate
+            }
+            if (counter.length >= 2) break; // cap per pair
+          }
+
+          if (counter.length > 0) {
+            results[idx] = {
+              ...pair,
+              grounded: false,
+              reason:
+                `${pair.reason} BUT contradicted by claim ${counter[0]!.claim_id} (score=${counter[0]!.contradiction_score.toFixed(2)}) — counter-evidence requires reconciliation`,
+              counter_evidence: counter,
+            };
+          }
+        }),
+      );
     }
   }
 
@@ -3080,6 +3170,32 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
     // information lives. Render before the `vouch search` suggestion so
     // the agent sees "re-claim against existing dossier" as the first
     // option when the KB has anything close.
+    // P-α: surface counter-evidence FIRST when present — it's the strongest
+    // signal that the claim needs work. Even if the agent had confirming
+    // evidence, the counter-evidence forces a reconciliation choice.
+    if (p.counter_evidence && p.counter_evidence.length > 0) {
+      lines.push(`      ⚠ counter-evidence in KB (P-α: this claim has BOTH supporting AND contradicting prior claims):`);
+      for (const c of p.counter_evidence) {
+        const truncatedClaim = c.claim_text.length > 160
+          ? c.claim_text.slice(0, 160) + "…"
+          : c.claim_text;
+        const dossierLine = c.dossier_slug
+          ? `\n         dossier: ${c.dossier_slug}`
+          : "";
+        lines.push(
+          `        [claim ${c.claim_id}, contra=${c.contradiction_score.toFixed(2)}] "${truncatedClaim}"${dossierLine}\n         why contradicts: ${c.contradiction_reason.slice(0, 200)}`,
+        );
+      }
+      lines.push(
+        `      → reconcile: edit the claim to acknowledge the disagreement (e.g. "X is widely held; Y is the counter-position from <source>")`,
+      );
+      lines.push(
+        `      → or supersede: if the new claim is correct, file with --supersedes ${p.counter_evidence[0]!.claim_id} citing why`,
+      );
+      lines.push(
+        `      → or hedge: "(unverified, sources disagree)" near the entity if you can't decide right now`,
+      );
+    }
     if (p.kb_candidates && p.kb_candidates.length > 0) {
       lines.push(`      KB nearest:`);
       for (const c of p.kb_candidates) {
@@ -3105,10 +3221,10 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
         );
       }
       lines.push(`      → for a fresh source: ${suggestVerification(p.entity, draft)}`);
-    } else {
-      // No KB candidates at all (Phase 1 hybrid search returned nothing
-      // relevant). Fall back to the suggestion-only path — search will
-      // route to web fallback under cli.ts:957's behavior.
+    } else if (!p.counter_evidence?.length) {
+      // No KB candidates AND no counter-evidence. Phase 1 hybrid search
+      // returned nothing relevant. Fall back to the suggestion-only path
+      // — search will route to web fallback under cli.ts:957's behavior.
       lines.push(renderSuggestionLine(suggestVerification(p.entity, draft)));
     }
   }
