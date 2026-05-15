@@ -3,13 +3,25 @@
  * Fires once per user turn (BEFORE the agent drafts), reads the user prompt
  * from the CC hook stdin payload, and injects pre-prompt context.
  *
- * Lookup order, mirroring L5's gate.ts contract (`fetchExaForUngrounded`
- * only fires on `!p.kb_candidates`):
+ * Two orthogonal context streams compose into one additionalContext block:
  *
- *   1. Embed prompt → searchHybrid against existing KB claims + dossiers
- *   2. If best similarity ≥ KB_HIT_THRESHOLD: inject KB matches as context,
- *      do NOT call Exa (avoid redundant fetch + dossier pollution)
- *   3. Else: call Exa, persist new web/exa dossiers, inject those instead
+ *   (a) Prompt-driven sources: KB-first lookup → Exa fallback. Mirrors
+ *       L5's gate.ts contract (`fetchExaForUngrounded` only fires on
+ *       `!p.kb_candidates`):
+ *
+ *         1. Embed prompt → searchHybrid against KB claims + dossiers
+ *         2. If best similarity ≥ KB_HIT_THRESHOLD: inject KB matches,
+ *            do NOT call Exa (avoid redundant fetch + dossier pollution)
+ *         3. Else: call Exa, persist new web/exa dossiers, inject those
+ *
+ *   (b) Session humility nudge: read session_claims ledger via
+ *       transcript_path, compute (HEDGE + SPECULATE) / (ASSERT + HEDGE +
+ *       SPECULATE) for the session-so-far. Surface only when the ratio
+ *       is below the healthy band (default 10%); above-band sessions
+ *       don't need a nudge. Independent of the current prompt — surfaces
+ *       even on heuristic-skipped prompts (the agent's disposition
+ *       carries across turns regardless of whether THIS prompt triggers
+ *       a lookup).
  *
  * Migrated from L5 fire-time path (gate.ts → fetchExaForUngrounded). The L5
  * path remains live in parallel for the 2-week observation window per the
@@ -41,6 +53,13 @@ const MAX_PROMPT_CHARS = 5000;
 const CODE_BLOCK_FRACTION_MAX = 0.5;
 const NUM_RESULTS = 3;
 const EXCERPT_CHARS = 200;
+/** Minimum session-claim count before showing the humility ratio. Below
+ *  this the ratio is noisy small-N (a single hedge in a 2-claim session
+ *  isn't a real signal). Smaller than the gate's display floor of 10
+ *  because pre-prompt nudging is cheap and starts paying off earlier. */
+const HUMILITY_MIN_TRUTH = 3;
+const HUMILITY_TARGET_LOW = 10;
+const HUMILITY_TARGET_HIGH = 25;
 /** Cosine threshold above which we consider the KB to "have" the entity.
  *  Embeddings are l2-normalized so this is dot-product. Picked
  *  conservatively at 0.65 — below this, the embedder is reaching for any
@@ -52,6 +71,7 @@ const KB_TOPK = 3;
 export type UserPromptSubmitInput = {
   prompt?: string;
   session_id?: string;
+  transcript_path?: string;
   hook_event_name?: string;
 };
 
@@ -136,6 +156,50 @@ export function formatKbContext(hits: store.SearchHit[]): string {
   return lines.join("\n");
 }
 
+/** Format the session-so-far humility ratio as a single-line context
+ *  nudge. Renders only when the session has at least HUMILITY_MIN_TRUTH
+ *  truth-bearing claims, and only when the ratio is below the healthy
+ *  target band. Above-target / in-band sessions don't need a nudge;
+ *  emitting one anyway would be noise. */
+export function formatHumilityContext(c: {
+  asserts: number;
+  hedges: number;
+  speculates: number;
+}): string {
+  const truthBearing = c.asserts + c.hedges + c.speculates;
+  if (truthBearing < HUMILITY_MIN_TRUTH) return "";
+  const uncertain = c.hedges + c.speculates;
+  const ratePct = (uncertain / truthBearing) * 100;
+  if (ratePct >= HUMILITY_TARGET_LOW) return "";
+  const rateStr = ratePct.toFixed(1);
+  return (
+    `[vouch context] Session-so-far humility: ${uncertain}/${truthBearing} = ${rateStr}% explicit-uncertainty ` +
+    `(${c.asserts} assert / ${c.hedges} hedge / ${c.speculates} speculate). ` +
+    `Healthy band ${HUMILITY_TARGET_LOW}-${HUMILITY_TARGET_HIGH}%. ` +
+    `Hedge load-bearing claims you can't fully verify, or surface a specific \`[gap: <facet>]\` this turn.`
+  );
+}
+
+/** Read session humility counts from the session_claims ledger. Returns
+ *  zero counts on any read failure or missing transcript_path — caller
+ *  treats that the same as a fresh session (no nudge). */
+export function lookupHumility(transcript_path: string | undefined): {
+  asserts: number;
+  hedges: number;
+  speculates: number;
+} {
+  const empty = { asserts: 0, hedges: 0, speculates: 0 };
+  if (!transcript_path) return empty;
+  try {
+    const transcript_id = transcript_path.split("/").pop()?.replace(/\.jsonl$/, "") || "";
+    if (!transcript_id) return empty;
+    const c = store.getSessionFireCounts(transcript_id);
+    return { asserts: c.asserts, hedges: c.hedges, speculates: c.speculates };
+  } catch {
+    return empty;
+  }
+}
+
 /** KB-first lookup. Embeds the prompt, runs hybrid search, returns hits
  *  above the configured threshold (capped at KB_TOPK). Empty array on any
  *  failure — caller falls through to Exa. */
@@ -151,10 +215,16 @@ export async function lookupKb(prompt: string): Promise<store.SearchHit[]> {
 
 export async function runUserPromptSubmit(input: UserPromptSubmitInput): Promise<UserPromptSubmitOutput> {
   const skip = shouldSkip(input.prompt);
-  if (skip) return {};
+  if (skip) {
+    // Humility nudge is independent of the prompt-driven KB/Exa lookup and
+    // worth surfacing even on skipped prompts — it's about the agent's
+    // session disposition, not the current prompt's content.
+    return wrap(formatHumilityContext(lookupHumility(input.transcript_path)));
+  }
 
   const prompt = input.prompt!.trim();
   const budgetMs = parseInt(process.env.VOUCH_USERPROMPT_BUDGET_MS || "", 10) || DEFAULT_BUDGET_MS;
+  const humilityLine = formatHumilityContext(lookupHumility(input.transcript_path));
 
   // KB-first. The embed call is the cost of the lookup; it's also the cost
   // of writing dossiers, so a populated KB is a free hit-rate boost.
@@ -163,18 +233,22 @@ export async function runUserPromptSubmit(input: UserPromptSubmitInput): Promise
     new Promise<store.SearchHit[]>((resolve) => setTimeout(() => resolve([]), budgetMs)),
   ]);
   if (kbHits.length > 0) {
-    return wrap(formatKbContext(kbHits));
+    return wrap(joinContext(formatKbContext(kbHits), humilityLine));
   }
 
   // KB miss → fall through to Exa. searchWithText fail-opens internally:
   // missing EXA_API_KEY / network error → []. We pass numResults + timeout
   // so Exa can't outlive the outer wall budget.
-  if (!process.env.EXA_API_KEY) return {};
+  if (!process.env.EXA_API_KEY) return wrap(humilityLine);
   const candidates = await Promise.race([
     searchWithText(prompt, { numResults: NUM_RESULTS, timeoutMs: budgetMs }).catch(() => [] as ExaCandidate[]),
     new Promise<ExaCandidate[]>((resolve) => setTimeout(() => resolve([]), budgetMs + 500)),
   ]);
-  return wrap(formatExaContext(candidates));
+  return wrap(joinContext(formatExaContext(candidates), humilityLine));
+}
+
+function joinContext(...blocks: string[]): string {
+  return blocks.filter((b) => b).join("\n\n");
 }
 
 function wrap(additionalContext: string): UserPromptSubmitOutput {

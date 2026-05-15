@@ -19,7 +19,9 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import {
   codeBlockFraction,
   formatExaContext,
+  formatHumilityContext,
   formatKbContext,
+  lookupHumility,
   runUserPromptSubmit,
   shouldSkip,
 } from "../src/userpromptsubmit.ts";
@@ -148,6 +150,61 @@ describe("formatKbContext", () => {
     expect(out).toContain("dossier github/winkjs/wink-nlp");
     expect(out).toContain("sim=0.72");
     expect(out).toContain("winkjs/wink-nlp");
+  });
+});
+
+describe("formatHumilityContext", () => {
+  it("returns empty string when session has fewer than 3 claims (small-N)", () => {
+    expect(formatHumilityContext({ asserts: 0, hedges: 0, speculates: 0 })).toBe("");
+    expect(formatHumilityContext({ asserts: 2, hedges: 0, speculates: 0 })).toBe("");
+  });
+
+  it("returns empty string when ratio is at or above the target band", () => {
+    // 2 hedges / 10 truth-bearing = 20% (in band [10, 25])
+    expect(formatHumilityContext({ asserts: 8, hedges: 2, speculates: 0 })).toBe("");
+    // 30% — above target high
+    expect(formatHumilityContext({ asserts: 7, hedges: 3, speculates: 0 })).toBe("");
+  });
+
+  it("nudges when ratio is below the target low band", () => {
+    // 1 / 50 = 2% — way below
+    const out = formatHumilityContext({ asserts: 49, hedges: 1, speculates: 0 });
+    expect(out).toContain("[vouch context]");
+    expect(out).toContain("Session-so-far humility");
+    expect(out).toContain("1/50 = 2.0%");
+    expect(out).toContain("49 assert / 1 hedge / 0 speculate");
+    expect(out).toContain("Healthy band 10-25%");
+    expect(out).toContain("[gap:");
+  });
+
+  it("nudges at exactly the floor (3 truth-bearing) when below band", () => {
+    // 0 / 3 = 0% — just enough to render
+    const out = formatHumilityContext({ asserts: 3, hedges: 0, speculates: 0 });
+    expect(out).toContain("0/3 = 0.0%");
+  });
+
+  it("respects truth-bearing boundary at 10%", () => {
+    // 1 / 10 = 10% — exactly at floor, should NOT nudge
+    expect(formatHumilityContext({ asserts: 9, hedges: 1, speculates: 0 })).toBe("");
+    // 1 / 11 = 9.09% — just below floor, should nudge
+    const out = formatHumilityContext({ asserts: 10, hedges: 1, speculates: 0 });
+    expect(out).toContain("1/11 = 9.1%");
+  });
+});
+
+describe("lookupHumility", () => {
+  it("returns zero counts on missing transcript_path", () => {
+    expect(lookupHumility(undefined)).toEqual({ asserts: 0, hedges: 0, speculates: 0 });
+    expect(lookupHumility("")).toEqual({ asserts: 0, hedges: 0, speculates: 0 });
+  });
+
+  it("returns zero counts on an unknown transcript_id (fresh session)", () => {
+    // Pointing at a path whose basename won't match any session_claims row.
+    expect(lookupHumility("/tmp/does-not-exist-9f3a2.jsonl")).toEqual({
+      asserts: 0,
+      hedges: 0,
+      speculates: 0,
+    });
   });
 });
 
