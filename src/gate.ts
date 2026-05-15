@@ -79,6 +79,16 @@ import type { ClaimType } from "./types.ts";
 export const DEFAULT_GATE_MODEL =
   process.env.VOUCH_GATE_MODEL || "vertex_ai/gemini-3.1-flash-lite";
 
+// ANSI helpers. Honor https://no-color.org/ via NO_COLOR env. The Stop
+// hook's output is piped to Claude Code, which renders ANSI escapes in
+// its UI; agents reading the feedback see the bold-red entity name as
+// visual focus. Without TTY detection because the pipe context isn't a
+// TTY but the rendering layer still handles escapes — so we default-ON.
+const VOUCH_NO_COLOR = !!process.env.NO_COLOR;
+function boldRed(s: string): string {
+  return VOUCH_NO_COLOR ? s : `\x1b[1;31m${s}\x1b[0m`;
+}
+
 export const STANCES = [
   "ASSERT",
   "OPINION",
@@ -2902,25 +2912,22 @@ function formatEscalatedBlockMessage(verdict: GateVerdict, draft: string): strin
   );
   for (const u of verdict.reviseCheck?.stillUnaddressed ?? []) {
     lines.push(
-      `  • "${u.entity}" (fired turn ${u.turn_idx}): "${u.proposition.slice(0, 200)}"`,
+      `  • ${boldRed(u.entity)} (fired turn ${u.turn_idx}): "${u.proposition.slice(0, 200)}"`,
     );
-    lines.push(`      → suggested: ${suggestVerification(u.entity, draft)}`);
-    lines.push(
-      `      → or hedge: keep the claim with an explicit "(unverified, from training memory)" tag near "${u.entity}"`,
-    );
+    lines.push(`      → ${suggestVerification(u.entity, draft)}`);
   }
   lines.push("");
   lines.push(
-    `To pass this turn, the revise above must contain ONE of the following for EACH listed entity:`,
+    `To pass, the revise must contain ONE of these for EACH entity above (in preference order):`,
   );
   lines.push(
-    `  • A \`vouch fetch <url>\` / \`vouch claim ...\` / \`vouch search ...\` / \`WebFetch\` / \`gh api\` tool call referencing the entity, OR`,
+    `  • verify — \`vouch fetch\` / \`vouch claim\` / \`vouch search\` / \`WebFetch\` / \`gh api\` tool call referencing it`,
   );
   lines.push(
-    `  • An explicit \`(unverified, from training memory)\` (or equivalent) hedge tag adjacent to the entity, OR`,
+    `  • hedge — \`(unverified, from training memory)\` tag adjacent to the entity`,
   );
   lines.push(
-    `  • Demonstrable removal of the entity from the claim (no new proposition mentions it).`,
+    `  • remove — only if the entity is genuinely not load-bearing. Silent delete hides the gap.`,
   );
   lines.push("");
   return lines.join("\n") + "\n";
@@ -3320,7 +3327,7 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
       p.session_sources_checked && p.session_sources_checked > 0
         ? ` — checked ${p.session_sources_checked} session source(s), none entailed`
         : "";
-    lines.push(`  • ${p.entity}: "${p.proposition.slice(0, 200)}" (${p.reason})${checked}`);
+    lines.push(`  • ${boldRed(p.entity)}: "${p.proposition.slice(0, 200)}" (${p.reason})${checked}`);
     if (p.hint) {
       const safeProp = p.proposition.replace(/"/g, '\\"');
       lines.push(
@@ -3406,10 +3413,10 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
     : "";
   const guidance = advisory
     ? ""
-    : `\nBefore answering, ground each claim:\n` +
-      `  • vouch search "<keyword>" — check the KB\n` +
-      `  • vouch fetch <url> — pull the source${fetchHint}\n` +
-      `  • vouch claim "<text>" --type ATOMIC --dossier <slug> --source-quote "..."\n` +
-      `Or hedge explicitly with "(unverified, from training memory)" near the claim.\n`;
+    : `\nVerify; don't delete. The source exists.\n` +
+      `  • vouch search "<entity>"\n` +
+      `  • vouch fetch <url>${fetchHint}\n` +
+      `  • vouch claim "<text>" --dossier <slug>\n` +
+      `If the source contradicts your draft, rephrase. Silent delete hides what you didn't check. Hedge "(unverified, from training memory)" only if no source can verify.\n`;
   return `${header}\n${lines.join("\n")}${agNote}${guidance ? "\n" + guidance : "\n"}`;
 }

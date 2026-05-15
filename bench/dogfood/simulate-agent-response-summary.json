@@ -1,0 +1,69 @@
+{
+  "cases_n": 13,
+  "wall_seconds": 163.222,
+  "llm_calls": 26,
+  "baseline_observed_dogfood": {
+    "remove": 21,
+    "fetch": 2,
+    "hedge": 1,
+    "continue": 0
+  },
+  "v1_suppression_message": {
+    "remove": 2,
+    "hedge": 0,
+    "fetch": 11,
+    "continue": 0
+  },
+  "v2_fetch_driving_message": {
+    "remove": 0,
+    "hedge": 0,
+    "fetch": 13,
+    "continue": 0
+  },
+  "delta_fetch_pp": 15.384615384615385,
+  "delta_remove_pp": -15.384615384615385,
+  "by_source": {
+    "p-alpha-strict": {
+      "v1": {
+        "remove": 2,
+        "hedge": 0,
+        "fetch": 1,
+        "continue": 0
+      },
+      "v2": {
+        "remove": 0,
+        "hedge": 0,
+        "fetch": 3,
+        "continue": 0
+      }
+    },
+    "value-reconcile": {
+      "v1": {
+        "remove": 0,
+        "hedge": 0,
+        "fetch": 5,
+        "continue": 0
+      },
+      "v2": {
+        "remove": 0,
+        "hedge": 0,
+        "fetch": 5,
+        "continue": 0
+      }
+    },
+    "category-mismatch": {
+      "v1": {
+        "remove": 0,
+        "hedge": 0,
+        "fetch": 5,
+        "continue": 0
+      },
+      "v2": {
+        "remove": 0,
+        "hedge": 0,
+        "fetch": 5,
+        "continue": 0
+      }
+    }
+  }
+}
