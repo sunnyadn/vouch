@@ -1,0 +1,30 @@
+{
+  "tally": {
+    "top1_canonical": {
+      "exa": 7,
+      "tavily": 2,
+      "brave": 6
+    },
+    "any_top3_canonical": {
+      "exa": 7,
+      "tavily": 5,
+      "brave": 6
+    },
+    "cases_n": 8,
+    "avg_latency_ms": {
+      "exa": 913,
+      "tavily": 1051,
+      "brave": 598
+    }
+  },
+  "cases": [
+    "compromise",
+    "wink-nlp",
+    "Vertex Gemini 3.1 Pro",
+    "marimo",
+    "KernelSHAP",
+    "fastcmprsk",
+    "FActScore",
+    "Letta"
+  ]
+}

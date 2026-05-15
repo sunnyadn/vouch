@@ -74,6 +74,7 @@ import { embedOne } from "./embedder.ts";
 import { classifyError, verifyClaimAgainstSource, verifyClaimsBatch, verifyContradiction } from "./verifier.ts";
 import * as store from "./store.ts";
 import { suggestVerification, renderSuggestionLine } from "./suggest.ts";
+import { searchWithText, type ExaCandidate } from "./exa.ts";
 import type { ClaimType } from "./types.ts";
 
 export const DEFAULT_GATE_MODEL =
@@ -3215,6 +3216,14 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             (verdict.reviseCheck?.stillUnaddressed.length ?? 0) > 0;
           const effectiveBlocked = verdict.blocked || escalatedFromUnaddressed;
 
+          // Pre-fetch Exa candidates for any ungrounded ASSERT with no
+          // KB candidate. Fail-open (empty Map when EXA_API_KEY unset or
+          // network error). Only worth the call when we're going to emit
+          // a fire message (effectiveBlocked) — skip on advisory-pass.
+          const exaByEntity = effectiveBlocked
+            ? await fetchExaForUngrounded(verdict)
+            : undefined;
+
           if (!effectiveBlocked) {
             const autoGrounded = verdict.pairs.filter((p) => p.auto_grounded);
             const msgs: string[] = [deltaMsg];
@@ -3227,7 +3236,7 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             message = msgs.join("");
             exitCode = 0;
           } else if (!opts.strict) {
-            message = formatBlockMessage(verdict, true, draft || "") + deltaMsg + sessionMsg;
+            message = formatBlockMessage(verdict, true, draft || "", exaByEntity) + deltaMsg + sessionMsg;
             exitCode = 0;
           } else if (escalatedFromUnaddressed && !verdict.blocked) {
             // Escalation: this turn passed its OWN gate
@@ -3236,7 +3245,7 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             message = formatEscalatedBlockMessage(verdict, draft || "") + deltaMsg + sessionMsg;
             exitCode = 2;
           } else {
-            message = formatBlockMessage(verdict, false, draft || "") + deltaMsg + sessionMsg;
+            message = formatBlockMessage(verdict, false, draft || "", exaByEntity) + deltaMsg + sessionMsg;
             exitCode = 2;
           }
         }
@@ -3319,7 +3328,29 @@ function formatHarvestMessage(h: HarvestResult): string {
   return out.join("");
 }
 
-function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: string): string {
+/** Pre-fetch Exa candidates for any ungrounded ASSERT that has no KB
+ *  candidate and no counter-evidence — the case where the agent
+ *  historically silent-deletes because the verify path is too long.
+ *  Inlining the canonical source(s) collapses fetch+rephrase from two
+ *  turns to one (3/8 in dogfood simulation 2026-05-15). Parallel, fail-
+ *  open: missing EXA_API_KEY or network error → empty Map, no fire. */
+async function fetchExaForUngrounded(verdict: GateVerdict): Promise<Map<string, ExaCandidate[]>> {
+  const targets = verdict.pairs.filter(
+    (p) => !p.grounded && !p.auto_grounded && p.stance === "ASSERT" &&
+           (!p.kb_candidates || p.kb_candidates.length === 0) &&
+           (!p.counter_evidence || p.counter_evidence.length === 0)
+  );
+  if (!targets.length) return new Map();
+  const results = await Promise.all(
+    targets.map(async (p) => {
+      const candidates = await searchWithText(p.proposition, { numResults: 3 });
+      return [p.entity, candidates] as const;
+    })
+  );
+  return new Map(results);
+}
+
+function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: string, exaByEntity?: Map<string, ExaCandidate[]>): string {
   const ungrounded = verdict.pairs.filter((p) => !p.grounded);
   const lines: string[] = [];
   for (const p of ungrounded) {
@@ -3393,9 +3424,25 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
       lines.push(`      → for a fresh source: ${suggestVerification(p.entity, draft)}`);
     } else if (!p.counter_evidence?.length) {
       // No KB candidates AND no counter-evidence. Phase 1 hybrid search
-      // returned nothing relevant. Fall back to the suggestion-only path
-      // — search will route to web fallback under cli.ts:957's behavior.
-      lines.push(renderSuggestionLine(suggestVerification(p.entity, draft)));
+      // returned nothing relevant. If Exa results were pre-fetched (via
+      // fetchExaForUngrounded), inline them so the agent sees canonical
+      // source(s) up-front — converts the historical 2-turn (fetch then
+      // rephrase) sequence into a 1-turn rephrase in 3/8 of dogfood
+      // simulation cases (2026-05-15). Without Exa results: fall back to
+      // suggestion-only.
+      const exaCandidates = exaByEntity?.get(p.entity);
+      if (exaCandidates && exaCandidates.length > 0) {
+        lines.push(`      Fresh web sources for ${p.entity}:`);
+        for (let i = 0; i < exaCandidates.length; i++) {
+          const c = exaCandidates[i]!;
+          const excerpt = c.text.slice(0, 250).replace(/\s+/g, " ").trim();
+          lines.push(`        [${i + 1}] ${c.url}`);
+          if (excerpt) lines.push(`            "${excerpt}…"`);
+        }
+        lines.push(`      → reconcile against the source(s) above, or \`vouch fetch <url>\` for the full page`);
+      } else {
+        lines.push(renderSuggestionLine(suggestVerification(p.entity, draft)));
+      }
     }
   }
   const anySessionChecked = ungrounded.some((p) => (p.session_sources_checked ?? 0) > 0);
