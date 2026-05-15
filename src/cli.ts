@@ -21,6 +21,7 @@ import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
 import { DEFAULT_GATE_MODEL, findSessionSourceByToolUseId, getFirstEventTimestamp, readStdinJson, runGateCli } from "./gate.ts";
 import { runUserPromptSubmit, type UserPromptSubmitInput } from "./userpromptsubmit.ts";
+import { findCounterEvidence } from "./counter.ts";
 import { runDoctor } from "./doctor.ts";
 import {
   SEARCH_PROVIDERS,
@@ -1179,6 +1180,47 @@ program
         : {}),
     }));
     process.exit(result.exitCode);
+  });
+
+// ---------- counter (adversarial-probe verb) ----------
+program
+  .command("counter <proposition>")
+  .description(
+    "Probe the KB for claims that CONTRADICT a proposition on the same entity. " +
+      "Same engine the Stop-hook gate uses when VOUCH_GATE_COUNTER_EVIDENCE=1; " +
+      "exposed here so an agent can adversarially check before committing. " +
+      "Returns up to --max-hits counter-claims with contradiction scores and " +
+      "dossier refs. Exit 0 even when no counter found (empty array).",
+  )
+  .requiredOption("--entity <e>", "Named entity to scope the contradiction search (case-insensitive substring match)")
+  .option("--top-k <n>", "KB candidates considered per probe", (v) => parseInt(v, 10), 5)
+  .option("--min-cos <x>", "Minimum cosine similarity to consider a candidate", parseFloat, 0.55)
+  .option("--fire-score <x>", "verifyContradiction score above which a hit qualifies", parseFloat, 0.75)
+  .option("--max-hits <n>", "Stop after this many counter-claims", (v) => parseInt(v, 10), 2)
+  .option("--exclude-claim <id>", "Skip this claim id (e.g., the entailing match in a paired probe)", (v) => parseInt(v, 10))
+  .action(async (proposition: string, opts: any) => {
+    const counters = await findCounterEvidence(proposition, opts.entity, {
+      topK: opts.topK,
+      minCos: opts.minCos,
+      fireScore: opts.fireScore,
+      maxHits: opts.maxHits,
+      excludeClaimId: opts.excludeClaim,
+    });
+    emit(
+      { proposition, entity: opts.entity, counters },
+      (o) =>
+        o.counters.length === 0
+          ? `No contradicting claims found on "${o.entity}".`
+          : `${o.counters.length} counter-claim(s) on "${o.entity}":\n` +
+            o.counters
+              .map(
+                (c: any) =>
+                  `  • [claim ${c.claim_id}, contra=${c.contradiction_score.toFixed(2)}] ${c.claim_text}\n` +
+                  (c.dossier_slug ? `       dossier: ${c.dossier_slug}\n` : "") +
+                  `       why contradicts: ${c.contradiction_reason}`,
+              )
+              .join("\n"),
+    );
   });
 
 // ---------- userpromptsubmit (L3 hook) ----------

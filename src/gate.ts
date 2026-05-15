@@ -72,6 +72,7 @@ import { DB_PATH, MAX_SOURCE_CHARS } from "./config.ts";
 import { getLanguageModel } from "./providers.ts";
 import { embedOne } from "./embedder.ts";
 import { classifyError, verifyClaimAgainstSource, verifyClaimsBatch, verifyContradiction } from "./verifier.ts";
+import { findCounterEvidence, COUNTER_EVIDENCE_MAX_HITS } from "./counter.ts";
 import * as store from "./store.ts";
 import { suggestVerification, renderSuggestionLine } from "./suggest.ts";
 import { searchWithText, type ExaCandidate } from "./exa.ts";
@@ -667,13 +668,6 @@ const WIDER_TOPK = 8;
 const COSINE_SHORTCUT = 0.95;
 const COSINE_SECONDARY = 0.92;
 
-// KB counter-evidence thresholds — mirror SESSION_CONTRADICTION_* so the
-// two contradiction-detection paths (KB-wide vs same-session) stay tuned
-// together.
-const COUNTER_EVIDENCE_TOPK = 5;
-const COUNTER_EVIDENCE_MIN_COS = 0.55;
-const COUNTER_EVIDENCE_FIRE_SCORE = 0.75;
-
 /** Cosine threshold above which a NEW proposition this turn is treated as
  *  semantically the same claim as a prior fired one — used to distinguish
  *  legitimate topic-drop from "entity removed but claim re-asserted in
@@ -981,7 +975,9 @@ async function batchGroundAssertions(
   // evidence alone is insufficient — if a comparably-supported counter-claim
   // exists, flip to ungrounded so the agent must reconcile, supersede, or
   // hedge. Opt-in because each grounded pair adds an embed + search +
-  // up to COUNTER_EVIDENCE_TOPK verifyContradiction calls (~5-10s/turn).
+  // up to TOPK verifyContradiction calls (~5-10s/turn). Implementation in
+  // src/counter.ts so the same pull is reachable as the `vouch counter`
+  // agent-callable CLI verb.
   if (process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1" && !abortRef?.aborted) {
     const groundedIdx = results.flatMap((p, i) => (p.grounded ? [i] : []));
     if (groundedIdx.length) {
@@ -989,48 +985,11 @@ async function batchGroundAssertions(
         groundedIdx.map(async (idx) => {
           if (abortRef?.aborted) return;
           const pair = results[idx]!;
-          let queryEmb: Float32Array;
-          try {
-            queryEmb = await embedOne(`${pair.entity}. ${pair.proposition}`);
-          } catch {
-            return; // embed failure — skip counter-check for this pair
-          }
-          const hits = store
-            .searchHybrid(queryEmb, COUNTER_EVIDENCE_TOPK)
-            .filter((h) => h.kind === "claim");
-
-          const counter: NonNullable<GroundedPair["counter_evidence"]> = [];
-          for (const h of hits) {
-            if (abortRef?.aborted) break;
-            if (h.id == null) continue;
-            if (h.similarity < COUNTER_EVIDENCE_MIN_COS) continue;
-            const claim = store.getClaim(h.id);
-            if (!claim) continue;
-            if (claim.status !== "supported") continue;
-            if (claim.superseded_by != null) continue;
-            // Don't compare against itself if it's the entailing match.
-            if (claim.id === pair.matched_claim_id) continue;
-            // Filter to claims that share the firing entity (avoid false-
-            // positive contradictions on semantically-nearby but unrelated
-            // claims, same filter (E) uses).
-            if (!sharesPrimaryEntity(pair, claim.claim_text)) continue;
-            try {
-              const verdict = await verifyContradiction(pair.proposition, claim.claim_text);
-              if (verdict.contradicts && verdict.score >= COUNTER_EVIDENCE_FIRE_SCORE) {
-                counter.push({
-                  claim_id: claim.id,
-                  claim_text: claim.claim_text,
-                  dossier_slug: claim.dossier_slug || null,
-                  contradiction_score: verdict.score,
-                  contradiction_reason: verdict.reason,
-                });
-              }
-            } catch {
-              // transient/non-fatal — skip this candidate
-            }
-            if (counter.length >= 2) break; // cap per pair
-          }
-
+          const counter = await findCounterEvidence(pair.proposition, pair.entity, {
+            excludeClaimId: pair.matched_claim_id ?? undefined,
+            maxHits: COUNTER_EVIDENCE_MAX_HITS,
+            abortRef,
+          });
           if (counter.length > 0) {
             results[idx] = {
               ...pair,
