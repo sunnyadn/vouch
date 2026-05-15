@@ -24,7 +24,10 @@
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "typescript": "^5.5.0"
+    "compromise": "^14.15.0",
+    "typescript": "^5.5.0",
+    "wink-eng-lite-web-model": "^1.8.1",
+    "wink-nlp": "^2.4.0"
   },
   "peerDependencies": {
     "typescript": "^5.5.0"

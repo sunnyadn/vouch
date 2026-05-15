@@ -1,16 +1,6 @@
 {
-  "_doc": "Category taxonomy for entity-category-mismatch detector. Agent-maintained: any user (human or LLM) extending vouch's comprehensiveness coverage for a new domain should add categories here, not in source. Each top-level key is a canonical category; the value is a list of synonyms (single-word or multi-word, lowercase). Detection: an entity is tagged with category C iff a predicate phrase near the entity contains any synonym for C. Mismatch fires when proposition and KB claim tag the same entity with disjoint category sets. Update via bench/dogfood/discover_taxonomy.ts.",
-  "_version": "1",
-  "_provenance": "Seeded from cross-validation findings on fires-judge-study-P_alpha (2026-05-14): FActScore, follic, Letta, mem0. Domain at seed time: AI/ML benchmark discussion. Expand for other domains.",
-  "categories": {
-    "dataset": ["dataset", "datasets", "benchmark", "benchmarks", "corpus", "corpora", "test set", "evaluation set"],
-    "algorithm": ["algorithm", "algorithms", "method", "methods", "metric", "metrics", "score", "procedure", "approach"],
-    "package": ["package", "packages", "library", "libraries", "module", "modules", "extension", "plugin"],
-    "product": ["product", "products", "tool", "tools", "application", "app", "platform", "service", "saas"],
-    "lab": ["lab", "labs", "company", "companies", "startup", "startups", "organization", "team"],
-    "paper": ["paper", "papers", "publication", "publications", "preprint", "study", "manuscript"],
-    "model": ["model", "models", "llm", "language model", "neural network"],
-    "evaluator": ["evaluator", "evaluators", "judge", "judges", "verifier", "scorer"],
-    "framework": ["framework", "frameworks", "system", "pipeline", "engine"]
-  }
+  "_doc": "Category taxonomy for the entity-category-mismatch comprehensiveness detector. Ships EMPTY by default — users in any domain populate it via bench/dogfood/discover_taxonomy.ts (which extracts candidates from the user's own KB or transcripts) and/or by loading a sample pack from bench/dogfood/taxonomies/. Point a pack at the detector via VOUCH_COMPREHENSIVENESS_TAXONOMY=<path>; otherwise the detector reads this file and (when empty) fires on nothing. The detector + discover are domain-agnostic; the vocabulary is the user's responsibility.",
+  "_version": "2",
+  "_domain": "empty",
+  "categories": {}
 }

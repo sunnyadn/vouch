@@ -1,32 +1,46 @@
 #!/usr/bin/env bun
-// discover_taxonomy.ts — agent-driven taxonomy update for the
+// discover_taxonomy.ts — LLM-based taxonomy discovery for the
 // comprehensiveness category detector.
 //
-// Scans a corpus of texts for "<entity> is a <Y>" / "<entity> ... documented
-// as a <Y>" / "the <Y> <entity>" patterns, extracts the noun head Y, and
-// tallies candidates that DO NOT yet appear in comprehensiveness_taxonomy.json.
+// Scans a corpus of (entity, sentence) pairs, asks the vouch verifier LLM
+// to extract the category-asserting head noun (if any) for each, and
+// proposes additions to the active taxonomy.
 //
-// Output: a JSON proposal block with (candidate_word, frequency, example
-// contexts). An agent (human or LLM) reviews and decides whether to:
+// Output: a JSON proposal block with (candidate, frequency, example
+// sentences, proposed category). An agent reviews and decides:
 //   - add candidate to an existing category synonym list
 //   - create a new top-level category
-//   - decline (noise)
+//   - decline (LLM misread / not a category)
 //
-// Default corpus: bench/dogfood/fires-judge-study-P_alpha.jsonl (propositions
-// + claim texts). Pass --input <path> to scan an arbitrary JSONL where each
-// row has `proposition` and/or `claim_text` strings, or use --kb to scan
-// the vouch KB directly (claim_text from claims table).
+// Why LLM here (not regex): the seed taxonomy work showed regex / shallow
+// NLP misses real category assertions when modifiers / participial clauses
+// / quoted material interrupt the surface pattern. Discover runs
+// infrequently (weekly?) and quality matters more than latency.
+//
+// Default corpus: bench/dogfood/fires-judge-study-P_alpha.jsonl. Pass
+// --kb to scan the vouch KB directly (claim_text from supported claims).
+// --limit N caps the number of LLM calls (default 200; full pass ≈ $0.05).
 
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import { Database } from "bun:sqlite";
+import { generateObject } from "ai";
+import { z } from "zod";
+import { getLanguageModel } from "../../src/providers.ts";
+import { VERIFIER_MODEL } from "../../src/config.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 // Load current taxonomy
-const taxonomyPath = join(HERE, "comprehensiveness_taxonomy.json");
-const taxonomy: { categories: Record<string, string[]> } = JSON.parse(
+const taxonomyEnv = process.env.VOUCH_COMPREHENSIVENESS_TAXONOMY;
+const taxonomyPath = taxonomyEnv
+  ? (taxonomyEnv.startsWith("/") ? taxonomyEnv : join(process.cwd(), taxonomyEnv))
+  : join(HERE, "comprehensiveness_taxonomy.json");
+if (!existsSync(taxonomyPath)) {
+  throw new Error(`Taxonomy not found at ${taxonomyPath}`);
+}
+const taxonomy: { categories: Record<string, string[]>; _domain?: string; _version?: string } = JSON.parse(
   readFileSync(taxonomyPath, "utf8")
 );
 const KNOWN = new Set<string>();
@@ -34,138 +48,156 @@ for (const syns of Object.values(taxonomy.categories)) {
   for (const s of syns) KNOWN.add(s.toLowerCase());
 }
 
-// Stop nouns — words that fit grammatically into "X is a Y" but are
-// almost never category-defining.
-const GENERIC = new Set([
-  "thing", "things", "case", "cases", "example", "examples", "way", "ways",
-  "result", "results", "kind", "type", "types", "instance", "instances",
-  "part", "parts", "version", "versions", "set", "sets", "form", "forms",
-  "feature", "features", "function", "functions", "value", "values",
-  "name", "names", "number", "numbers", "summary", "list", "lists",
-  "side", "sides", "step", "steps", "field", "fields", "process",
-]);
+const args = process.argv.slice(2);
+const useKb = args.includes("--kb");
+const inputIdx = args.indexOf("--input");
+const inputArg = inputIdx !== -1 ? args[inputIdx + 1] : undefined;
+const limitIdx = args.indexOf("--limit");
+const limit = limitIdx !== -1 ? parseInt(args[limitIdx + 1], 10) : 200;
+const concurrencyIdx = args.indexOf("--concurrency");
+const concurrency = concurrencyIdx !== -1 ? parseInt(args[concurrencyIdx + 1], 10) : 5;
 
-// Function words and common modifiers that show up inside captured phrases
-// when the regex over-reaches. These are never category nouns.
-const NOT_A_NOUN = new Set([
-  "for", "the", "that", "with", "and", "or", "from", "into", "onto", "by",
-  "to", "of", "in", "on", "at", "as", "an", "if", "but", "than", "then",
-  "this", "these", "those", "such", "any", "all", "some", "more", "less",
-  "used", "made", "built", "shown", "given", "based", "found",
-  "evaluating", "evaluated", "presented", "presenting", "running",
-  "first", "second", "third", "primary", "secondary", "main", "original",
-  "candidate", "choice", "current", "next", "previous", "final",
-  "true", "false", "valid", "invalid",
-]);
+// ──────────────────────────────────────────────────────────────────────────
+// Collect (entity, sentence) pairs from input
+// ──────────────────────────────────────────────────────────────────────────
 
-const N_RE = /\b([A-Z][\w.-]*|[a-z][\w.-]+)\b[^.;!?]{0,80}?\b(?:is|are|was|were|=)\s+(?:a|an|the|one|that)\s+([a-z][\w-]*(?:\s+[a-z][\w-]+){0,3})/g;
-const PAT_B = /\b([A-Z][\w.-]*|[a-z][\w.-]+)\b[^.;!?]{0,120}?\b(?:documented|described|classified|categorized|labeled|defined|positioned|titled|presented)\s+as\s+(?:a|an|the)\s+([a-z][\w-]*(?:\s+[a-z][\w-]+){0,3})/g;
+type Pair = { entity: string; sentence: string };
+const pairs: Pair[] = [];
+
+if (useKb) {
+  const dbPath = `${process.env.HOME}/.vouch/store.db`;
+  const db = new Database(dbPath, { readonly: true });
+  const rows = db
+    .query("SELECT primary_entity, claim_text FROM claims WHERE verdict = 'supported' AND superseded_by IS NULL")
+    .all() as { primary_entity: string | null; claim_text: string }[];
+  for (const r of rows) {
+    if (!r.primary_entity || !r.claim_text) continue;
+    // One claim may have multiple sentences; the entity is per-claim.
+    for (const sentence of splitSentences(r.claim_text)) {
+      pairs.push({ entity: r.primary_entity, sentence });
+    }
+  }
+  db.close();
+  console.error(`Collected ${pairs.length} (entity, sentence) pairs from KB`);
+} else {
+  const inputPath = inputArg ?? join(HERE, "fires-judge-study-P_alpha.jsonl");
+  const lines = readFileSync(inputPath, "utf8").trim().split("\n");
+  for (const line of lines) {
+    const r = JSON.parse(line) as { entity?: string; proposition?: string; claim_text?: string };
+    if (!r.entity) continue;
+    if (r.proposition) for (const s of splitSentences(r.proposition)) pairs.push({ entity: r.entity, sentence: s });
+    if (r.claim_text) for (const s of splitSentences(r.claim_text)) pairs.push({ entity: r.entity, sentence: s });
+  }
+  console.error(`Collected ${pairs.length} (entity, sentence) pairs from ${inputPath}`);
+}
+
+function splitSentences(text: string): string[] {
+  // Coarse split on .!?  Skip very short fragments.
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 15 && s.length < 400);
+}
+
+// Dedupe + sample
+const seen = new Set<string>();
+const unique: Pair[] = [];
+for (const p of pairs) {
+  const k = `${p.entity}::${p.sentence}`;
+  if (seen.has(k)) continue;
+  seen.add(k);
+  unique.push(p);
+}
+const sampled = unique.slice(0, limit);
+console.error(`Sampling ${sampled.length} / ${unique.length} unique pairs (limit=${limit})`);
+
+// ──────────────────────────────────────────────────────────────────────────
+// LLM extraction
+// ──────────────────────────────────────────────────────────────────────────
+
+const ExtractSchema = z.object({
+  asserts_category: z.boolean().describe(
+    "True iff the sentence asserts what KIND/TYPE/CATEGORY the entity IS (e.g., 'X is a lab/product/dataset/library/paper'). False if the sentence only describes what X does, what X has, who made X, what's true ABOUT X."
+  ),
+  category_word: z.string().nullable().describe(
+    "If asserts_category=true, the single HEAD NOUN that names the category (e.g., 'lab', 'product', 'library'). Use singular, lowercase, no modifiers. null otherwise."
+  ),
+});
+
+async function extractCategory(p: Pair): Promise<string | null> {
+  try {
+    const { object } = await generateObject({
+      model: getLanguageModel(VERIFIER_MODEL),
+      schema: ExtractSchema,
+      prompt: `Sentence: ${p.sentence}\n\nEntity: ${p.entity}\n\nDoes this sentence assert what category/kind/type the entity ${p.entity} IS? If yes, what is the single head noun naming that category?`,
+    });
+    if (!object.asserts_category) return null;
+    const w = object.category_word?.toLowerCase().trim().replace(/[^\w\s-]/g, "");
+    if (!w) return null;
+    return w;
+  } catch (e: any) {
+    console.error(`extraction error on ${p.entity}: ${e.message}`);
+    return null;
+  }
+}
+
+// Run with bounded concurrency
+async function mapLimited<T, R>(items: T[], fn: (item: T) => Promise<R>, conc: number): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let i = 0;
+  await Promise.all(
+    Array.from({ length: conc }, async () => {
+      while (i < items.length) {
+        const idx = i++;
+        results[idx] = await fn(items[idx]);
+      }
+    })
+  );
+  return results;
+}
+
+console.error(`Calling LLM (${VERIFIER_MODEL}) with concurrency=${concurrency}…`);
+const t0 = Date.now();
+const extracted = await mapLimited(sampled, extractCategory, concurrency);
+const wall = (Date.now() - t0) / 1000;
+console.error(`LLM extraction done in ${wall.toFixed(1)}s`);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Aggregate candidates
+// ──────────────────────────────────────────────────────────────────────────
 
 type Candidate = {
   word: string;
   frequency: number;
-  example_contexts: string[];
-  proposed_category: string | null; // null = needs new top-level category
+  example_contexts: { entity: string; sentence: string }[];
+  proposed_category: string | null;
 };
 
-const counts = new Map<string, { count: number; examples: string[] }>();
-
-function harvestFromText(text: string): void {
-  // Pattern A: "X is/are a Y"
-  for (const m of text.matchAll(N_RE)) {
-    const phrase = m[2].toLowerCase();
-    harvestWordsFromPhrase(phrase, text, m.index ?? 0);
-  }
-  // Pattern B: "X documented as a Y"
-  for (const m of text.matchAll(PAT_B)) {
-    const phrase = m[2].toLowerCase();
-    harvestWordsFromPhrase(phrase, text, m.index ?? 0);
-  }
-}
-
-function harvestWordsFromPhrase(phrase: string, fullText: string, hitIndex: number): void {
-  // Take the HEAD noun: last word of the phrase (and an optional second-to-last
-  // for multi-word noun heads like "language model"). Drop modifiers entirely.
-  const wordList = phrase
-    .split(/\s+/)
-    .map(w => w.toLowerCase().replace(/^[^\w]+|[^\w]+$/g, ""))
-    .filter(Boolean);
-  if (!wordList.length) return;
-  const head = wordList[wordList.length - 1];
-  const candidates = [head];
-  if (wordList.length >= 2) {
-    const bigram = `${wordList[wordList.length - 2]} ${head}`;
-    candidates.push(bigram);
-  }
-
-  for (const cand of candidates) {
-    if (cand.length < 3) continue;
-    if (cand.split(" ").every(w => NOT_A_NOUN.has(w))) continue;
-    const lastWord = cand.split(" ").pop()!;
-    if (NOT_A_NOUN.has(lastWord)) continue; // head must be a noun
-    if (KNOWN.has(cand)) continue;
-    if (GENERIC.has(cand)) continue;
-    if (/^\d/.test(cand)) continue;
-    const start = Math.max(0, hitIndex - 20);
-    const end = Math.min(fullText.length, hitIndex + 120);
-    const ctx = fullText.slice(start, end).replace(/\s+/g, " ").trim();
-    if (!counts.has(cand)) counts.set(cand, { count: 0, examples: [] });
-    const entry = counts.get(cand)!;
-    entry.count++;
-    if (entry.examples.length < 3 && !entry.examples.some(e => e.includes(ctx.slice(0, 60)))) {
-      entry.examples.push(ctx);
-    }
-  }
+const counts = new Map<string, { count: number; examples: { entity: string; sentence: string }[] }>();
+for (let i = 0; i < sampled.length; i++) {
+  const word = extracted[i];
+  if (!word) continue;
+  if (KNOWN.has(word)) continue; // already in taxonomy
+  if (!counts.has(word)) counts.set(word, { count: 0, examples: [] });
+  const entry = counts.get(word)!;
+  entry.count++;
+  if (entry.examples.length < 3) entry.examples.push(sampled[i]);
 }
 
 function proposeCategory(word: string): string | null {
-  // Lightweight clustering: substring / morphological similarity to any
-  // existing synonym. Falls through to null = "needs new category".
   for (const [cat, syns] of Object.entries(taxonomy.categories)) {
     for (const s of syns) {
       const sLower = s.toLowerCase();
       if (word === sLower + "s" || word + "s" === sLower) return cat;
-      if (word.endsWith(sLower) || sLower.endsWith(word)) return cat;
-      if (Math.abs(word.length - sLower.length) <= 2) {
-        const shared = [...word].filter(c => sLower.includes(c)).length;
-        if (shared >= Math.min(word.length, sLower.length) - 1) return cat;
+      if (word.includes(sLower) || sLower.includes(word)) {
+        if (Math.abs(word.length - sLower.length) <= 3) return cat;
       }
     }
   }
   return null;
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Input sources
-// ──────────────────────────────────────────────────────────────────────────
-
-const args = process.argv.slice(2);
-const useKb = args.includes("--kb");
-const inputArg = args[args.indexOf("--input") + 1];
-
-if (useKb) {
-  // Scan vouch KB claims directly
-  const dbPath = `${process.env.HOME}/.vouch/store.db`;
-  const db = new Database(dbPath, { readonly: true });
-  const rows = db
-    .query("SELECT claim_text FROM claims WHERE verdict = 'supported' AND superseded_by IS NULL")
-    .all() as { claim_text: string }[];
-  console.error(`Scanning ${rows.length} supported KB claims…`);
-  for (const r of rows) if (r.claim_text) harvestFromText(r.claim_text);
-  db.close();
-} else {
-  const inputPath = inputArg ?? join(HERE, "fires-judge-study-P_alpha.jsonl");
-  console.error(`Scanning ${inputPath}…`);
-  const lines = readFileSync(inputPath, "utf8").trim().split("\n");
-  for (const line of lines) {
-    const r = JSON.parse(line) as { proposition?: string; claim_text?: string };
-    if (r.proposition) harvestFromText(r.proposition);
-    if (r.claim_text) harvestFromText(r.claim_text);
-  }
-}
-
-// Filter: minimum frequency 2 (drop hapax legomena)
-const MIN_FREQ = 2;
+const MIN_FREQ = 1; // LLM is high-precision; even singletons worth surfacing
 const candidates: Candidate[] = [...counts.entries()]
   .filter(([_, v]) => v.count >= MIN_FREQ)
   .map(([word, v]) => ({
@@ -179,9 +211,13 @@ const candidates: Candidate[] = [...counts.entries()]
 const proposal = {
   detector: "category-mismatch",
   taxonomy_source: taxonomyPath,
-  taxonomy_version: (taxonomy as Record<string, unknown>)._version ?? "?",
+  taxonomy_domain: taxonomy._domain ?? "?",
+  taxonomy_version: taxonomy._version ?? "?",
+  extractor: VERIFIER_MODEL,
   input_source: useKb ? "vouch KB" : (inputArg ?? "fires-judge-study-P_alpha.jsonl"),
-  min_frequency: MIN_FREQ,
+  sample_size: sampled.length,
+  total_unique: unique.length,
+  wall_seconds: wall,
   candidates_count: candidates.length,
   candidates,
 };

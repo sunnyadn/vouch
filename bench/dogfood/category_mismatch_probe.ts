@@ -1,25 +1,27 @@
 #!/usr/bin/env bun
-// category_mismatch_probe.ts — entity-category-mismatch detector
-// (NLI-free, regex over a user/agent-maintained taxonomy).
+// category_mismatch_probe.ts — entity-category-mismatch detector.
 //
 // Detects pairs where prop and KB claim assert different category-type
 // predicates about the same entity ("X is a [dataset/package/product]"
 // vs KB-attested "X is an [algorithm/lab/...]").
 //
-// Implements the ComprehensivenessDetector interface (defined inline,
-// shared shape across detectors in this directory). Loads its taxonomy
-// from comprehensiveness_taxonomy.json — that file is the agent-
-// maintained source of truth, not hardcoded here.
+// Implements the ComprehensivenessDetector interface. Uses the
+// `compromise` NLP library for noun-phrase extraction (head noun after
+// copula / documented-as). Loads taxonomy from a JSON file pointed to
+// by $VOUCH_COMPREHENSIVENESS_TAXONOMY, or falls back to the main
+// comprehensiveness_taxonomy.json in this dir (which ships EMPTY —
+// users supply vocabulary by either loading a sample pack from
+// taxonomies/ or running discover_taxonomy.ts on their own KB).
 
-import { readFileSync, writeFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
+import nlp from "compromise";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 // ──────────────────────────────────────────────────────────────────────────
-// Detector interface (inline; will be extracted to a shared module when
-// the second detector also adopts it).
+// Detector interface
 // ──────────────────────────────────────────────────────────────────────────
 
 type DetectionInput = {
@@ -41,20 +43,22 @@ interface ComprehensivenessDetector {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Config: taxonomy from JSON. User handle from env (no user-private
-// literals in source — same pattern src/gate.ts §rule-1 uses).
+// Taxonomy loading: env-pointable, default empty
 // ──────────────────────────────────────────────────────────────────────────
 
-const taxonomyPath = join(HERE, "comprehensiveness_taxonomy.json");
-const taxonomy: { categories: Record<string, string[]> } = JSON.parse(
+const taxonomyEnv = process.env.VOUCH_COMPREHENSIVENESS_TAXONOMY;
+const taxonomyPath = taxonomyEnv
+  ? (taxonomyEnv.startsWith("/") ? taxonomyEnv : join(process.cwd(), taxonomyEnv))
+  : join(HERE, "comprehensiveness_taxonomy.json");
+if (!existsSync(taxonomyPath)) {
+  throw new Error(`Taxonomy not found at ${taxonomyPath}. Set VOUCH_COMPREHENSIVENESS_TAXONOMY or use the default empty taxonomy.`);
+}
+const taxonomy: { categories: Record<string, string[]>; _domain?: string; _version?: string } = JSON.parse(
   readFileSync(taxonomyPath, "utf8")
 );
 const CATEGORIES = taxonomy.categories;
 
-const USER_HANDLE_RAW = process.env.VOUCH_GATE_USER_HANDLE ?? "";
-const USER_POSSESSIVE = USER_HANDLE_RAW ? `${USER_HANDLE_RAW.toLowerCase()}'s` : null;
-
-// Reverse map word → canonical category
+// Reverse map: word → canonical category
 const WORD_TO_CAT: Record<string, string> = {};
 for (const [cat, syns] of Object.entries(CATEGORIES)) {
   for (const s of syns) {
@@ -69,81 +73,71 @@ for (const [cat, syns] of Object.entries(CATEGORIES)) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Detector impl
+// Noun extraction via compromise
 // ──────────────────────────────────────────────────────────────────────────
 
-function detectCategoryAssertions(text: string, entity: string): Set<string> {
+function extractCategoryAssertions(text: string, entity: string): Set<string> {
   const out = new Set<string>();
-  const lower = text.toLowerCase();
-  const entityLower = entity.toLowerCase();
+  if (Object.keys(CATEGORIES).length === 0) return out; // empty taxonomy → no fires
 
-  const WORD = "[\\w./-]+";
-  const SEP = "[^;!?]"; // allow . inside (file extensions, decimals)
-  // Possessive determiner group — built from env-derived handle plus
-  // generic determiners. No user-private literal in source.
-  const possessiveOpts = ["a", "an", "the", "one", "that", "its"];
-  if (USER_POSSESSIVE) possessiveOpts.push(escapeRegex(USER_POSSESSIVE));
-  const DET = `(?:${possessiveOpts.join("|")})?`;
+  const doc = nlp(text);
 
-  // Pattern A: "<entity>... is/are/= [det] <noun-phrase>"
-  const patA = new RegExp(
-    `\\b${escapeRegex(entityLower)}\\b${SEP}{0,80}?\\b(?:is|are|=|stands\\s+for|refers\\s+to|represents)\\b\\s+${DET}\\s*(${WORD}(?:\\s+${WORD}){0,7})`,
-    "gi"
-  );
-  for (const m of lower.matchAll(patA)) {
-    addCatsFromPhrase(m[1], out);
-  }
+  // Pattern A: "<entity> is/are/was/were/= [det] <NP>"
+  const copulaMatch = doc.match(`(${entity}) (is|are|was|were|=)`);
+  copulaMatch.forEach((m: any) => {
+    const after = m.after();
+    if (!after || after.length === 0) return;
+    // Take the first noun phrase compromise identifies after the copula.
+    // compromise's .nouns() returns noun phrases as chunks; head = last word.
+    const nps = after.nouns().out("array") as string[];
+    if (nps.length === 0) return;
+    addCatsFromPhrase(nps[0].toLowerCase(), out);
+  });
 
-  // Pattern B: "<entity>... documented/described/classified as [det] <category>"
-  const patB = new RegExp(
-    `\\b${escapeRegex(entityLower)}\\b${SEP}{0,120}?\\b(?:documented|described|classified|categorized|labeled|defined|positioned|titled|presented)\\s+as\\s+${DET}\\s*(${WORD}(?:\\s+${WORD}){0,7})`,
-    "gi"
-  );
-  for (const m of lower.matchAll(patB)) {
-    addCatsFromPhrase(m[1], out);
-  }
+  // Pattern B: "<entity> ... documented/described/classified/titled as [det] <NP>"
+  const verbMatch = doc.match(`(${entity}) .* (documented|described|classified|categorized|labeled|titled|presented) as`);
+  verbMatch.forEach((m: any) => {
+    const after = m.after();
+    if (!after || after.length === 0) return;
+    const nps = after.nouns().out("array") as string[];
+    if (nps.length === 0) return;
+    addCatsFromPhrase(nps[0].toLowerCase(), out);
+  });
 
-  // Pattern C: "<det> <category> <entity>" — appositive form
-  // The user-possessive form is included via DET_REQ only when env handle
-  // is set; otherwise this drops to generic determiners only.
-  const possessiveC = USER_POSSESSIVE
-    ? `(?:a|an|the|this|that|${escapeRegex(USER_POSSESSIVE)}|its|our)`
-    : `(?:a|an|the|this|that|its|our)`;
+  // Pattern C: appositive — "the/a/an [adj]? <category> <entity>"
   for (const cat of Object.keys(CATEGORIES)) {
     for (const syn of CATEGORIES[cat]) {
       const synLower = syn.toLowerCase();
-      const patC = new RegExp(
-        `\\b${possessiveC}\\s+(?:[\\w-]+\\s+){0,2}${escapeRegex(synLower)}\\s+(?:called\\s+|named\\s+)?${escapeRegex(entityLower)}\\b`,
-        "i"
-      );
-      if (patC.test(lower)) out.add(cat);
+      // "the R package follic" / "an AI lab building..."
+      const apMatch = doc.match(`(the|a|an|this|that|its|our) (#Adjective|#Noun)? ${synLower.replace(/ /g, " ")} ${entity}`);
+      if (apMatch.found) out.add(cat);
     }
   }
 
   return out;
 }
 
-function escapeRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function addCatsFromPhrase(phrase: string, out: Set<string>): void {
+  // Multi-word first (full phrase substring check)
   for (const mw of MULTI_WORD) {
-    if (phrase.includes(mw.phrase)) out.add(mw.cat);
+    if (phrase.includes(mw.phrase)) {
+      out.add(mw.cat);
+      return; // multi-word hit dominates
+    }
   }
-  for (const rawWord of phrase.split(/\s+/)) {
-    const word = rawWord.toLowerCase().replace(/^[^\w]+|[^\w]+$/g, "");
-    if (!word) continue;
-    const cat = WORD_TO_CAT[word];
-    if (cat) out.add(cat);
+  // Head noun = last token, stripped of punctuation
+  const tokens = phrase.split(/\s+/).map(w => w.replace(/[^\w]/g, ""));
+  const head = tokens[tokens.length - 1];
+  if (head && WORD_TO_CAT[head]) {
+    out.add(WORD_TO_CAT[head]);
   }
 }
 
 export const CategoryMismatchDetector: ComprehensivenessDetector = {
   name: "category-mismatch",
   detect(input: DetectionInput): DetectionFire | null {
-    const propCats = detectCategoryAssertions(input.proposition, input.entity);
-    const claimCats = detectCategoryAssertions(input.claim_text, input.entity);
+    const propCats = extractCategoryAssertions(input.proposition, input.entity);
+    const claimCats = extractCategoryAssertions(input.claim_text, input.entity);
     if (!propCats.size || !claimCats.size) return null;
     const overlap = [...propCats].some(c => claimCats.has(c));
     if (overlap) return null;
@@ -156,7 +150,7 @@ export const CategoryMismatchDetector: ComprehensivenessDetector = {
 };
 
 // ──────────────────────────────────────────────────────────────────────────
-// Standalone CLI: run over fires-judge-study-P_alpha.jsonl
+// Standalone CLI
 // ──────────────────────────────────────────────────────────────────────────
 
 if (import.meta.path === Bun.main) {
@@ -187,8 +181,8 @@ if (import.meta.path === Bun.main) {
     const r: Row = JSON.parse(line);
     total++;
     const fire = CategoryMismatchDetector.detect(r);
-    const propHasCats = detectCategoryAssertions(r.proposition, r.entity).size > 0;
-    const claimHasCats = detectCategoryAssertions(r.claim_text, r.entity).size > 0;
+    const propHasCats = extractCategoryAssertions(r.proposition, r.entity).size > 0;
+    const claimHasCats = extractCategoryAssertions(r.claim_text, r.entity).size > 0;
     if (propHasCats && claimHasCats) withCategory++;
     if (fire) {
       fires.push({
@@ -205,9 +199,10 @@ if (import.meta.path === Bun.main) {
 
   const summary = {
     detector: CategoryMismatchDetector.name,
+    taxonomy_path: taxonomyPath,
+    taxonomy_domain: taxonomy._domain ?? "?",
     taxonomy_categories: Object.keys(CATEGORIES).length,
-    taxonomy_version: (taxonomy as Record<string, unknown>)._version ?? "?",
-    user_handle_from_env: USER_HANDLE_RAW || "<unset>",
+    extractor: "compromise@14",
     total_pairs: total,
     pairs_with_category_assertion_both_sides: withCategory,
     fires: fires.length,
