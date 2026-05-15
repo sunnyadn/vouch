@@ -77,8 +77,6 @@ import { safeHarvest, type HarvestResult } from "./harvest.ts";
 import * as store from "./store.ts";
 import { suggestVerification, renderSuggestionLine } from "./suggest.ts";
 import { searchWithText, type ExaCandidate } from "./exa.ts";
-import type { ClaimType } from "./types.ts";
-
 export const DEFAULT_GATE_MODEL =
   process.env.VOUCH_GATE_MODEL || "vertex_ai/gemini-3.1-flash-lite";
 
@@ -2782,26 +2780,9 @@ export async function runGateCli(opts: GateRunOptions): Promise<GateRunResult & 
             hedges: verdict.pairs.filter((p) => p.stance === "HEDGE").length,
             speculates: verdict.pairs.filter((p) => p.stance === "SPECULATE").length,
           };
-          // Web-counter-evidence suggestion: when the KB counter-check ran
-          // but found nothing for any grounded pair, prompt for a manual
-          // web counter-search. The 44% KB-miss rate on the dogfood
-          // baseline says most relevant counter-evidence isn't in KB.
-          // Suppressed when KB counter-evidence WAS found (the inline
-          // counter-evidence block carries the load there).
-          const paEnabled = process.env.VOUCH_GATE_COUNTER_EVIDENCE === "1";
-          const groundedAsserts = verdict.pairs.filter(
-            (p) => p.stance === "ASSERT" && p.grounded,
-          );
-          const anyKbCounter = verdict.pairs.some(
-            (p) => (p.counter_evidence?.length ?? 0) > 0,
-          );
-          const paWebSuggestion =
-            paEnabled && groundedAsserts.length > 0 && !anyKbCounter
-              ? `[vouch-gate] ${groundedAsserts.length} grounded ASSERT(s) this turn cleared the KB counter-evidence check with no contradictions found. The KB lacks a counter for ~44% of dodge-fire entities on the latest dogfood baseline — for load-bearing claims, consider \`vouch search "<entity> limitations" --provider ddg\` to check the web for contradicting sources.\n`
-              : "";
           const sessionMsg = sessionTid
-            ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn, thisTurnStances) + paWebSuggestion
-            : paWebSuggestion;
+            ? formatSessionSummary(sessionTid, verdict.reviseCheck, blindSpotsThisTurn, thisTurnStances)
+            : "";
 
           // Opt-in escalation: when VOUCH_GATE_ESCALATE_UNADDRESSED=1 and
           // the revise-check reports stillUnaddressed prior-turn fires
@@ -3060,12 +3041,14 @@ function formatBlockMessage(verdict: GateVerdict, advisory: boolean, draft: stri
   const fetchHint = anySessionChecked
     ? ` — for a WebFetch result that didn't entail, \`vouch fetch <url>\` pulls the raw page (WebFetch returns model-extracted text)`
     : "";
+  // Per-fire writing guidance ("verify; don't delete", hedge phrasing) is
+  // owned by skills/vouch/SKILL.md rules #1-#3 now. The fire message keeps
+  // only the concrete operational bullets — the per-claim payload above
+  // already names what's wrong; the next-step verbs go in the footer.
   const guidance = advisory
     ? ""
-    : `\nVerify; don't delete. The source exists.\n` +
-      `  • vouch search "<entity>"\n` +
+    : `\n  • vouch search "<entity>"\n` +
       `  • vouch fetch <url>${fetchHint}\n` +
-      `  • vouch claim "<text>" --dossier <slug>\n` +
-      `If the source contradicts your draft, rephrase. Silent delete hides what you didn't check. Hedge "(unverified, from training memory)" only if no source can verify.\n`;
+      `  • vouch claim "<text>" --dossier <slug>\n`;
   return `${header}\n${lines.join("\n")}${agNote}${guidance ? "\n" + guidance : "\n"}`;
 }
