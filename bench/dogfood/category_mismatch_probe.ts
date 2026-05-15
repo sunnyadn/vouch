@@ -5,18 +5,24 @@
 // predicates about the same entity ("X is a [dataset/package/product]"
 // vs KB-attested "X is an [algorithm/lab/...]").
 //
-// Implements the ComprehensivenessDetector interface. Uses the
-// `compromise` NLP library for noun-phrase extraction (head noun after
-// copula / documented-as). Loads taxonomy from a JSON file pointed to
-// by $VOUCH_COMPREHENSIVENESS_TAXONOMY, or falls back to the main
-// comprehensiveness_taxonomy.json in this dir (which ships EMPTY —
-// users supply vocabulary by either loading a sample pack from
-// taxonomies/ or running discover_taxonomy.ts on their own KB).
+// Implements the ComprehensivenessDetector interface. The default
+// extractor is LLM-based (vouch verifier, Gemini 3.1 Pro) — highest
+// accuracy on participle clauses, quote interruptions, distant heads
+// that shallow NLP misses. Falls back to compromise@14 (180KB, ~5ms/
+// case) when VOUCH_CATEGORY_EXTRACTOR=compromise is set — useful for
+// gate-time hot path where ~1.5s/case LLM latency is too expensive.
+//
+// Loads taxonomy from $VOUCH_COMPREHENSIVENESS_TAXONOMY (path) or falls
+// back to comprehensiveness_taxonomy.json in this dir (ships EMPTY).
 
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 import nlp from "compromise";
+import { generateObject } from "ai";
+import { z } from "zod";
+import { getLanguageModel } from "../../src/providers.ts";
+import { VERIFIER_MODEL } from "../../src/config.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -39,11 +45,11 @@ type DetectionFire = {
 
 interface ComprehensivenessDetector {
   name: string;
-  detect(input: DetectionInput): DetectionFire | null;
+  detect(input: DetectionInput): DetectionFire | Promise<DetectionFire | null> | null;
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Taxonomy loading: env-pointable, default empty
+// Taxonomy loading
 // ──────────────────────────────────────────────────────────────────────────
 
 const taxonomyEnv = process.env.VOUCH_COMPREHENSIVENESS_TAXONOMY;
@@ -51,7 +57,7 @@ const taxonomyPath = taxonomyEnv
   ? (taxonomyEnv.startsWith("/") ? taxonomyEnv : join(process.cwd(), taxonomyEnv))
   : join(HERE, "comprehensiveness_taxonomy.json");
 if (!existsSync(taxonomyPath)) {
-  throw new Error(`Taxonomy not found at ${taxonomyPath}. Set VOUCH_COMPREHENSIVENESS_TAXONOMY or use the default empty taxonomy.`);
+  throw new Error(`Taxonomy not found at ${taxonomyPath}`);
 }
 const taxonomy: { categories: Record<string, string[]>; _domain?: string; _version?: string } = JSON.parse(
   readFileSync(taxonomyPath, "utf8")
@@ -73,28 +79,23 @@ for (const [cat, syns] of Object.entries(CATEGORIES)) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────
-// Noun extraction via compromise
+// Extractor (a): compromise-based — fast, ~5ms/case, 5/8 on bakeoff
 // ──────────────────────────────────────────────────────────────────────────
 
-function extractCategoryAssertions(text: string, entity: string): Set<string> {
+function extractWithCompromise(text: string, entity: string): Set<string> {
   const out = new Set<string>();
-  if (Object.keys(CATEGORIES).length === 0) return out; // empty taxonomy → no fires
-
+  if (Object.keys(CATEGORIES).length === 0) return out;
   const doc = nlp(text);
 
-  // Pattern A: "<entity> is/are/was/were/= [det] <NP>"
   const copulaMatch = doc.match(`(${entity}) (is|are|was|were|=)`);
   copulaMatch.forEach((m: any) => {
     const after = m.after();
     if (!after || after.length === 0) return;
-    // Take the first noun phrase compromise identifies after the copula.
-    // compromise's .nouns() returns noun phrases as chunks; head = last word.
     const nps = after.nouns().out("array") as string[];
     if (nps.length === 0) return;
     addCatsFromPhrase(nps[0].toLowerCase(), out);
   });
 
-  // Pattern B: "<entity> ... documented/described/classified/titled as [det] <NP>"
   const verbMatch = doc.match(`(${entity}) .* (documented|described|classified|categorized|labeled|titled|presented) as`);
   verbMatch.forEach((m: any) => {
     const after = m.after();
@@ -104,40 +105,90 @@ function extractCategoryAssertions(text: string, entity: string): Set<string> {
     addCatsFromPhrase(nps[0].toLowerCase(), out);
   });
 
-  // Pattern C: appositive — "the/a/an [adj]? <category> <entity>"
-  for (const cat of Object.keys(CATEGORIES)) {
-    for (const syn of CATEGORIES[cat]) {
-      const synLower = syn.toLowerCase();
-      // "the R package follic" / "an AI lab building..."
-      const apMatch = doc.match(`(the|a|an|this|that|its|our) (#Adjective|#Noun)? ${synLower.replace(/ /g, " ")} ${entity}`);
-      if (apMatch.found) out.add(cat);
-    }
-  }
-
   return out;
 }
 
 function addCatsFromPhrase(phrase: string, out: Set<string>): void {
-  // Multi-word first (full phrase substring check)
   for (const mw of MULTI_WORD) {
     if (phrase.includes(mw.phrase)) {
       out.add(mw.cat);
-      return; // multi-word hit dominates
+      return;
     }
   }
-  // Head noun = last token, stripped of punctuation
   const tokens = phrase.split(/\s+/).map(w => w.replace(/[^\w]/g, ""));
   const head = tokens[tokens.length - 1];
-  if (head && WORD_TO_CAT[head]) {
-    out.add(WORD_TO_CAT[head]);
+  if (head && WORD_TO_CAT[head]) out.add(WORD_TO_CAT[head]);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Extractor (b): LLM-based — accurate, ~1.5s/case, 6-8/8 on bakeoff
+// Cache by (entity, text) since the corpus has many repeated propositions.
+// ──────────────────────────────────────────────────────────────────────────
+
+const ExtractSchema = z.object({
+  asserts_category: z.boolean().describe(
+    "True iff the sentence asserts what KIND/TYPE/CATEGORY the entity IS (e.g., 'X is a lab/product/dataset/library/paper'). False if the sentence only describes what X does/has, or who made X."
+  ),
+  category_word: z.string().nullable().describe(
+    "If asserts_category=true, the single HEAD NOUN naming that category (singular, lowercase, no modifiers). null otherwise."
+  ),
+});
+
+const llmCache = new Map<string, string | null>();
+
+async function extractWithLlm(text: string, entity: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (Object.keys(CATEGORIES).length === 0) return out;
+
+  const cacheKey = `${entity}::${text}`;
+  let word: string | null;
+  if (llmCache.has(cacheKey)) {
+    word = llmCache.get(cacheKey) ?? null;
+  } else {
+    try {
+      const { object } = await generateObject({
+        model: getLanguageModel(VERIFIER_MODEL),
+        schema: ExtractSchema,
+        prompt: `Sentence: ${text}\n\nEntity: ${entity}\n\nDoes this sentence assert what category/kind/type the entity ${entity} IS? If yes, what is the single head noun naming that category?`,
+      });
+      word = object.asserts_category
+        ? (object.category_word?.toLowerCase().trim().replace(/[^\w\s-]/g, "") || null)
+        : null;
+    } catch (e: any) {
+      console.error(`LLM extract error on ${entity}: ${e.message}`);
+      word = null;
+    }
+    llmCache.set(cacheKey, word);
   }
+
+  if (!word) return out;
+  // Map LLM-extracted word to a canonical category in the taxonomy.
+  // Direct lookup first; if not in vocabulary, the user's taxonomy
+  // doesn't cover this concept yet → don't fire on it. The discover
+  // tool surfaces these as candidates for taxonomy expansion.
+  if (WORD_TO_CAT[word]) out.add(WORD_TO_CAT[word]);
+  else for (const mw of MULTI_WORD) if (word.includes(mw.phrase) || mw.phrase.includes(word)) out.add(mw.cat);
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Detector (dispatch on env var)
+// ──────────────────────────────────────────────────────────────────────────
+
+const EXTRACTOR = (process.env.VOUCH_CATEGORY_EXTRACTOR ?? "llm").toLowerCase();
+if (EXTRACTOR !== "llm" && EXTRACTOR !== "compromise") {
+  throw new Error(`Invalid VOUCH_CATEGORY_EXTRACTOR=${EXTRACTOR}; expected 'llm' or 'compromise'`);
+}
+
+async function extract(text: string, entity: string): Promise<Set<string>> {
+  return EXTRACTOR === "llm" ? extractWithLlm(text, entity) : Promise.resolve(extractWithCompromise(text, entity));
 }
 
 export const CategoryMismatchDetector: ComprehensivenessDetector = {
   name: "category-mismatch",
-  detect(input: DetectionInput): DetectionFire | null {
-    const propCats = extractCategoryAssertions(input.proposition, input.entity);
-    const claimCats = extractCategoryAssertions(input.claim_text, input.entity);
+  async detect(input: DetectionInput): Promise<DetectionFire | null> {
+    const propCats = await extract(input.proposition, input.entity);
+    const claimCats = await extract(input.claim_text, input.entity);
     if (!propCats.size || !claimCats.size) return null;
     const overlap = [...propCats].some(c => claimCats.has(c));
     if (overlap) return null;
@@ -177,32 +228,52 @@ if (import.meta.path === Bun.main) {
   let withCategory = 0;
   const fires: Fire[] = [];
 
-  for (const line of lines) {
-    const r: Row = JSON.parse(line);
-    total++;
-    const fire = CategoryMismatchDetector.detect(r);
-    const propHasCats = extractCategoryAssertions(r.proposition, r.entity).size > 0;
-    const claimHasCats = extractCategoryAssertions(r.claim_text, r.entity).size > 0;
-    if (propHasCats && claimHasCats) withCategory++;
-    if (fire) {
-      fires.push({
-        ...fire,
-        entity: r.entity,
-        entity_class: r.entity_class,
-        proposition: r.proposition,
-        claim_text: r.claim_text,
-        strict: r.strict.fires,
-        broad: r.broad.fires,
-      });
-    }
-  }
+  const t0 = Date.now();
+
+  // Concurrency-bounded
+  const concurrency = parseInt(process.env.CONCURRENCY ?? "5", 10);
+  let i = 0;
+  const rows = lines.map(l => JSON.parse(l) as Row);
+  total = rows.length;
+
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (i < rows.length) {
+        const idx = i++;
+        const r = rows[idx];
+        const fire = await CategoryMismatchDetector.detect(r);
+        const propHasCats = (await extract(r.proposition, r.entity)).size > 0;
+        const claimHasCats = (await extract(r.claim_text, r.entity)).size > 0;
+        if (propHasCats && claimHasCats) withCategory++;
+        if (fire) {
+          fires.push({
+            ...(fire as DetectionFire),
+            entity: r.entity,
+            entity_class: r.entity_class,
+            proposition: r.proposition,
+            claim_text: r.claim_text,
+            strict: r.strict.fires,
+            broad: r.broad.fires,
+          });
+        }
+        if (idx % 25 === 0 && EXTRACTOR === "llm") {
+          console.error(`  [${idx}/${rows.length}] fires=${fires.length} cache=${llmCache.size}`);
+        }
+      }
+    })
+  );
+
+  const wall = (Date.now() - t0) / 1000;
 
   const summary = {
     detector: CategoryMismatchDetector.name,
+    extractor: EXTRACTOR,
+    extractor_model: EXTRACTOR === "llm" ? VERIFIER_MODEL : "compromise@14",
     taxonomy_path: taxonomyPath,
     taxonomy_domain: taxonomy._domain ?? "?",
     taxonomy_categories: Object.keys(CATEGORIES).length,
-    extractor: "compromise@14",
+    wall_seconds: wall,
+    llm_calls: EXTRACTOR === "llm" ? llmCache.size : 0,
     total_pairs: total,
     pairs_with_category_assertion_both_sides: withCategory,
     fires: fires.length,
