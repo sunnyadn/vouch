@@ -1,0 +1,12 @@
+{
+  "name": "vouch",
+  "description": "Fetch-Before-Claim verifier and persistent claim KB for source-traceable factual writing.",
+  "version": "0.3.0",
+  "author": {
+    "name": "Sunny Yang",
+    "email": "sunnyadn1130@gmail.com"
+  },
+  "homepage": "https://github.com/sunnyadn/vouch",
+  "repository": "https://github.com/sunnyadn/vouch",
+  "license": "MIT"
+}
