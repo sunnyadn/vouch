@@ -47,6 +47,90 @@ manual `--source-quote` — its stripped text diverges from vouch's and breaks
 the quote check (`--source-quote` is optional anyway; omit it and vouch
 auto-selects from the dossier).
 
+## Baked rules — read every turn
+
+These are the canonical L2 contract. The rest of the doc is reference.
+
+1. **Verify or hedge before asserting about a named external entity.** A
+   library, paper, person, framework, tool — anything with a proper noun
+   that the user could look up. Run `vouch search` (KB first) and/or
+   `vouch fetch <url>` (web) before stating a fact about it. If you can't
+   or won't fetch, hedge: `(unverified, from training memory)`. The Stop
+   gate blocks ungrounded ASSERTs.
+
+2. **A real hedge names the uncertainty.** "I think" / "probably" / "might"
+   / `(unverified)` / `(unverified, sources disagree)` / `(unverified, from
+   training memory)` all count — they propagate to the user. Hedging
+   privately in your head while the prose reads as a flat assertion does
+   NOT count: "X is the leading framework" is still an ASSERT even if you
+   meant it as a guess.
+
+3. **Verify; don't delete.** When the gate fires on an ungrounded claim,
+   the productive responses are *verify* (fetch + claim against a real
+   source) or *hedge* (mark the uncertainty). Silent delete — rewriting
+   the draft to remove the entity so the gate stops firing — hides what
+   you didn't check. If you genuinely must drop an entity (no source
+   exists, claim isn't load-bearing), say so explicitly: "Removed the
+   claim about X — couldn't find a current source for it." The
+   `session_claims` ledger tracks `awaiting_revise`; silent-remove +
+   same-shape re-assert on the next turn flags as still-unaddressed.
+
+4. **Surface what you didn't check, before the user finds it.** Use
+   `[gap: <specific facet>]` markers proactively. Healthy humility ratio
+   per turn is roughly 10–25% HEDGE/SPECULATE among truth-bearing
+   propositions; 0 hedges and 0 gaps across 3+ ASSERTs is over-confidence
+   by omission. The Stop gate reports the running ratio after every turn.
+
+5. **`[gap:]` markers must be specific and real.** "I didn't check whether
+   X supports Y on version Z" beats "I didn't check minor things". Vacuous
+   gaps to game the blind-spot counter are an anti-pattern — the gate
+   flags them and the user sees through them anyway. 0 honest gaps beats
+   3 fake ones.
+
+6. **For claims about the user's working repo or vouch's own internals,
+   attest — don't claim.** Use `vouch attest --from-session-tool
+   <tool_use_id>` to file workspace observations (something you read with
+   `Read`/`cat`/`Glob`/`Grep`). `vouch claim` is for third-party sources
+   fetched via `vouch fetch`. Treating the workspace as a third-party
+   source corrupts the trust boundary; the gate's `workspace-classify`
+   pass will flag it.
+
+7. **For derived claims, tag in-prose; don't run `vouch claim --type
+   INFERENCE` by hand.** Tag the segment `[inference-from: <id1>, <id2>]`
+   / `[synthesis-of: …]` / `[interpretation: …]` / `[hypothesis]` and the
+   gate harvests on a passing draft. The segment is filed verbatim as
+   `claim_text` — write it self-contained, no bare "this" / "the above" /
+   "it" back-references.
+
+8. **`[inference-from:]` / `[synthesis-of:]` only when scenario-anchored or
+   paper-derived.** Scenario-anchored = directly answers the user's
+   specific question, every step deduces from verified atomic claims.
+   Paper-derived = paraphrases an inference the paper authors wrote
+   themselves. Free-form "interesting connection" between unrelated claims
+   is `[hypothesis]`, not inference. The gate doesn't catch this — you do.
+
+9. **Counter-evidence (P-α) requires reconcile, supersede, or
+   explicit-disagreement hedge.** When the gate surfaces a contradicting
+   KB claim, pick one: (a) edit as `[synthesis-of: <support>, <contra>]`
+   acknowledging both; (b) `vouch supersede <old> <new> --reason "<why>"`
+   if the new claim is right; (c) `(unverified, sources disagree)` next to
+   the entity if you can't resolve now. Silent-rephrase to dodge the fire
+   is flagged on the next turn.
+
+10. **Cite, don't fabricate.** `claim_id`s come from `vouch list-claims` /
+    `vouch search` / gate output — don't invent them. Don't tag
+    `[verified: <id>]` for things you derived without fetching. Don't
+    auto-supersede other agents' claims without strong justification.
+
+## Pre-prompt context (`[vouch L3]`)
+
+Before you draft, vouch may inject a `[vouch L3]` block listing pre-fetched
+KB matches or fresh web sources relevant to the user's prompt. Treat it as
+free verification candy: prefer citing those (`vouch claim "<quote>"
+--dossier <slug>`) over refetching the same entity. If the L3 block shows
+KB matches, you don't need to `vouch search` for those entities — the
+match list already is the search result.
+
 ## Commands
 
 ```bash

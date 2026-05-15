@@ -16,7 +16,7 @@ logic belongs elsewhere, (d) setting LOC red lines per layer.
 | # | Layer | Vehicle | Job | LOC cap |
 |---|---|---|---|---|
 | L1 | Training | export `session_claims` as training corpus | shape disposition; out of scope for runtime but vouch can produce the data | n/a |
-| L2 | Agent system prompt | plugin's own `CLAUDE.md` fragment | encode `"before asserting about external named entity, verify; track your own humility ratio; name what you didn't check"` as baked rules every turn | ≤ 200 lines of rules |
+| L2 | Agent system prompt | plugin's `skills/vouch/SKILL.md` (see [Amendment, 2026-05-15](#amendment-2026-05-15-l2-vehicle-is-the-skill-not-claudemd)) | encode `"before asserting about external named entity, verify; track your own humility ratio; name what you didn't check"` as baked rules every turn | ≤ 200 lines of rules |
 | L3 | Pre-prompt augmentation | `UserPromptSubmit` hook | scan user prompt → extract mentioned entities → KB lookup → inject structured "entities + verification status + suggested action" block into agent context BEFORE agent drafts | hook script ≤ 300 LOC |
 | L4 | In-flow tools | `vouch search` / `vouch fetch` / `vouch claim` / `vouch attest` / `vouch session show` | give agent verbs to call mid-flow when it wants to verify, attest, or check | each command ≤ 500 LOC |
 | L5 | Post-draft gate | `vouch gate` (Stop hook) | minimal blocker on ungrounded ASSERTs — extractor + grounder + block decision. **Not** a place to drive behavior; behavior belongs in L2/L3 | **≤ 800 LOC** (currently 3000+) |
@@ -61,8 +61,10 @@ but tractable.
 
 ## What needs to exist for migration
 
-L2 — **plugin CLAUDE.md fragment** (currently empty). Distribute via
-Claude Code plugin manifest; gets loaded on plugin install. Contains:
+L2 — **plugin `skills/vouch/SKILL.md`** (see [Amendment](#amendment-2026-05-15-l2-vehicle-is-the-skill-not-claudemd)).
+The Claude Code plugin system does NOT auto-load a plugin-root `CLAUDE.md`
+into agent context; the skill is the canonical vehicle for "always-on
+agent instructions" shipped via a plugin. Contents:
 
 - "before asserting about a named external entity, verify via vouch
   search or hedge explicitly"
@@ -128,14 +130,15 @@ new L5 work, prioritize migration.
 Priority-ordered. Each item is a separate PR.
 
 1. **[L2 + L3] Stand up plugin skeleton** — create `@vouch/plugin`
-   directory layout (plugin.json + CLAUDE.md fragment + hooks/ +
-   skills/). 1-2 hrs.
+   directory layout (`.claude-plugin/plugin.json` + `hooks/hooks.json` +
+   `skills/vouch/SKILL.md`). 1-2 hrs. **Shipped `4ab3d71` 2026-05-15.**
 2. **[L3] UserPromptSubmit hook v0** — entity extraction + KB lookup +
    structured context injection. Migrates Exa inline (1f2e955) + dossier
-   persist (cc1dbf9). 3-4 hrs.
-3. **[L2] CLAUDE.md rules v0** — write the ~10 baked-in rules.
-   Migrates verify-driven message (e6c12a7) + blind-spot rule (P-γ.5) +
-   hedge escape rule (#42). 1 hr.
+   persist (cc1dbf9). 3-4 hrs. **Shipped `8f960d0` 2026-05-15.** L5 path
+   stays live in parallel per the rollback policy below.
+3. **[L2] SKILL.md rules v0** — write the ~10 baked-in rules in
+   `skills/vouch/SKILL.md`. Migrates verify-driven message (e6c12a7) +
+   blind-spot rule (P-γ.5) + hedge escape rule (#42). 1 hr.
 4. **[L5] Strip gate.ts** — delete migrated logic, target ≤ 1500 LOC
    intermediate, ≤ 800 final after 5-7 lands. 2-3 hrs.
 5. **[L3] humility ratio injection** — pre-prompt shows current session
@@ -172,3 +175,35 @@ without forward measurement.
 - a particular hook implementation language (the existing Stop hook is
   TypeScript via the compiled `vouch` binary; UserPromptSubmit can be
   the same shape)
+
+## Amendment, 2026-05-15: L2 vehicle is the skill, not CLAUDE.md
+
+The original draft (above) called the L2 vehicle a "plugin CLAUDE.md
+fragment." That mechanism does not exist in Claude Code. Per the [CC
+plugins-reference](https://code.claude.com/docs/en/plugins-reference)
+(verified while shipping SUN-82 PR #1):
+
+> A `CLAUDE.md` file at the plugin root is not loaded as project context.
+> Plugins contribute context through skills, agents, and hooks rather
+> than CLAUDE.md. To ship instructions that load into Claude's context,
+> put them in a skill.
+
+Concretely:
+- L2 baked rules live in `skills/vouch/SKILL.md` (already at the canonical
+  plugin location).
+- The skill is model-invoked, with `description` triggers — meaning the
+  rules load into context when the model decides the skill applies
+  (research-grounded writing, decision memos, etc.), not literally every
+  turn. For the always-on slice, the Stop-hook fire message itself
+  carries the "verify; don't delete" guidance — that's the safety net.
+- Future direction (out of scope for SUN-82): if we want truly always-on
+  rules, the agent-team or default-agent settings.json hook (a CC plugin
+  feature documented at the same reference) lets a plugin activate a
+  named subagent as the main thread. Not pursued today — too invasive
+  for the trust-boundary product.
+
+Side effect on PR #1 scope: the spec-listed "empty CLAUDE.md fragment"
+was dropped from the skeleton; the existing `skills/vouch/SKILL.md`
+absorbed the L2 slot. PR #3 (this amendment) lands the canonical 10
+rules in that file as a new top-of-skill "Baked rules — read every turn"
+section.
