@@ -8,7 +8,7 @@
  * (vouch gate always prints prose for the Stop hook.)
  */
 import { Command } from "commander";
-import { mkdirSync, appendFileSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, readdirSync, statSync } from "node:fs";
 import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -22,6 +22,7 @@ import { TransientVerifierError } from "./verifier.ts";
 import { DEFAULT_GATE_MODEL, findSessionSourceByToolUseId, getFirstEventTimestamp, readStdinJson, runGateCli } from "./gate.ts";
 import { runUserPromptSubmit, type UserPromptSubmitInput } from "./userpromptsubmit.ts";
 import { findCounterEvidence } from "./counter.ts";
+import { harvestDerivedClaims } from "./harvest.ts";
 import { runDoctor } from "./doctor.ts";
 import {
   SEARCH_PROVIDERS,
@@ -1180,6 +1181,50 @@ program
         : {}),
     }));
     process.exit(result.exitCode);
+  });
+
+// ---------- harvest (tag-driven derived-claim verb) ----------
+program
+  .command("harvest <file>")
+  .description(
+    "Read a markdown file (or '-' for stdin) and file every `[inference-from:]` / " +
+      "`[synthesis-of:]` / `[interpretation:]` / `[hypothesis]` segment as a derived " +
+      "claim. `[verified: <id>]` tags don't file anything — they're validation " +
+      "checks (dangling / superseded / unsupported ids surface as flags). Same " +
+      "engine the Stop-hook gate uses on a passing draft; exposed here so an " +
+      "agent can harvest from offline / saved drafts.",
+  )
+  .option("--attribution <s>", "Author attribution for filed claims", "claude-skill")
+  .action(async (file: string, opts: any) => {
+    let draft: string;
+    try {
+      draft = file === "-" ? readFileSync(0, "utf-8") : readFileSync(file, "utf-8");
+    } catch (e: any) {
+      console.error(JSON.stringify({ error: `cannot read file: ${e?.message ?? e}` }));
+      process.exit(1);
+    }
+    const result = await harvestDerivedClaims(draft, { attribution: opts.attribution });
+    emit(
+      result,
+      (r) => {
+        const out: string[] = [];
+        if (r.filed.length) {
+          out.push(`filed ${r.filed.length} derived claim(s):`);
+          for (const f of r.filed) {
+            const dep = f.depends_on.length ? ` ←(${f.depends_on.join(", ")})` : "";
+            out.push(`  • [${f.claim_type}] claim ${f.claim_id}${dep}: "${f.claim_text.slice(0, 160)}"`);
+          }
+        }
+        if (r.skipped.length) {
+          out.push(`already in KB (not re-filed): ${r.skipped.map((s: any) => `claim ${s.claim_id}`).join(", ")}`);
+        }
+        if (r.flags.length) {
+          out.push("advisories:");
+          for (const f of r.flags) out.push(`  • ${f}`);
+        }
+        return out.length ? out.join("\n") : "no tags found.";
+      },
+    );
   });
 
 // ---------- counter (adversarial-probe verb) ----------

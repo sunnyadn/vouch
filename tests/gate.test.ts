@@ -29,6 +29,7 @@ mock.module("../src/embedder.ts", () => ({
 
 const store = await import("../src/store.ts");
 const gate = await import("../src/gate.ts");
+const harvest = await import("../src/harvest.ts");
 
 afterEach(() => {
   const db = store.getDb();
@@ -2086,7 +2087,7 @@ describe("parseDerivedTags", () => {
       "GraphRAG and LightRAG both target RAG quality [synthesis-of: 5, 6]. " +
       "Restating: LightRAG keeps retrieval cheap [interpretation: 6]. " +
       "It might also help latency-sensitive workloads [hypothesis].";
-    const tags = gate.parseDerivedTags(draft);
+    const tags = harvest.parseDerivedTags(draft);
     expect(tags.map((t) => t.kind)).toEqual([
       "verified",
       "inference-from",
@@ -2107,7 +2108,7 @@ describe("parseDerivedTags", () => {
   });
 
   it("accepts bare [inference: ids] / [synthesis: ids] aliases and [hypothesis; score: N]", () => {
-    const tags = gate.parseDerivedTags("X deduces Y [inference: 9]. X plus Z give W [synthesis: 9, 10]. Maybe Q [hypothesis; score: 0.3].");
+    const tags = harvest.parseDerivedTags("X deduces Y [inference: 9]. X plus Z give W [synthesis: 9, 10]. Maybe Q [hypothesis; score: 0.3].");
     expect(tags[0]!.kind).toBe("inference-from");
     expect(tags[0]!.ids).toEqual([9]);
     expect(tags[1]!.kind).toBe("synthesis-of");
@@ -2118,22 +2119,22 @@ describe("parseDerivedTags", () => {
   });
 
   it("does not split a segment on a mid-sentence abbreviation, but does at a real sentence end", () => {
-    expect(gate.parseDerivedTags("Per the paper, e.g. Table 2, method X beats Y by 3 points [inference-from: 1].")[0]!.segment).toBe(
+    expect(harvest.parseDerivedTags("Per the paper, e.g. Table 2, method X beats Y by 3 points [inference-from: 1].")[0]!.segment).toBe(
       "Per the paper, e.g. Table 2, method X beats Y by 3 points",
     );
-    expect(gate.parseDerivedTags("Here is meta prose. We then set up X. Given the data, X wins [inference-from: 1].")[0]!.segment).toBe(
+    expect(harvest.parseDerivedTags("Here is meta prose. We then set up X. Given the data, X wins [inference-from: 1].")[0]!.segment).toBe(
       "Given the data, X wins",
     );
   });
 
   it("returns [] for untagged prose", () => {
-    expect(gate.parseDerivedTags("Just a normal sentence with no tags at all.")).toEqual([]);
+    expect(harvest.parseDerivedTags("Just a normal sentence with no tags at all.")).toEqual([]);
   });
 
   it("skipRanges excludes matches inside protected regions", () => {
     const draft = "Skip this [inference-from: 1] but keep [inference-from: 2].";
     const skipRanges = [{ start: 0, end: 25 }];
-    const tags = gate.parseDerivedTags(draft, skipRanges);
+    const tags = harvest.parseDerivedTags(draft, skipRanges);
     expect(tags.length).toBe(1);
     expect(tags[0]!.ids).toEqual([2]);
   });
@@ -2145,14 +2146,14 @@ describe("parseDerivedTags", () => {
 
 describe("computeProtectedRanges", () => {
   it("protects inline code spans", () => {
-    const ranges = gate.computeProtectedRanges("Some `inline code` here");
+    const ranges = harvest.computeProtectedRanges("Some `inline code` here");
     expect(ranges.length).toBe(1);
     expect(ranges[0]!).toEqual({ start: 5, end: 18 });
   });
 
   it("protects triple-backtick code fences", () => {
     const draft = "before\n```js\nconst x = 1;\n```\nafter";
-    const ranges = gate.computeProtectedRanges(draft);
+    const ranges = harvest.computeProtectedRanges(draft);
     expect(ranges.length).toBe(1);
     expect(ranges[0]!.start).toBe(7);
     expect(ranges[0]!.end).toBe(29);
@@ -2160,26 +2161,26 @@ describe("computeProtectedRanges", () => {
 
   it("protects tilde code fences", () => {
     const draft = "before\n~~~\nconst x = 1;\n~~~\nafter";
-    const ranges = gate.computeProtectedRanges(draft);
+    const ranges = harvest.computeProtectedRanges(draft);
     expect(ranges.length).toBe(1);
     expect(ranges[0]!.start).toBe(7);
     expect(ranges[0]!.end).toBe(27);
   });
 
   it("protects blockquote lines", () => {
-    const ranges = gate.computeProtectedRanges("> quoted [inference-from: 1]");
+    const ranges = harvest.computeProtectedRanges("> quoted [inference-from: 1]");
     expect(ranges.some((r) => r.start === 0 && r.end === 28)).toBe(true);
   });
 
   it("protects 4-space-indented lines", () => {
-    const ranges = gate.computeProtectedRanges("    code [hypothesis]");
+    const ranges = harvest.computeProtectedRanges("    code [hypothesis]");
     expect(ranges.some((r) => r.start === 0 && r.end === 21)).toBe(true);
   });
 
   it("does not protect list-continuation indents (heuristic)", () => {
     // List items themselves start with non-space markers; we only indent
     // lines that begin with 4+ spaces and no marker.
-    const ranges = gate.computeProtectedRanges("    - list item [inference-from: 1]");
+    const ranges = harvest.computeProtectedRanges("    - list item [inference-from: 1]");
     expect(ranges.length).toBe(0);
   });
 });
