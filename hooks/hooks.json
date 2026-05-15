@@ -1,3 +1,14 @@
 {
-  "hooks": {}
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vouch userpromptsubmit"
+          }
+        ]
+      }
+    ]
+  }
 }

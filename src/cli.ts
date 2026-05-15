@@ -20,6 +20,7 @@ import { fetchAndStore } from "./fetch.ts";
 import { attestAndStore } from "./attest.ts";
 import { TransientVerifierError } from "./verifier.ts";
 import { DEFAULT_GATE_MODEL, findSessionSourceByToolUseId, getFirstEventTimestamp, readStdinJson, runGateCli } from "./gate.ts";
+import { runUserPromptSubmit, type UserPromptSubmitInput } from "./userpromptsubmit.ts";
 import { runDoctor } from "./doctor.ts";
 import {
   SEARCH_PROVIDERS,
@@ -1178,6 +1179,34 @@ program
         : {}),
     }));
     process.exit(result.exitCode);
+  });
+
+// ---------- userpromptsubmit (L3 hook) ----------
+program
+  .command("userpromptsubmit")
+  .description(
+    "UserPromptSubmit hook: read the CC hook stdin payload, pre-fetch up to 3 " +
+      "Exa sources for the user prompt, persist them as web/exa dossiers, and emit " +
+      "a JSON envelope with hookSpecificOutput.additionalContext for the agent. " +
+      "Fail-open: every error path exits 0 with an empty envelope. Never blocks. " +
+      "Env: EXA_API_KEY (required to do anything), " +
+      "VOUCH_USERPROMPT_BUDGET_MS=ms (default 8000), VOUCH_USERPROMPT_BYPASS=1.",
+  )
+  .action(async () => {
+    let payload: UserPromptSubmitInput;
+    try {
+      payload = (readStdinJson() ?? {}) as UserPromptSubmitInput;
+    } catch {
+      console.log("{}");
+      process.exit(0);
+    }
+    try {
+      const out = await runUserPromptSubmit(payload);
+      console.log(JSON.stringify(out));
+    } catch {
+      console.log("{}");
+    }
+    process.exit(0);
   });
 
 // ---------- doctor ----------
