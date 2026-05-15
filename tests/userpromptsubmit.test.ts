@@ -96,7 +96,7 @@ describe("formatExaContext", () => {
       { url: "https://example.com/a", title: "Example A", text: "Body about A. ".repeat(50) },
       { url: "https://example.com/b", title: "Example B", text: "Body B" },
     ]);
-    expect(out).toContain("[vouch L3]");
+    expect(out).toContain("[vouch context]");
     expect(out).toContain("Pre-fetched 2");
     expect(out).toContain("https://example.com/a");
     expect(out).toContain("Example A");

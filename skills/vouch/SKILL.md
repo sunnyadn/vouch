@@ -49,7 +49,7 @@ auto-selects from the dossier).
 
 ## Baked rules — read every turn
 
-These are the canonical L2 contract. The rest of the doc is reference.
+These are the canonical rules. The rest of the doc is reference.
 
 1. **Verify or hedge before asserting about a named external entity.** A
    library, paper, person, framework, tool — anything with a proper noun
@@ -109,7 +109,7 @@ These are the canonical L2 contract. The rest of the doc is reference.
    themselves. Free-form "interesting connection" between unrelated claims
    is `[hypothesis]`, not inference. The gate doesn't catch this — you do.
 
-9. **Counter-evidence (P-α) requires reconcile, supersede, or
+9. **Counter-evidence requires reconcile, supersede, or
    explicit-disagreement hedge.** When the gate surfaces a contradicting
    KB claim, pick one: (a) edit as `[synthesis-of: <support>, <contra>]`
    acknowledging both; (b) `vouch supersede <old> <new> --reason "<why>"`
@@ -122,14 +122,14 @@ These are the canonical L2 contract. The rest of the doc is reference.
     `[verified: <id>]` for things you derived without fetching. Don't
     auto-supersede other agents' claims without strong justification.
 
-## Pre-prompt context (`[vouch L3]`)
+## Pre-prompt context (`[vouch context]`)
 
-Before you draft, vouch may inject a `[vouch L3]` block listing pre-fetched
-KB matches or fresh web sources relevant to the user's prompt. Treat it as
-free verification candy: prefer citing those (`vouch claim "<quote>"
---dossier <slug>`) over refetching the same entity. If the L3 block shows
-KB matches, you don't need to `vouch search` for those entities — the
-match list already is the search result.
+Before you draft, vouch may inject a `[vouch context]` block listing
+pre-fetched KB matches or fresh web sources relevant to the user's prompt.
+Treat it as free verification candy: prefer citing those (`vouch claim
+"<quote>" --dossier <slug>`) over refetching the same entity. If the
+block shows KB matches, you don't need to `vouch search` for those
+entities — the match list already is the search result.
 
 ## Commands
 
@@ -193,7 +193,7 @@ Every factual segment in your response to the user carries a tag:
 | `[inference-from: <id1>, …]` | Conclusion deduced from verified claims | scenario-anchored OR paper-derived only |
 | `[interpretation: <id>]` | Substantive reframing of one claim | cite the single claim |
 | `[hypothesis]` | Speculation you can't fully justify | explicit |
-| `[gap: <text>]` | What you didn't check / don't know — surfaces blind spots **before** the user finds them | scoped, specific, real (P-γ.5) |
+| `[gap: <text>]` | What you didn't check / don't know — surfaces blind spots **before** the user finds them | scoped, specific, real |
 
 The gate harvests the four derived forms on a passing draft — `claim_text` is
 your segment **verbatim**, `depends_on` is the cited ids, `status` is
@@ -223,7 +223,7 @@ When the user asks "X vs Y, which?", the most credible evidence is a quote
 where the *loser* admits the weakness in their own docs — self-admissions
 have more leverage than third-party benchmarks. Spend fetch budget there.
 
-## Humility surface (P-γ + P-γ.5)
+## Humility surface
 
 On every Stop hook, vouch reports two humility signals after the per-turn
 delta:
@@ -252,7 +252,7 @@ made claims about an entity but haven't verified a specific facet (e.g.,
 performance on a sub-distribution, a specific version, an edge case).
 They're cheap to write and they make the limits of your retrieval visible.
 
-## Counter-evidence (P-α, opt-in)
+## Counter-evidence (opt-in)
 
 When `VOUCH_GATE_COUNTER_EVIDENCE=1` is set, vouch ALSO searches the KB
 for claims that **contradict** what you just confidently asserted (not
@@ -318,14 +318,13 @@ its own corrections.
   `vouch search` output.
 - ❌ Don't auto-supersede other agents' claims without strong justification.
 - ❌ Don't pad `[gap:]` markers with vacuous "minor things" to game the
-  blind-spot counter (P-γ.5). Each gap should be a specific facet the user
+  blind-spot counter. Each gap should be a specific facet the user
   could reasonably ask about. If you can't think of a real one, leave it
   out — 0 honest gaps is better than 3 fake ones.
-- ❌ Don't dodge a counter-evidence fire (P-α) by silently removing the
-  contradicted entity (4b silent-rephrase per #50). Reconcile, supersede,
-  or hedge — the system-tracked `awaiting_revise` ledger will flag a
-  silent-remove + same-shape re-assert as still-unaddressed on the next
-  turn.
+- ❌ Don't dodge a counter-evidence fire by silently removing the
+  contradicted entity. Reconcile, supersede, or hedge — the
+  `awaiting_revise` ledger will flag a silent-remove + same-shape
+  re-assert as still-unaddressed on the next turn.
 
 ## Mirror the gate's verdict in your reply
 

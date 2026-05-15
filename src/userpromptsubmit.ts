@@ -101,7 +101,7 @@ export function codeBlockFraction(text: string): number {
 export function formatExaContext(candidates: ExaCandidate[]): string {
   if (!candidates.length) return "";
   const lines: string[] = [];
-  lines.push(`[vouch L3] Pre-fetched ${candidates.length} fresh web source(s) for this turn (no confident KB hit) — persisted as web/exa dossiers:`);
+  lines.push(`[vouch context] Pre-fetched ${candidates.length} fresh web source(s) for this turn (no confident KB hit) — persisted as web/exa dossiers:`);
   for (let i = 0; i < candidates.length; i++) {
     const c = candidates[i]!;
     const excerpt = c.text.slice(0, EXCERPT_CHARS).replace(/\s+/g, " ").trim();
@@ -120,7 +120,7 @@ export function formatExaContext(candidates: ExaCandidate[]): string {
 export function formatKbContext(hits: store.SearchHit[]): string {
   if (!hits.length) return "";
   const lines: string[] = [];
-  lines.push(`[vouch L3] KB has ${hits.length} match(es) likely relevant to this turn — cite these instead of refetching:`);
+  lines.push(`[vouch context] KB has ${hits.length} match(es) likely relevant to this turn — cite these instead of refetching:`);
   for (let i = 0; i < hits.length; i++) {
     const h = hits[i]!;
     const sim = h.similarity.toFixed(2);
