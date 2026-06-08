@@ -36,9 +36,32 @@ Three steps, all automatic:
   including absence claims asserted with no search.
 - **Research insufficiency** — a conclusion whose scope exceeds the evidence (*"performance
   resolved"* after fixing one query).
+- **Unfalsifiable conclusion** — a causal claim or a *"fixed it"* with no discriminating
+  test behind it (see below). A claim that can be neither confirmed nor refuted isn't
+  grounded.
 - **Decision contradicts a project lesson** — a choice that repeats a documented mistake
   (the reviewer reads the project's auto-memory; see below).
 - **Omission** — unresolved failures the summary doesn't acknowledge.
+
+## Falsifiability — demand the discriminating test
+
+The most expensive bad conclusions aren't false, they're *unfalsifiable as stated*: the
+agent never said what observation would prove it wrong, so it can neither confirm nor refute
+its own claim. This bites hardest in **causal attribution** — *"the test failed **because**
+of the cache, so I disabled it"* — where the cause is asserted but never isolated.
+
+For a causal or *"fixed it"* claim, vouch checks the trace for a **discriminating test** —
+an observation that would have come out *differently* if the claim were false:
+
+- a **fix** needs a **red→green**: a check that *failed before* the change and *passes
+  after*. No before-state, no fix — just a change that happens to coexist with green.
+- a **cause** needs **isolation**: *"if the cache is the cause, disabling it makes the test
+  pass"* — and then actually running it. If it still fails, the cache wasn't the cause.
+
+When the discriminating test is missing, vouch flags the claim (blocking if it's conclusive)
+and, in the suggestion, names the falsification the agent should *state and run* — turning a
+confident guess into a checked result. It is treated as research insufficiency: a conclusion
+with no way to be wrong is a conclusion with no evidence.
 
 ## Two layers
 

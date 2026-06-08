@@ -6,24 +6,34 @@ drift from that: fabricated results, conclusions with no investigation behind th
 *"there's no library for X"* asserted without a search. The agent follows no protocol and
 can't forget to use it — the hooks do everything. vouch watches; it doesn't ask.
 
+## How it works, in one loop
+
+vouch **observes** every step while the agent works, then **verifies** its words against
+that record when the turn wraps up. There's nothing to cooperate with — the hooks do it all.
+
+```mermaid
+flowchart LR
+    subgraph turn["While the agent works — OBSERVE (passive, no interruptions)"]
+        ACT["read · run · edit · search"] -->|"every call + its real output"| REC[("trace")]
+    end
+    turn -->|"the turn wraps up"| V{"VERIFY at Stop:<br/>its words ⟷ what the trace shows"}
+    V -->|"holds up"| DONE(["let it finish"])
+    V -->|"shortcut · hallucination · bad cause · overreach"| FIX["send it back — ground it or fix it"]
+    FIX --> ACT
+```
+
 ## What it catches
 
-| The agent claims… | …but the trace shows | vouch's move |
-| --- | --- | --- |
-| "all tests pass" / "fixed it" | the recorded test run failed, or none ran | **block** — run them, report the real result |
-| "updated **all** the call sites" | files edited, no search for the usages | **block** — grep first, or say "the ones I found" |
-| "the default is 4 threads" | a file it read earlier this session says `16` | **block** — contradicts what it already saw |
-| "as we established, X works like Y" | nothing this session backs it — it's memory | **block** — cite this session's evidence, or re-check |
-| "…all set up cleanly" | an install/command errored mid-session | **flag** — acknowledge the failure you skipped |
-| "there's no library for this" | no `WebSearch`/`WebFetch` in the trace | **block** — search before claiming absence |
-| "`Promise.all` cancels the rest" | a precise API claim, no docs fetched | **block** — fetch the source; memory ≠ knowledge |
-| "no security issues" | a sweeping conclusion, two files read | **flag** — scope it to what you actually checked |
-| "decision: skip the cache layer" | repeats a mistake the project's memory records | **block** — the project already learned this |
+| | The agent says… | …but the trace shows | vouch's move |
+| --- | --- | --- | --- |
+| 🥱 **Shortcut** | "updated **all** the call sites" | 3 files edited, the symbol never grep'd | **block** — search first, or scope it to "the ones I found" |
+| 🌫️ **Hallucination** | "there's no library for this" | zero `WebSearch` this session | **block** — search before asserting absence |
+| 🔗 **Mis-attribution** | "it failed *because* of the cache, so I disabled it" | the test still fails with the cache off | **block** — the trace doesn't support that cause |
+| 🧩 **Overreach** | "no security issues" | two files read | **flag** — scope it to what you actually checked |
+| 🔬 **Unfalsifiable** | "this fixes the race condition" | no test that would fail if it *didn't* | **block** — state the test that would refute it, then run it |
+| 🧠 **Stale memory** | "as we established, the default is 4 threads" | a file it read earlier says `16` | **block** — contradicts what it saw 40 calls ago |
 
-Two earn their keep alone: it catches a claim that contradicts something the agent **read
-40 tool-calls earlier** (perfect session recall, which you'd never track), and it stops
-*"there's no library for X"* — the most expensive sentence an agent says — by making it run
-the search first. Every block names the exact span, why, and the fix:
+Every block names the exact span, why it's unsupported, and the fix:
 
 ```
 ⛔ vouch reviewer (BLOCK): [active-fabrication]
