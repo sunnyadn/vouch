@@ -52,34 +52,31 @@ Three steps, all automatic — the agent does nothing:
 3. **Ungrounded claims are blocked**, with the exact offending span, why it's
    unsupported, and what to do about it.
 
-### The catches you'll wish you'd had
+### Typical catches
 
-Not the clumsy lies — the ones that cost you an afternoon. One per thing vouch grounds.
+| The agent claims… | …but the trace shows | vouch's move |
+| --- | --- | --- |
+| "all tests pass" / "fixed it" | the recorded test run failed, or none ran | **block** — run them, report the real result |
+| "updated **all** the call sites" | files edited, no search for the usages | **block** — grep first, or say "the ones I found" |
+| "the default is 4 threads" | a file it read earlier this session says `16` | **block** — contradicts what it already saw |
+| "as we established, X works like Y" | nothing this session backs it — it's memory | **block** — cite this session's evidence, or re-check |
+| "…all set up cleanly" | an install/command errored mid-session | **flag** — acknowledge the failure you skipped |
+| "there's no library for this" | no `WebSearch`/`WebFetch` in the trace | **block** — search before claiming absence |
+| "`Promise.all` cancels the rest" | a precise API claim, no docs fetched | **block** — fetch the source; memory ≠ knowledge |
+| "no security issues" | a sweeping conclusion, two files read | **flag** — scope it to what you actually checked |
+| "decision: skip the cache layer" | repeats a mistake the project's memory records | **block** — the project already learned this |
 
-**The thing it remembered that you forgot.** Forty tool calls deep, the agent states
-*"the worker pool defaults to 4 threads, so that's our concurrency ceiling."* Sounds
-reasonable, you move on. But near the top of the session it had run `cat
-worker.config.ts`, and the output said `poolSize: 16`. You scrolled past that an hour
-ago; so did the agent. vouch didn't — it queries the *entire* session trace, finds the
-earlier read, and blocks:
+Two are worth their weight alone: it catches a claim that contradicts something the
+agent **read 40 tool-calls earlier** (perfect session recall, which you'd never track),
+and it stops *"there's no library for X"* — the most expensive sentence an agent says —
+by making it run the search first. Every block names the exact span, why it's
+unsupported, and the fix:
 
 ```
 ⛔ vouch reviewer (BLOCK): [active-fabrication]
-   "defaults to 4 threads" — worker.config.ts, read earlier this session, shows
-   poolSize: 16. The claim contradicts what the agent already saw.
+   "defaults to 4 threads" — worker.config.ts (read earlier) shows poolSize: 16.
    → re-read the file or correct the number.
 ```
-
-It keeps perfect recall of everything the agent observed — even across a long session,
-even when the agent (and you) lost the thread.
-
-**The reinvention it talked you out of.** Mid-task the agent decides *"Fastify has no
-built-in rate limiter, so I'll write a token bucket"* — and starts on 60 lines. The
-trace shows it never searched. vouch blocks the unsupported *"no built-in"*: an absence
-claimed from memory, not from a search. One `WebSearch` later the agent finds
-`@fastify/rate-limit` and deletes the hand-rolled version. vouch didn't catch a *lie*
-here — it saved an afternoon of owning code that already existed. ("There's no library
-for X" is the most expensive sentence an agent says; vouch makes it run the search.)
 
 ## How it runs
 
