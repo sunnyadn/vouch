@@ -52,33 +52,34 @@ Three steps, all automatic — the agent does nothing:
 3. **Ungrounded claims are blocked**, with the exact offending span, why it's
    unsupported, and what to do about it.
 
-### Two failures that actually slip past you
+### The catches you'll wish you'd had
 
-Not the clumsy lies — the confident, plausible claims you'd nod along to. One per
-axis vouch grounds.
+Not the clumsy lies — the ones that cost you an afternoon. One per thing vouch grounds.
 
-**Own work — the half-done refactor sold as finished.** The agent reports:
-*"Renamed `getUser` → `loadUser` and updated all the call sites."* It edited three
-files. It never ran a project-wide search for `getUser`, so it has no idea whether
-three was *all* of them — and the two it missed are a runtime break waiting to ship.
-vouch blocks the commit:
+**The thing it remembered that you forgot.** Forty tool calls deep, the agent states
+*"the worker pool defaults to 4 threads, so that's our concurrency ceiling."* Sounds
+reasonable, you move on. But near the top of the session it had run `cat
+worker.config.ts`, and the output said `poolSize: 16`. You scrolled past that an hour
+ago; so did the agent. vouch didn't — it queries the *entire* session trace, finds the
+earlier read, and blocks:
 
 ```
-⛔ vouch reviewer (BLOCK): [passive-fabrication]
-   "updated all the call sites" — 3 files edited, but no search for `getUser`
-   usages this session; "all" has nothing behind it.
-   → grep the usages first, or scope the claim to what you actually touched.
+⛔ vouch reviewer (BLOCK): [active-fabrication]
+   "defaults to 4 threads" — worker.config.ts, read earlier this session, shows
+   poolSize: 16. The claim contradicts what the agent already saw.
+   → re-read the file or correct the number.
 ```
 
-You can't claim *all* until you've actually looked for all.
+It keeps perfect recall of everything the agent observed — even across a long session,
+even when the agent (and you) lost the thread.
 
-**External knowledge — the precise claim that's quietly wrong.** While writing the
-batch loader the agent asserts: *"`Promise.all` rejects on the first rejection and
-cancels the remaining promises."* It sounds authoritative — and the second half is
-flat wrong (the others keep running). The trace shows no docs were ever opened. vouch
-flags it: a load-bearing claim about an external API, asserted from memory with no
-source. One `WebFetch` of the docs either grounds it or kills it before it becomes a
-bug. Training memory is not verified knowledge.
+**The reinvention it talked you out of.** Mid-task the agent decides *"Fastify has no
+built-in rate limiter, so I'll write a token bucket"* — and starts on 60 lines. The
+trace shows it never searched. vouch blocks the unsupported *"no built-in"*: an absence
+claimed from memory, not from a search. One `WebSearch` later the agent finds
+`@fastify/rate-limit` and deletes the hand-rolled version. vouch didn't catch a *lie*
+here — it saved an afternoon of owning code that already existed. ("There's no library
+for X" is the most expensive sentence an agent says; vouch makes it run the search.)
 
 ## How it runs
 
