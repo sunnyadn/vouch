@@ -49,6 +49,10 @@ export function captureVerdict(rec: {
       ts: new Date().toISOString(),
       project: process.cwd(),
       actionType: rec.actionType,
+      // reviewed | skipped | failed — without this an empty `issues` is ambiguous: a clean
+      // pass and a fail-open death both look like []. This is what makes the corpus a
+      // measurable precision sample (drop `failed` records — they reviewed nothing).
+      status: rec.verdict.status,
       blocked: rec.verdict.issues.some((i) => i.severity === "block"),
       issues: rec.verdict.issues.map((i) => ({
         type: i.type,

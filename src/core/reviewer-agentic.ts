@@ -141,7 +141,7 @@ export interface AgenticContext {
 // breaks the session on a reviewer failure.
 export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<ReviewVerdict> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return { issues: [], ok: true };
+  if (!apiKey) return { issues: [], ok: true, status: "skipped" };
   const model = process.env.VOUCH_REVIEWER_MODEL ?? DEFAULT_MODEL;
   const client = new Anthropic({ apiKey });
 
@@ -185,10 +185,10 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
         .filter((b): b is Anthropic.TextBlock => b.type === "text")
         .map((b) => b.text)
         .join("");
-      return parseReviewResponse(text);
+      return { ...parseReviewResponse(text), status: "reviewed" };
     }
   } catch {
-    return { issues: [], ok: true }; // fail open
+    return { issues: [], ok: true, status: "failed" }; // fail open — but RECORD that it failed
   }
-  return { issues: [], ok: true }; // ran out of turns → fail open
+  return { issues: [], ok: true, status: "failed" }; // ran out of turns → fail open
 }

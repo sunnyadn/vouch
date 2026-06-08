@@ -46,6 +46,17 @@ export interface ReviewIssue {
 export interface ReviewVerdict {
   issues: ReviewIssue[];
   ok: boolean;
+  /**
+   * Whether the LLM reviewer actually completed a round-trip on this call. An empty
+   * `issues` array is ambiguous on its own: it could mean "reviewed, found nothing"
+   * OR "couldn't review at all". Without this distinction a DEAD reviewer (drained
+   * quota, bad key, timeout) is byte-identical to a CLEAN pass — the silent fail-open.
+   *   reviewed — a real round-trip completed (clean or with issues)
+   *   skipped  — intentionally not run (no API key configured)
+   *   failed   — a key IS configured but the call errored / ran out of turns (fail-open)
+   * Optional: the deterministic gate and callers that don't reach the LLM leave it unset.
+   */
+  status?: "reviewed" | "skipped" | "failed";
 }
 
 export type ReviewFn = (context: ReviewContext) => Promise<ReviewVerdict>;
@@ -321,6 +332,18 @@ const ISSUE_LABEL: Record<ReviewIssue["type"], string> = {
   "premise-unexamined": "premise unchecked",
   "omission": "ignores a failure",
 };
+
+// The reviewer failed open (a key IS configured but the call errored / timed out). Surface
+// it as a NON-breaking advise line so an outage is VISIBLE instead of silently catching
+// nothing — the one signal that turns "vouch went quiet" from a trap into a prompt to act.
+// Returns "" for the healthy/skipped cases so it never adds noise to a normal turn.
+export function formatReviewerHealthNote(verdict: ReviewVerdict): string {
+  if (verdict.status !== "failed") return "";
+  return (
+    "⚠ vouch reviewer unavailable — it failed open and reviewed nothing this turn " +
+    "(drained quota, bad key, or timeout). You are UNGATED until it recovers. Run `vouch doctor`."
+  );
+}
 
 export function formatReviewMessage(verdict: ReviewVerdict): string {
   if (verdict.ok) return "";

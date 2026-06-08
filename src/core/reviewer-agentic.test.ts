@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import type { CapturedEvent } from "./evidence-capture.ts";
-import { queryHistory, formatHits } from "./reviewer-agentic.ts";
+import { anthropicReviewerAgentic, queryHistory, formatHits } from "./reviewer-agentic.ts";
 
 const ev = (o: Partial<CapturedEvent>): CapturedEvent => ({
   tool: "Bash", command: undefined, filePath: undefined, stdout: "", stderr: "", exitCode: 0, isNegative: false, ...o,
@@ -26,6 +26,20 @@ test("queryHistory matches file reads and output text; empty when nothing matche
   expect(queryHistory(events, "abc123").length).toBe(1); // commit hash in output → post-commit summary groundable
   expect(queryHistory(events, "nope").length).toBe(0);
   expect(formatHits([])).toContain("no matching");
+});
+
+test("no API key → verdict.status is 'skipped', NOT an indistinguishable empty pass", async () => {
+  // The silent fail-open gap: a clean review and a dead/absent reviewer both have issues:[].
+  // status disambiguates so a quiet vouch can't masquerade as a working one.
+  const saved = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  try {
+    const v = await anthropicReviewerAgentic({ action: "tests pass", actionType: "stop-response", events: [] });
+    expect(v.issues).toEqual([]);
+    expect(v.status).toBe("skipped"); // intentional no-op — distinct from a 'reviewed' clean pass
+  } finally {
+    if (saved !== undefined) process.env.ANTHROPIC_API_KEY = saved;
+  }
 });
 
 test("queryHistory is window-agnostic: a pre-commit event is still found after a commit", () => {

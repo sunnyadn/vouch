@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { CapturedEvent } from "../src/core/evidence-capture.ts";
 import {
   buildEvidenceSummary,
+  formatReviewerHealthNote,
   formatReviewMessage,
   type ReviewContext,
   type ReviewFn,
@@ -18,6 +19,23 @@ function event(overrides: Partial<CapturedEvent>): CapturedEvent {
     ...overrides,
   };
 }
+
+describe("formatReviewerHealthNote", () => {
+  const verdict = (status?: ReviewVerdict["status"]): ReviewVerdict => ({
+    issues: [],
+    ok: true,
+    status,
+  });
+  test("warns ONLY when the reviewer failed open — the visible signal for a silent death", () => {
+    expect(formatReviewerHealthNote(verdict("failed"))).toContain("vouch reviewer unavailable");
+    expect(formatReviewerHealthNote(verdict("failed"))).toContain("vouch doctor");
+  });
+  test("stays silent for healthy, intentional, and legacy verdicts (no noise on a normal turn)", () => {
+    expect(formatReviewerHealthNote(verdict("reviewed"))).toBe(""); // clean pass
+    expect(formatReviewerHealthNote(verdict("skipped"))).toBe(""); // no key configured — by design
+    expect(formatReviewerHealthNote(verdict(undefined))).toBe(""); // deterministic-gate / legacy
+  });
+});
 
 describe("buildEvidenceSummary", () => {
   test("collects files read, edited, and bash commands", () => {

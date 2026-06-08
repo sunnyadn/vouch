@@ -41,6 +41,15 @@ endpoint, the model, a timed round-trip, the deterministic gate, project-memory 
 trace-capture writability.
 
 > **The reviewer fails open — on purpose.** A reviewer error (dead key, drained quota,
-> network blip) never breaks your session; it just produces an empty verdict. The cost is
-> that an outage is **silent** — vouch looks alive but catches nothing. **If you stop
-> seeing it fire, run `vouch doctor`.**
+> network blip) never breaks your session; it just produces an empty verdict. To keep that
+> from being **silent**, a failed-open review now prints a one-line, non-blocking notice at
+> the turn/commit it happened on:
+>
+> ```
+> ⚠ vouch reviewer unavailable — it failed open and reviewed nothing this turn
+>    (drained quota, bad key, or timeout). You are UNGATED until it recovers. Run `vouch doctor`.
+> ```
+>
+> Every verdict is also tagged `status: reviewed | skipped | failed` in the corpus, so a
+> clean pass (`reviewed`, empty) is distinguishable from a death (`failed`, empty). **If you
+> see the notice — or just stop seeing vouch fire — run `vouch doctor`.**

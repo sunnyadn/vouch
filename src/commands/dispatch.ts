@@ -113,7 +113,9 @@ export async function dispatch(argv: string[]): Promise<number> {
         // trace (allEvents) — what changed is in there — and the auditable CLAIMS live in the
         // -m message, so that is the action we review. extractClaimArgsFromCommand is the same
         // message extractor Layer 1 uses, so both layers see the same claims.
-        const { shouldCallReviewer, formatReviewMessage } = await import("../core/reviewer.ts");
+        const { shouldCallReviewer, formatReviewMessage, formatReviewerHealthNote } = await import(
+          "../core/reviewer.ts"
+        );
         const { GIT_COMMIT_RE } = await import("../core/evidence-capture.ts");
         const message = GIT_COMMIT_RE.test(command)
           ? extractClaimArgsFromCommand(command).join("\n").trim()
@@ -126,6 +128,8 @@ export async function dispatch(argv: string[]): Promise<number> {
           });
           const { captureVerdict } = await import("../core/corpus.ts");
           captureVerdict({ actionType: "commit", action: message, events: allEvents, verdict });
+          const healthNote = formatReviewerHealthNote(verdict);
+          if (healthNote) process.stderr.write(`${healthNote}\n`);
           const reviewMsg = formatReviewMessage(verdict);
           if (reviewMsg) {
             const hasBlock = verdict.issues.some((i) => i.severity === "block");
@@ -233,7 +237,9 @@ export async function dispatch(argv: string[]): Promise<number> {
           }
 
           // 2b. LLM reviewer
-          const { formatReviewMessage } = await import("../core/reviewer.ts");
+          const { formatReviewMessage, formatReviewerHealthNote } = await import(
+            "../core/reviewer.ts"
+          );
           if (reviewerEnabled && draft && draft.length > 50) {
             const verdict = await runReviewer({
               action: draft.slice(0, 4000),
@@ -247,6 +253,8 @@ export async function dispatch(argv: string[]): Promise<number> {
               events: allEvents,
               verdict,
             });
+            const healthNote = formatReviewerHealthNote(verdict);
+            if (healthNote) messages.push(healthNote);
             const reviewMsg = formatReviewMessage(verdict);
             if (reviewMsg) messages.push(reviewMsg);
             if (verdict.issues.some((i) => i.severity === "block")) reviewerBlocked = true;
