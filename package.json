@@ -1,7 +1,7 @@
 {
   "name": "vouch",
-  "version": "0.3.0",
-  "description": "Verified-claim KB CLI — Fetch Before Claim (FBC) pattern.",
+  "version": "0.4.0",
+  "description": "Passive anti-hallucination gate for AI coding agents — watches the session trace and blocks ungrounded claims (own-work AND external) at commit and turn-end. No agent cooperation required.",
   "license": "MIT",
   "type": "module",
   "module": "src/cli.ts",
@@ -9,27 +9,17 @@
     "vouch": "./src/cli.ts"
   },
   "scripts": {
-    "vouch": "bun run src/cli.ts",
-    "build": "bun build src/cli.ts --compile --outfile dist/vouch",
+    "dev": "bun run src/cli.ts",
     "test": "bun test",
+    "lint": "biome check src",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "ai": "^6.0.0",
-    "@ai-sdk/google-vertex": "^4.0.0",
-    "@ai-sdk/openai": "^3.0.0",
-    "@ai-sdk/anthropic": "^3.0.0",
-    "commander": "^14.0.0",
-    "zod": "^3.23.8"
+    "@anthropic-ai/sdk": "^0.98.0",
+    "commander": "^14.0.0"
   },
   "devDependencies": {
     "@types/bun": "latest",
-    "compromise": "^14.15.0",
-    "typescript": "^5.5.0",
-    "wink-eng-lite-web-model": "^1.8.1",
-    "wink-nlp": "^2.4.0"
-  },
-  "peerDependencies": {
     "typescript": "^5.5.0"
   }
 }

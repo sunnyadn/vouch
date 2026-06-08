@@ -1,7 +1,7 @@
 {
   "name": "vouch",
-  "description": "Fetch-Before-Claim verifier and persistent claim KB for source-traceable factual writing.",
-  "version": "0.3.0",
+  "description": "Passive anti-hallucination gate. Hooks watch every tool result as evidence; an LLM reviewer blocks ungrounded claims — own-work (tests pass, bug fixed) and external (a library/paper claim with no fetch) — at commit and turn-end. No agent cooperation, no protocol.",
+  "version": "0.4.0",
   "author": {
     "name": "Sunny Yang",
     "email": "sunnyadn1130@gmail.com"

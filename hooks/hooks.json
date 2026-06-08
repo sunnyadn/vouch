@@ -1,11 +1,59 @@
 {
   "hooks": {
-    "UserPromptSubmit": [
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vouch hook pre-commit-gate",
+            "timeout": 60,
+            "statusMessage": "vouch commit-block"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vouch hook pre-edit-gate",
+            "timeout": 5,
+            "statusMessage": "vouch edit-gate"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "vouch userpromptsubmit"
+            "command": "vouch hook trace-append",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vouch hook trace-append",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vouch hook stop-review",
+            "timeout": 60,
+            "statusMessage": "vouch stop review"
           }
         ]
       }

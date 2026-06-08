@@ -1,6 +1,0 @@
-{
-  "_doc": "Category taxonomy for the entity-category-mismatch comprehensiveness detector. Ships EMPTY by default — users in any domain populate it via bench/dogfood/discover_taxonomy.ts (which extracts candidates from the user's own KB or transcripts) and/or by loading a sample pack from bench/dogfood/taxonomies/. Point a pack at the detector via VOUCH_COMPREHENSIVENESS_TAXONOMY=<path>; otherwise the detector reads this file and (when empty) fires on nothing. The detector + discover are domain-agnostic; the vocabulary is the user's responsibility.",
-  "_version": "2",
-  "_domain": "empty",
-  "categories": {}
-}

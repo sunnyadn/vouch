@@ -1,0 +1,95 @@
+{
+  "detector": "category-mismatch",
+  "taxonomy_source": "/Users/sunny/Projects/vouch/bench/dogfood/taxonomies/ml-research.sample.json",
+  "taxonomy_domain": "ml-research",
+  "taxonomy_version": "1",
+  "extractor": "vertex_ai/gemini-3.1-pro-preview",
+  "input_source": "fires-judge-study-P_alpha.jsonl",
+  "sample_size": 100,
+  "total_unique": 298,
+  "wall_seconds": 99.023,
+  "candidates_count": 7,
+  "candidates": [
+    {
+      "word": "entrant",
+      "frequency": 2,
+      "example_contexts": [
+        {
+          "entity": "Mem0",
+          "sentence": "Mem0 is a market entrant in the agentic memory space."
+        },
+        {
+          "entity": "Letta",
+          "sentence": "Letta is a market entrant in the agentic memory space."
+        }
+      ],
+      "proposed_category": null
+    },
+    {
+      "word": "citation",
+      "frequency": 1,
+      "example_contexts": [
+        {
+          "entity": "Blanche",
+          "sentence": "Blanche §4 is a relevant citation for the risk regression methodology."
+        }
+      ],
+      "proposed_category": null
+    },
+    {
+      "word": "source",
+      "frequency": 1,
+      "example_contexts": [
+        {
+          "entity": "riskRegression",
+          "sentence": "riskRegression is the source associated with claim 139."
+        }
+      ],
+      "proposed_category": null
+    },
+    {
+      "word": "implementation",
+      "frequency": 1,
+      "example_contexts": [
+        {
+          "entity": "FActScore",
+          "sentence": "FActScore is the original implementation of an EMNLP 2023 paper on fine-grained atomic evaluation of factual precision in long form text generation."
+        }
+      ],
+      "proposed_category": null
+    },
+    {
+      "word": "infrastructure",
+      "frequency": 1,
+      "example_contexts": [
+        {
+          "entity": "Mem0",
+          "sentence": "Mem0 markets itself as drop-in memory infrastructure for AI agents and apps."
+        }
+      ],
+      "proposed_category": null
+    },
+    {
+      "word": "entity",
+      "frequency": 1,
+      "example_contexts": [
+        {
+          "entity": "Letta",
+          "sentence": "Letta is a third-party entity that can be used for memory-related tasks."
+        }
+      ],
+      "proposed_category": null
+    },
+    {
+      "word": "choice",
+      "frequency": 1,
+      "example_contexts": [
+        {
+          "entity": "ALCE",
+          "sentence": "ALCE is the primary benchmark choice."
+        }
+      ],
+      "proposed_category": null
+    }
+  ]
+}
