@@ -52,30 +52,33 @@ Three steps, all automatic — the agent does nothing:
 3. **Ungrounded claims are blocked**, with the exact offending span, why it's
    unsupported, and what to do about it.
 
-### Three failures you already know
+### Two failures that actually slip past you
 
-**1. The fake "it's done."** The agent wraps up: *"Fixed the login bug — all 142
-tests pass."* You're one click from trusting it. But the trace shows the test run
-came back with failures (or never ran at all). vouch stops the commit cold:
+Not the clumsy lies — the confident, plausible claims you'd nod along to. One per
+axis vouch grounds.
+
+**Own work — the half-done refactor sold as finished.** The agent reports:
+*"Renamed `getUser` → `loadUser` and updated all the call sites."* It edited three
+files. It never ran a project-wide search for `getUser`, so it has no idea whether
+three was *all* of them — and the two it missed are a runtime break waiting to ship.
+vouch blocks the commit:
 
 ```
-⛔ vouch reviewer (BLOCK): [active-fabrication]
-   "all 142 tests pass" — the recorded run shows 3 failures.
-   → Fix the failures or report them; don't claim green over red.
+⛔ vouch reviewer (BLOCK): [passive-fabrication]
+   "updated all the call sites" — 3 files edited, but no search for `getUser`
+   usages this session; "all" has nothing behind it.
+   → grep the usages first, or scope the claim to what you actually touched.
 ```
 
-It can't ship the lie. The only way past the gate is to make the claim *true*.
+You can't claim *all* until you've actually looked for all.
 
-**2. The invented API.** *"Just pass `{ retry: true }` to `fetch()` — it retries
-automatically."* Confident, plausible, and completely made up — and the trace shows
-no docs were ever opened. vouch blocks it as an external claim with no source:
-training memory is not verified knowledge. One `WebFetch` of the real docs either
-grounds the claim or exposes it.
-
-**3. The premature all-clear.** *"Audited the codebase — no security issues."* The
-trace shows it read two files. vouch flags the gap: a sweeping "no issues" backed by
-a sliver of evidence is the most dangerous false confidence there is. Narrow the
-claim to what you actually checked — or go check the rest.
+**External knowledge — the precise claim that's quietly wrong.** While writing the
+batch loader the agent asserts: *"`Promise.all` rejects on the first rejection and
+cancels the remaining promises."* It sounds authoritative — and the second half is
+flat wrong (the others keep running). The trace shows no docs were ever opened. vouch
+flags it: a load-bearing claim about an external API, asserted from memory with no
+source. One `WebFetch` of the docs either grounds it or kills it before it becomes a
+bug. Training memory is not verified knowledge.
 
 ## How it runs
 
