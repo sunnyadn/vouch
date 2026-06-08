@@ -1,0 +1,12 @@
+{
+  "name": "vouch",
+  "description": "vouch — passive anti-hallucination gate for AI coding agents. Hooks auto-capture every tool result as evidence; an LLM reviewer checks the agent's claims (own-work and external) against it at commit and stop boundaries.",
+  "owner": { "name": "Sunny Yang" },
+  "plugins": [
+    {
+      "name": "vouch",
+      "source": "./plugin",
+      "description": "Passive anti-hallucination hooks for Claude Code: auto-capture tool results as evidence, a deterministic commit gate, and an LLM reviewer that catches fabrication, ungrounded conclusions, skipped research, and unbacked external claims. The hooks call the globally-installed `vouch` CLI."
+    }
+  ]
+}

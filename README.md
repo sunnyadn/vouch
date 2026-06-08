@@ -78,8 +78,15 @@ vouch doctor      # confirms the API key, endpoint, a live round-trip, the gate,
                   # project-memory, and trace capture
 ```
 
-3. **Install the hooks** — register the plugin (`.claude-plugin/plugin.json` +
-   `hooks/hooks.json`) with Claude Code, then restart the session.
+3. **Install the hooks** — the repo is its own marketplace
+   (`.claude-plugin/marketplace.json` → `./plugin`):
+
+```text
+/plugin marketplace add /path/to/this/repo
+/plugin install vouch@vouch
+```
+
+   Then restart the session and re-run `vouch doctor` to confirm.
 
 | Hook | What it does |
 | --- | --- |
