@@ -39,6 +39,47 @@ audits both axes passively, with no ceremony and no KB to maintain.)
   mistake (the reviewer reads the project's auto-memory).
 - **Omission** — unresolved failures the summary doesn't acknowledge.
 
+## How a catch works
+
+Three steps, all automatic — the agent does nothing:
+
+1. **Every tool result is recorded.** A `PostToolUse` hook appends every command,
+   file read, and search — *with its output* — to a session trace. Never a filtered
+   subset: a capture-time filter is itself the omission the capture exists to catch.
+2. **At commit and turn-end, the reviewer reads that trace.** For each factual claim
+   the agent makes, it queries the trace — *did the agent actually run this test,
+   read this file, fetch this source?* — instead of trusting the prose.
+3. **Ungrounded claims are blocked**, with the exact offending span, why it's
+   unsupported, and what to do about it.
+
+### Examples (all real)
+
+**Own-work fabrication — a claim with no run behind it.** The agent commits
+*"...refactored the cache. 127 tests still pass."* — but the trace shows no test
+command this session. vouch blocks the commit:
+
+```
+⛔ vouch reviewer (BLOCK): [passive-fabrication]
+   "127 tests still pass" — no test command was run this session; zero evidence.
+   → Run the suite and report the real result, or drop the claim.
+```
+
+The fix isn't to argue, it's to *run the test*. Once `bun test → 127 pass` is in the
+trace, the same commit clears. (This is verbatim what vouch did during its own build.)
+
+**Own-work contradiction — claim vs. a failing run.** The agent ends a turn with
+*"All tests pass, everything green,"* while the trace shows `bun test → 3 fail`.
+vouch blocks: the claim **contradicts** the recorded run (`active-fabrication`).
+
+**External claim — no source.** The agent writes *"Bun is the fastest JavaScript
+runtime, faster than Node and Deno"* with no `WebSearch`/`WebFetch` in the trace.
+vouch blocks (`passive-fabrication`): an assertion about the outside world with no
+source — training memory ≠ verified knowledge. A `WebFetch` of a benchmark grounds it.
+
+**Unverified assumption — from a real session.** *"...numba JIT first compile;
+warm-up will be faster."* The 19.9s timing was measured, but "warm-up will be faster"
+was never run. vouch flags the unverified half; the agent retracts it.
+
 ## How it runs
 
 Two layers, cheapest first:
