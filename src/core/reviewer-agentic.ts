@@ -154,14 +154,32 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
     `HISTORY INDEX (use query_history for outputs/details):\n${buildHistoryIndex(ctx.events)}${findings}`;
 
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMsg }];
+  // Up to MAX_AGENTIC_TURNS query turns, then ONE forcing turn with no tools. On a long trace
+  // the reviewer can keep querying and never emit a verdict, which used to fall through to
+  // fail-open and catch NOTHING exactly when the session is most claim-dense. The final
+  // tool-less turn demands a verdict from the history already gathered instead.
   try {
-    for (let turn = 0; turn < MAX_AGENTIC_TURNS; turn++) {
+    for (let turn = 0; turn <= MAX_AGENTIC_TURNS; turn++) {
+      const forcingTurn = turn === MAX_AGENTIC_TURNS;
+      if (forcingTurn) {
+        // Append the demand to the last tool_result message (a fresh `user` message would be two
+        // user turns in a row — the last message is always that array once we've looped).
+        const demand = {
+          type: "text" as const,
+          text: "Stop querying. Based on the history you have ALREADY gathered, output the verdict JSON now — no more tool calls.",
+        };
+        const last = messages[messages.length - 1];
+        if (Array.isArray(last?.content)) last.content.push(demand);
+        else messages.push({ role: "user", content: [demand] });
+        if (process.env.VOUCH_DIAG)
+          console.error(`[diag] forcing a verdict after ${MAX_AGENTIC_TURNS} query turns`);
+      }
       const m = await client.messages.create({
         model,
         max_tokens: 1500,
         temperature: 0,
         system: AGENTIC_REVIEWER_PROMPT,
-        tools: [QUERY_HISTORY_TOOL as Anthropic.Tool],
+        tools: forcingTurn ? [] : [QUERY_HISTORY_TOOL as Anthropic.Tool],
         messages,
       });
       if (m.stop_reason === "tool_use") {
@@ -192,34 +210,5 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
     if (process.env.VOUCH_DIAG) console.error(`[diag] reviewer ERROR: ${String(e).slice(0, 260)}`);
     return { issues: [], ok: true, status: "failed" }; // fail open — but RECORD that it failed
   }
-  // Queried for all MAX_AGENTIC_TURNS without ever emitting a verdict. This is the dominant
-  // failure on LONG traces (ev≈120): the reviewer keeps querying and never concludes, so it
-  // fell through to fail-open and caught NOTHING — exactly when the session is most claim-dense.
-  // Instead, force a final verdict: drop the tool and demand the JSON from what it already has.
-  if (process.env.VOUCH_DIAG)
-    console.error(`[diag] reviewer ran out of ${MAX_AGENTIC_TURNS} turns — forcing a verdict`);
-  try {
-    const last = messages[messages.length - 1];
-    const forcing = "Stop querying. Based on the history you have ALREADY gathered, output the verdict JSON now — no more tool calls.";
-    if (last && last.role === "user" && Array.isArray(last.content)) {
-      last.content.push({ type: "text", text: forcing });
-    } else {
-      messages.push({ role: "user", content: forcing });
-    }
-    const final = await client.messages.create({
-      model,
-      max_tokens: 1500,
-      temperature: 0,
-      system: AGENTIC_REVIEWER_PROMPT,
-      messages, // NO tools — it must conclude now
-    });
-    const text = final.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("");
-    return { ...parseReviewResponse(text), status: "reviewed" };
-  } catch (e) {
-    if (process.env.VOUCH_DIAG) console.error(`[diag] forced-verdict ERROR: ${String(e).slice(0, 260)}`);
-    return { issues: [], ok: true, status: "failed" }; // forcing failed → genuinely fail open
-  }
+  return { issues: [], ok: true, status: "failed" }; // tool_use with no query_history → bail
 }
