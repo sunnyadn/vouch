@@ -52,33 +52,30 @@ Three steps, all automatic — the agent does nothing:
 3. **Ungrounded claims are blocked**, with the exact offending span, why it's
    unsupported, and what to do about it.
 
-### Examples (all real)
+### Three failures you already know
 
-**Own-work fabrication — a claim with no run behind it.** The agent commits
-*"...refactored the cache. 127 tests still pass."* — but the trace shows no test
-command this session. vouch blocks the commit:
+**1. The fake "it's done."** The agent wraps up: *"Fixed the login bug — all 142
+tests pass."* You're one click from trusting it. But the trace shows the test run
+came back with failures (or never ran at all). vouch stops the commit cold:
 
 ```
-⛔ vouch reviewer (BLOCK): [passive-fabrication]
-   "127 tests still pass" — no test command was run this session; zero evidence.
-   → Run the suite and report the real result, or drop the claim.
+⛔ vouch reviewer (BLOCK): [active-fabrication]
+   "all 142 tests pass" — the recorded run shows 3 failures.
+   → Fix the failures or report them; don't claim green over red.
 ```
 
-The fix isn't to argue, it's to *run the test*. Once `bun test → 127 pass` is in the
-trace, the same commit clears. (This is verbatim what vouch did during its own build.)
+It can't ship the lie. The only way past the gate is to make the claim *true*.
 
-**Own-work contradiction — claim vs. a failing run.** The agent ends a turn with
-*"All tests pass, everything green,"* while the trace shows `bun test → 3 fail`.
-vouch blocks: the claim **contradicts** the recorded run (`active-fabrication`).
+**2. The invented API.** *"Just pass `{ retry: true }` to `fetch()` — it retries
+automatically."* Confident, plausible, and completely made up — and the trace shows
+no docs were ever opened. vouch blocks it as an external claim with no source:
+training memory is not verified knowledge. One `WebFetch` of the real docs either
+grounds the claim or exposes it.
 
-**External claim — no source.** The agent writes *"Bun is the fastest JavaScript
-runtime, faster than Node and Deno"* with no `WebSearch`/`WebFetch` in the trace.
-vouch blocks (`passive-fabrication`): an assertion about the outside world with no
-source — training memory ≠ verified knowledge. A `WebFetch` of a benchmark grounds it.
-
-**Unverified assumption — from a real session.** *"...numba JIT first compile;
-warm-up will be faster."* The 19.9s timing was measured, but "warm-up will be faster"
-was never run. vouch flags the unverified half; the agent retracts it.
+**3. The premature all-clear.** *"Audited the codebase — no security issues."* The
+trace shows it read two files. vouch flags the gap: a sweeping "no issues" backed by
+a sliver of evidence is the most dangerous false confidence there is. Narrow the
+claim to what you actually checked — or go check the rest.
 
 ## How it runs
 
