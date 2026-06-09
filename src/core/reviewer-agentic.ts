@@ -129,6 +129,20 @@ When you are done querying, output JSON ONLY (no prose, no code fences):
 Empty issues list if every claim is grounded.`;
 
 const MAX_AGENTIC_TURNS = 6;
+// The Stop/commit hooks KILL this process at their 60s timeout (plugin/hooks/hooks.json) — and
+// captureVerdict + the health note run AFTER the review returns, so a kill is SILENT: no verdict
+// recorded, no warning, nothing. Measured: a real ~4MB / 810-event trace takes ~64s > 60s → killed.
+// So bound ourselves BELOW the hook timeout: force a verdict when out of TIME (not just out of
+// turns), and hard-race a backstop so SOMETHING is always returned in time to be recorded.
+// Per-call latency dominates (~8-9s each on deepseek), so budget by wall-clock, not just turns.
+// SOFT forces the verdict early enough that the forcing call (~9s) still finishes with margin;
+// HARD is the absolute backstop that resolves `failed` before the 60s hook kill.
+const SOFT_BUDGET_MS = 32_000; // start the forcing turn once elapsed exceeds this (~4 query turns)
+const HARD_DEADLINE_MS = 50_000; // absolute backstop, comfortably under the 60s hook timeout
+
+// Fail OPEN — a reviewer that can't complete must never break the session. status:"failed" keeps
+// it VISIBLE (health note + corpus tag) so an empty verdict isn't mistaken for a clean pass.
+const failOpen = (): ReviewVerdict => ({ issues: [], ok: true, status: "failed" });
 
 export interface AgenticContext {
   action: string;
@@ -159,61 +173,81 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
     `HISTORY INDEX (use query_history for outputs/details):\n${buildHistoryIndex(ctx.events)}${findings}`;
 
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMsg }];
-  // Up to MAX_AGENTIC_TURNS query turns, then ONE forcing turn with no tools. On a long trace
-  // the reviewer can keep querying and never emit a verdict, which used to fall through to
-  // fail-open and catch NOTHING exactly when the session is most claim-dense. The final
-  // tool-less turn demands a verdict from the history already gathered instead.
-  try {
-    for (let turn = 0; turn <= MAX_AGENTIC_TURNS; turn++) {
-      const forcingTurn = turn === MAX_AGENTIC_TURNS;
-      if (forcingTurn) {
-        // Append the demand to the last tool_result message (a fresh `user` message would be two
-        // user turns in a row — the last message is always that array once we've looped).
-        const demand = {
-          type: "text" as const,
-          text: "Stop querying. Based on the history you have ALREADY gathered, output the verdict JSON now — no more tool calls.",
-        };
-        const last = messages[messages.length - 1];
-        if (Array.isArray(last?.content)) last.content.push(demand);
-        else messages.push({ role: "user", content: [demand] });
-        if (process.env.VOUCH_DIAG)
-          console.error(`[diag] forcing a verdict after ${MAX_AGENTIC_TURNS} query turns`);
-      }
-      const m = await client.messages.create({
-        model,
-        max_tokens: 1500,
-        temperature: 0,
-        system: AGENTIC_REVIEWER_PROMPT,
-        tools: forcingTurn ? [] : [QUERY_HISTORY_TOOL as Anthropic.Tool],
-        messages,
-      });
-      if (m.stop_reason === "tool_use") {
-        messages.push({ role: "assistant", content: m.content });
-        const results: Anthropic.ToolResultBlockParam[] = [];
-        for (const block of m.content) {
-          if (block.type === "tool_use" && block.name === "query_history") {
-            const input = block.input as { pattern?: unknown };
-            const pattern = typeof input?.pattern === "string" ? input.pattern : "";
-            results.push({
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: formatHits(queryHistory(ctx.events, pattern)),
-            });
-          }
+  const start = Date.now();
+  // Up to MAX_AGENTIC_TURNS query turns, then ONE forcing turn with no tools. On a long trace the
+  // reviewer can keep querying and never emit a verdict, which used to fall through to fail-open
+  // and catch NOTHING exactly when the session is most claim-dense. The forcing turn demands a
+  // verdict from the history already gathered — triggered by running out of TURNS *or* TIME.
+  const runLoop = async (): Promise<ReviewVerdict> => {
+    try {
+      for (let turn = 0; turn <= MAX_AGENTIC_TURNS; turn++) {
+        const forcingTurn = turn === MAX_AGENTIC_TURNS || Date.now() - start > SOFT_BUDGET_MS;
+        if (forcingTurn) {
+          // Append the demand to the last tool_result message (a fresh `user` message would be two
+          // user turns in a row — the last message is always that array once we've looped).
+          const demand = {
+            type: "text" as const,
+            text: "Stop querying. Based on the history you have ALREADY gathered, output the verdict JSON now — no more tool calls.",
+          };
+          const last = messages[messages.length - 1];
+          if (Array.isArray(last?.content)) last.content.push(demand);
+          else messages.push({ role: "user", content: [demand] });
+          if (process.env.VOUCH_DIAG)
+            console.error(`[diag] forcing a verdict (turn ${turn}, ${Date.now() - start}ms elapsed)`);
         }
-        if (results.length === 0) break; // tool_use stop but no query_history call → bail
-        messages.push({ role: "user", content: results });
-        continue;
+        const m = await client.messages.create({
+          model,
+          max_tokens: 1500,
+          temperature: 0,
+          system: AGENTIC_REVIEWER_PROMPT,
+          tools: forcingTurn ? [] : [QUERY_HISTORY_TOOL as Anthropic.Tool],
+          messages,
+        });
+        if (m.stop_reason === "tool_use") {
+          messages.push({ role: "assistant", content: m.content });
+          const results: Anthropic.ToolResultBlockParam[] = [];
+          for (const block of m.content) {
+            if (block.type === "tool_use" && block.name === "query_history") {
+              const input = block.input as { pattern?: unknown };
+              const pattern = typeof input?.pattern === "string" ? input.pattern : "";
+              results.push({
+                type: "tool_result",
+                tool_use_id: block.id,
+                content: formatHits(queryHistory(ctx.events, pattern)),
+              });
+            }
+          }
+          if (results.length === 0) break; // tool_use stop but no query_history call → bail
+          messages.push({ role: "user", content: results });
+          continue;
+        }
+        const text = m.content
+          .filter((b): b is Anthropic.TextBlock => b.type === "text")
+          .map((b) => b.text)
+          .join("");
+        return { ...parseReviewResponse(text), status: "reviewed" };
       }
-      const text = m.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("");
-      return { ...parseReviewResponse(text), status: "reviewed" };
+    } catch (e) {
+      if (process.env.VOUCH_DIAG) console.error(`[diag] reviewer ERROR: ${String(e).slice(0, 260)}`);
+      return failOpen(); // an error → fail open, but RECORD that it failed
     }
-  } catch (e) {
-    if (process.env.VOUCH_DIAG) console.error(`[diag] reviewer ERROR: ${String(e).slice(0, 260)}`);
-    return { issues: [], ok: true, status: "failed" }; // fail open — but RECORD that it failed
+    return failOpen(); // tool_use with no query_history → bail
+  };
+
+  // Hard backstop: if even the time-forced loop overruns (e.g. a maxRetries call backing off past
+  // budget), resolve `failed` before the hook SIGKILLs us — so the verdict gets RECORDED + the
+  // health note fires, instead of dying silently below the status floor.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const backstop = new Promise<ReviewVerdict>((resolve) => {
+    timer = setTimeout(() => {
+      if (process.env.VOUCH_DIAG)
+        console.error(`[diag] HARD deadline ${HARD_DEADLINE_MS}ms hit — returning failed before the hook kill`);
+      resolve(failOpen());
+    }, HARD_DEADLINE_MS);
+  });
+  try {
+    return await Promise.race([runLoop(), backstop]);
+  } finally {
+    clearTimeout(timer); // race settled → cancel the pending timer so we never hang
   }
-  return { issues: [], ok: true, status: "failed" }; // tool_use with no query_history → bail
 }
