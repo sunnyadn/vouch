@@ -103,7 +103,8 @@ function loadTrajectories(): Traj[] {
       if (CLEAN) {
         if (hallu) continue; // precision: clean trajectories only
       } else {
-        if (!hallu || t.hallucination_category !== CATEGORY) continue; // recall: this category
+        if (!hallu) continue;
+        if (CATEGORY !== "all" && t.hallucination_category !== CATEGORY) continue; // recall: this category
       }
       out.push(t);
     }
@@ -111,16 +112,33 @@ function loadTrajectories(): Traj[] {
   return out;
 }
 
-const trajectories = loadTrajectories().slice(0, LIMIT);
+// --category all → sample up to LIMIT *per category* (breadth across categories AND frameworks,
+// since category correlates with framework); otherwise take the first LIMIT of one category.
+const ALL = !CLEAN && CATEGORY === "all";
+const loaded = loadTrajectories();
+let trajectories: Traj[];
+if (ALL) {
+  const byCat = new Map<string, Traj[]>();
+  for (const t of loaded) {
+    const c = t.hallucination_category ?? "?";
+    if (!byCat.has(c)) byCat.set(c, []);
+    byCat.get(c)!.push(t);
+  }
+  trajectories = [...byCat.values()].flatMap((arr) => arr.slice(0, LIMIT));
+} else {
+  trajectories = loaded.slice(0, LIMIT);
+}
+
 // Print the ACTUAL model/endpoint — the A/B swaps these via env, so the output must say which.
 const endpoint = process.env.ANTHROPIC_BASE_URL ?? "api.anthropic.com";
 const model = process.env.VOUCH_REVIEWER_MODEL ?? "(default)";
 console.log(
-  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps\n`,
+  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${ALL ? "ALL categories" : CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps\n`,
 );
 
 let hits = 0; // recall: fired-on-hallucination; precision: fired-on-clean (a FALSE positive)
 const total = trajectories.length;
+const byCat = new Map<string, { good: number; n: number }>(); // per-category tally
 for (const t of trajectories) {
   const halluStep = Number(t.hallucination_step);
   // RECALL: review the labeled bad step, with the grounding gathered before it.
@@ -139,13 +157,23 @@ for (const t of trajectories) {
   if (firedMajority) hits++;
   // RECALL wants fire (✓ = caught); PRECISION wants silence (✓ = no false alarm)
   const good = CLEAN ? !firedMajority : firedMajority;
+  const cat = CLEAN ? "clean" : t.hallucination_category ?? "?";
+  const s = byCat.get(cat) ?? { good: 0, n: 0 };
+  s.n++;
+  if (good) s.good++;
+  byCat.set(cat, s);
   const sub = t.hallucination_subcategory || t.hallucination_category || "clean";
   console.log(`${good ? "✓" : "✗"} [${t.agent_type}] ${sub}  (fired ${fired}/${REPS})`);
 }
 
 console.log("\n── Scorecard ──");
+if (ALL || CLEAN) {
+  for (const [cat, s] of byCat)
+    console.log(`  ${cat.padEnd(30)} ${s.good}/${s.n} ${CLEAN ? "silent" : "caught"} (${((s.good / s.n) * 100).toFixed(0)}%)`);
+  console.log("  " + "─".repeat(40));
+}
 if (CLEAN) {
-  console.log(`PRECISION: ${total - hits}/${total} clean trajectories correctly silent (${(((total - hits) / total) * 100).toFixed(0)}%) — ${hits} false alarms`);
+  console.log(`PRECISION: ${total - hits}/${total} clean correctly silent (${(((total - hits) / total) * 100).toFixed(0)}%) — ${hits} false alarms`);
 } else {
   console.log(`RECALL: ${hits}/${total} caught (${((hits / total) * 100).toFixed(0)}%) — ${total - hits} missed`);
 }
