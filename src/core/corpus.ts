@@ -14,7 +14,7 @@
 // so a local log is strictly less exposure). Path: ~/.claude/vouch-corpus.jsonl, or
 // $VOUCH_CORPUS_PATH. Fail-open: a logging error must NEVER break the session.
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { CapturedEvent } from "./evidence-capture.ts";
@@ -24,6 +24,50 @@ import type { ReviewVerdict } from "./reviewer.ts";
 // uses — a hard-copied default would silently read the wrong/empty file if this ever drifts.
 export function corpusPath(): string {
   return process.env.VOUCH_CORPUS_PATH ?? join(homedir(), ".claude", "vouch-corpus.jsonl");
+}
+
+// Human-labeled reviewer MISSES — cases where vouch reviewed and stayed silent but a human
+// judged a claim fabricated/ungrounded. Separate from the corpus because these carry GOLD
+// labels (the human is the labeler, ⟂ the reviewer being judged), which is exactly what the
+// corpus's self-labels can't give us. Feeds bench/deepseek-eval as recall (expect FIRE) cases.
+export function missesPath(): string {
+  return process.env.VOUCH_MISSES_PATH ?? join(homedir(), ".claude", "vouch-misses.jsonl");
+}
+
+// Record a reviewer MISS: snapshot the MOST RECENT corpus record (the review that just
+// happened and missed) — its response + the exact trace vouch saw — alongside the human's note
+// of which claim was ungrounded. The latest record is the right one in the common case (the
+// user calls out the response right after it lands). Self-contained + replayable. Fail-open:
+// a logging error must never break the session.
+export function flagMiss(note: string): { sourceTs?: string; events?: number; ageSec?: number } {
+  let source: { ts?: string; events?: CapturedEvent[] } | undefined;
+  try {
+    const lines = readFileSync(corpusPath(), "utf8").split("\n").filter(Boolean);
+    const last = lines.at(-1);
+    if (last) source = JSON.parse(last);
+  } catch {
+    // no corpus yet — still record the note (just without an attached trace)
+  }
+  try {
+    // Store the whole source record as-is: keeping vouch's own verdict (status/issues) next to
+    // the human's FIRE label IS the signal — "reviewed clean, but a human caught it".
+    const entry = {
+      ts: new Date().toISOString(),
+      kind: "missed", // vouch reviewed and stayed silent; a human says it should have FIRED
+      expect: "FIRE",
+      note,
+      source: source ?? null,
+    };
+    appendFileSync(missesPath(), `${JSON.stringify(entry)}\n`);
+  } catch {
+    // never break the session
+  }
+  // Surface the source's age so attaching the WRONG (stale) trace is auditable, not silent —
+  // the latest record is only the right one if the user flags right after the response lands.
+  const ageSec = source?.ts
+    ? Math.round((Date.now() - new Date(source.ts).getTime()) / 1000)
+    : undefined;
+  return { sourceTs: source?.ts, events: source?.events?.length, ageSec };
 }
 
 // Bound the stored events so a record stays ~KB-sized but stays REPLAYABLE: the agentic

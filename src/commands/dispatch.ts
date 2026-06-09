@@ -273,6 +273,21 @@ export async function dispatch(argv: string[]): Promise<number> {
     });
 
   program
+    .command("flag")
+    .argument("<note...>", "the ungrounded claim vouch missed + why it had no support")
+    .description("record a reviewer MISS (a claim vouch reviewed but failed to flag) as gold corpus")
+    .action(async (noteParts: string[]) => {
+      const { flagMiss, missesPath } = await import("../core/corpus.ts");
+      const r = flagMiss(noteParts.join(" ").trim());
+      // Show the source's age — if it's not seconds old, it may be the wrong review (verify it).
+      process.stdout.write(
+        r.sourceTs
+          ? `vouch: flagged a MISS against the most recent review (${r.ageSec}s ago, ${r.events} trace events) → ${missesPath()}\n`
+          : `vouch: recorded the note, but found no prior review in the corpus to attach a trace to → ${missesPath()}\n`,
+      );
+    });
+
+  program
     .command("doctor")
     .description(
       "diagnose whether vouch is set up to catch things (API key, endpoint, latency, capture)",

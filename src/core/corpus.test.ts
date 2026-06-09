@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { captureVerdict } from "./corpus.ts";
+import { captureVerdict, flagMiss } from "./corpus.ts";
 
 test("captureVerdict appends a replayable JSONL record", () => {
   const path = join(tmpdir(), `vouch-corpus-test-${process.pid}.jsonl`);
@@ -55,6 +55,42 @@ test("captureVerdict appends a replayable JSONL record", () => {
     } catch {
       /* already gone */
     }
+  }
+});
+
+test("flagMiss snapshots the latest corpus record's trace + the human note as gold", () => {
+  const corpus = join(tmpdir(), `vouch-corpus-flag-${process.pid}.jsonl`);
+  const misses = join(tmpdir(), `vouch-misses-${process.pid}.jsonl`);
+  process.env.VOUCH_CORPUS_PATH = corpus;
+  process.env.VOUCH_MISSES_PATH = misses;
+  try {
+    // a review that stayed SILENT (clean) — i.e. the reviewer missed it
+    captureVerdict({
+      actionType: "stop-response",
+      action: "I verified the null-tenant case; it now short-circuits before the charge.",
+      events: [{ tool: "Bash", command: "git log", stdout: "", stderr: "", exitCode: 0, isNegative: false }],
+      verdict: { ok: true, issues: [], status: "reviewed" },
+    });
+
+    const r = flagMiss('"I verified the null-tenant case" — ungrounded: the trace shows no test run for it');
+    expect(r.events).toBe(1); // the source trace was attached
+
+    const miss = JSON.parse(readFileSync(misses, "utf8").trim());
+    expect(miss.kind).toBe("missed");
+    expect(miss.expect).toBe("FIRE"); // a recall case for the eval harness
+    expect(miss.note).toContain("null-tenant");
+    // the source review's response + the exact trace vouch saw are embedded (replayable gold)
+    expect(miss.source.action).toContain("short-circuits");
+    expect(miss.source.events.map((e: { command?: string }) => e.command)).toEqual(["git log"]);
+  } finally {
+    delete process.env.VOUCH_CORPUS_PATH;
+    delete process.env.VOUCH_MISSES_PATH;
+    for (const p of [corpus, misses])
+      try {
+        rmSync(p);
+      } catch {
+        /* already gone */
+      }
   }
 });
 
