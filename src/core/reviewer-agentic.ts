@@ -19,7 +19,11 @@ export interface HistoryHit {
 // Search the full trace for events whose command, file path, or output matches `pattern`.
 // Returns matches with their FULL output (bounded per hit) so the reviewer can verify
 // "did the agent actually run / read / observe X" against what really happened — not a
-// lossy summary. Most-recent first, capped (older matches dropped; narrow the pattern).
+// lossy summary. CHRONOLOGICAL order, capped to the most recent `max` (older matches
+// dropped; narrow the pattern). Order must be chronological AND labeled in formatHits:
+// an unlabeled most-recent-first list reads as "the history shows the OPPOSITE order"
+// and induced an active-fabrication false-fire on a grounded red→green fix
+// (bench/verify-replay, R4 — kimi flagged the fix as sequence-inverted).
 export function queryHistory(
   events: CapturedEvent[],
   pattern: string,
@@ -45,13 +49,13 @@ export function queryHistory(
       output: (e.stdout ?? "").slice(0, perOutput),
     });
   }
-  return hits.slice(-max).reverse();
+  return hits.slice(-max);
 }
 
 // Render hits as the tool-result text the reviewer reads back.
 export function formatHits(hits: HistoryHit[]): string {
   if (hits.length === 0) return "(no matching events in the session history)";
-  return hits
+  const body = hits
     .map((h) => {
       const label = h.filePath
         ? `${h.tool} ${h.filePath}`
@@ -59,12 +63,13 @@ export function formatHits(hits: HistoryHit[]): string {
       return h.output ? `${label}\n${h.output}` : label;
     })
     .join("\n---\n");
+  return `Matching events in CHRONOLOGICAL order (earliest first → latest last):\n${body}`;
 }
 
 export const QUERY_HISTORY_TOOL = {
   name: "query_history",
   description:
-    "Search THIS session's full history (every command run with its full output, every file read/edited, commits) for what the agent actually did or observed. Call this to VERIFY a claim before flagging it as ungrounded — e.g. query 'bun test' to check tests ran, a file path to check it was read, a commit hash to check it exists. Returns matching events with full output.",
+    "Search THIS session's full history (every command run with its full output, every file read/edited, commits) for what the agent actually did or observed. Call this to VERIFY a claim before flagging it as ungrounded — e.g. query 'bun test' to check tests ran, a file path to check it was read, a commit hash to check it exists. Returns matching events with full output, in CHRONOLOGICAL order (earliest first).",
   input_schema: {
     type: "object",
     properties: {
