@@ -112,8 +112,11 @@ function loadTrajectories(): Traj[] {
 }
 
 const trajectories = loadTrajectories().slice(0, LIMIT);
+// Print the ACTUAL model/endpoint — the A/B swaps these via env, so the output must say which.
+const endpoint = process.env.ANTHROPIC_BASE_URL ?? "api.anthropic.com";
+const model = process.env.VOUCH_REVIEWER_MODEL ?? "(default)";
 console.log(
-  `AgentHallu → deepseek reviewer | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps\n`,
+  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps\n`,
 );
 
 let hits = 0; // recall: fired-on-hallucination; precision: fired-on-clean (a FALSE positive)
