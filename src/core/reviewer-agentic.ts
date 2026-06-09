@@ -210,10 +210,13 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
             if (block.type === "tool_use" && block.name === "query_history") {
               const input = block.input as { pattern?: unknown };
               const pattern = typeof input?.pattern === "string" ? input.pattern : "";
+              const hits = queryHistory(ctx.events, pattern);
+              if (process.env.VOUCH_DIAG)
+                console.error(`[diag] query "${pattern}" → ${hits.length} hits`);
               results.push({
                 type: "tool_result",
                 tool_use_id: block.id,
-                content: formatHits(queryHistory(ctx.events, pattern)),
+                content: formatHits(hits),
               });
             }
           }

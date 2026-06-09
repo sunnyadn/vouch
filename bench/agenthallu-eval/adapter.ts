@@ -149,9 +149,13 @@ for (const t of trajectories) {
   const events = CLEAN ? eventsBefore(t, Number.MAX_SAFE_INTEGER) : eventsBefore(t, halluStep);
 
   let fired = 0;
+  let firedIssues: { type: string; detail: string }[] = [];
   for (let r = 0; r < REPS; r++) {
     const v = await anthropicReviewerAgentic({ action, actionType: "stop-response", events, projectFindings: [] });
-    if (v.issues.some((i) => i.severity === "block" || i.severity === "warn")) fired++;
+    if (v.issues.some((i) => i.severity === "block" || i.severity === "warn")) {
+      fired++;
+      firedIssues = v.issues; // keep a firing verdict so we can show WHY (esp. cry-wolf reasons)
+    }
   }
   const firedMajority = fired > REPS / 2;
   if (firedMajority) hits++;
@@ -164,6 +168,8 @@ for (const t of trajectories) {
   byCat.set(cat, s);
   const sub = t.hallucination_subcategory || t.hallucination_category || "clean";
   console.log(`${good ? "✓" : "✗"} [${t.agent_type}] ${sub}  (fired ${fired}/${REPS})`);
+  // On a CRY-WOLF (clean trajectory it flagged), print why — the diagnostic for precision work.
+  if (CLEAN && firedMajority) for (const i of firedIssues) console.log(`     ↳ ${i.type}: ${i.detail.slice(0, 160)}`);
 }
 
 console.log("\n── Scorecard ──");
