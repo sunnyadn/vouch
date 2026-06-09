@@ -144,7 +144,12 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return { issues: [], ok: true, status: "skipped" };
   const model = process.env.VOUCH_REVIEWER_MODEL ?? DEFAULT_MODEL;
-  const client = new Anthropic({ apiKey });
+  // This reviewer is FAIL-OPEN-CRITICAL: an exhausted-retry error doesn't error the session,
+  // it silently UN-GATES it (catch → status:"failed", ok:true). It also makes up to 7
+  // sequential calls per review, so one transient blip anywhere collapses the whole review —
+  // and that's likeliest on the big, claim-dense traces that matter most (a real such fail-open
+  // showed up in the corpus). So tolerate more transients than the SDK's interactive default of 2.
+  const client = new Anthropic({ apiKey, maxRetries: 4 });
 
   const findings = ctx.projectFindings?.length
     ? `\n\nPROJECT FINDINGS (lessons learned across sessions):\n${ctx.projectFindings.map((f) => `  • ${f}`).join("\n")}`

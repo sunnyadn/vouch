@@ -20,7 +20,9 @@ import { join } from "node:path";
 import type { CapturedEvent } from "./evidence-capture.ts";
 import type { ReviewVerdict } from "./reviewer.ts";
 
-function corpusPath(): string {
+// Exported so corpus readers (e.g. bench/deepseek-eval) resolve the SAME location the writer
+// uses — a hard-copied default would silently read the wrong/empty file if this ever drifts.
+export function corpusPath(): string {
   return process.env.VOUCH_CORPUS_PATH ?? join(homedir(), ".claude", "vouch-corpus.jsonl");
 }
 
