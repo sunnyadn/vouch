@@ -35,9 +35,16 @@ is **BURIAL** (the bad claim blends in and draws no scrutiny), NOT turn-exhausti
 run-to-run, R1 5/6, R3 2/6). Always run REPS≥4; never conclude from one run.
 
 Levers tested / on the table:
-- **factored reviewer (per-claim decompose) — TESTED, DEAD on deepseek.** Reusing the exact
-  kimi-validated probe28 cases at REPS=4, it REVERSES: agentic 4/4 & 2/4 buried-recall vs
-  factored 1/4 & 0/4 (its load-bearing extract filter over-drops on deepseek). Do NOT wire.
+- **factored (per-claim decompose) — the KIMI-TUNED version is inert on deepseek; do not wire
+  it.** Reusing the kimi-validated probe28 cases at REPS=4: agentic 4/4 & 2/4 buried-recall vs
+  factored 1/4 & 0/4. Cause (verified by dumping intermediates): BOTH stages fail — EXTRACT
+  returns 0 claims 2/3 of the time, and when the fab IS extracted VERIFY false-clears it.
+  Driver = the extract/verify prompts are tuned on kimi to suppress false-positives; deepseek
+  takes that leniency to the extreme and goes inert. So this is prompt-calibration, NOT a
+  deepseek limit. A deepseek-tuned attempt (looser extract, tighter verify) was then TRIED and
+  ALSO failed (0/4 & 0/4 buried recall, GROUNDED clean) — so factored-on-deepseek is a hard,
+  open problem (2 configs inert), NOT a free win, NOT proven impossible. Diminishing returns;
+  don't grind it. "decomposition is dead on deepseek" would still be an overclaim (N=2 configs).
 - **consensus / K-rep (candidate for the variance + low-recall finding):** single-shot R3 is
   2/6, so "any-fire over K reps" would catch it. any-fire = max recall, majority = balanced.
   Cost = K× per turn + any-fire compounds FPs → a recall/precision/cost tradeoff to measure
