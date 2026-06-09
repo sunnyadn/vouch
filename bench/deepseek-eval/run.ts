@@ -93,19 +93,31 @@ const CASES: Case[] = [
 const cases = CASES.filter((c) => !ONLY || c.kind === ONLY);
 console.log(`deepseek-eval — model=${process.env.VOUCH_REVIEWER_MODEL} REPS=${REPS}, ${cases.length} cases\n`);
 
-const rows: { c: Case; fires: number; pass: boolean }[] = [];
+const rows: { c: Case; fires: number; valid: number; pass: boolean }[] = [];
+let failOpens = 0;
 for (const c of cases) {
   let fires = 0;
+  let valid = 0; // reps that actually completed — a fail-open (429/error) returns status:"failed",
   for (let i = 0; i < REPS; i++) {
-    const v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
+    // issues:[] — which counts as a silent "no fire" and CORRUPTS the score. Retry it, don't count it.
+    let v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
+    for (let r = 0; v.status === "failed" && r < 3; r++) {
+      failOpens++;
+      await new Promise((res) => setTimeout(res, 2500 * (r + 1))); // back off the 429
+      v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
+    }
+    if (v.status === "failed") continue; // still dead after retries — skip (do NOT count as no-fire)
+    valid++;
     if (v.issues.length > 0) fires++;
   }
-  const majorityFire = fires * 2 > REPS;
-  const pass = (c.expect === "FIRE") === majorityFire;
-  const stable = fires === 0 || fires === REPS;
-  rows.push({ c, fires, pass });
-  console.log(`${pass ? "✅" : "❌"} [${c.kind}] ${c.id}: want ${c.expect}, fired ${fires}/${REPS}${stable ? "" : " ⚠variance"}  — ${c.note}`);
+  const majorityFire = fires * 2 > valid;
+  const pass = valid > 0 && (c.expect === "FIRE") === majorityFire;
+  const stable = valid > 0 && (fires === 0 || fires === valid);
+  rows.push({ c, fires, valid, pass });
+  const tag = valid === 0 ? "⊘ DEAD" : pass ? "✅" : "❌";
+  console.log(`${tag} [${c.kind}] ${c.id}: want ${c.expect}, fired ${fires}/${valid}${valid < REPS ? ` (${REPS - valid} fail-open)` : ""}${stable ? "" : " ⚠variance"}  — ${c.note}`);
 }
+if (failOpens) console.log(`\n⚠ ${failOpens} fail-open(s) hit during the run (retried) — quota/429 pressure.`);
 
 const score = (kind: "recall" | "precision", expect: "FIRE" | "NOFIRE") => {
   const sub = rows.filter((r) => r.c.kind === kind && r.c.expect === expect);
