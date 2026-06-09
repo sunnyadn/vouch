@@ -123,6 +123,32 @@ export async function runDoctor(opts: { dir?: string } = {}): Promise<DoctorChec
     });
   }
 
+  // 8. Hooks invoke bare `vouch hook …`, so the whole plugin is dead if `vouch` isn't on PATH —
+  //    the blind spot a green round-trip hides: doctor can be reached via `bun run src/cli.ts`
+  //    (or a stale link) and pass every other check while the hooks silently no-op (no trace,
+  //    nothing reviewed). Execute it the way a hook would, to also catch a broken/stale link.
+  //    Pass PATH explicitly — Bun.which otherwise reads a native env snapshot that ignores a
+  //    runtime PATH change, which would make this check lie about the live environment.
+  const resolved = Bun.which("vouch", { PATH: process.env.PATH });
+  let ok = false;
+  let detail: string;
+  if (!resolved) {
+    detail =
+      "hooks run bare `vouch hook …` but `vouch` is not on PATH → every hook silently no-ops " +
+      "(no trace, nothing reviewed). Run `bun link` and ensure ~/.bun/bin is on your PATH.";
+  } else {
+    try {
+      const run = Bun.spawnSync(["vouch", "--version"]);
+      ok = run.exitCode === 0;
+      detail = ok
+        ? `\`vouch\` resolves + runs (${resolved}) — hooks can fire.`
+        : `\`vouch\` is on PATH (${resolved}) but failed to run (exit ${run.exitCode}) — relink with \`bun link\`.`;
+    } catch (e) {
+      detail = `\`vouch\` is on PATH (${resolved}) but could not be executed: ${(e instanceof Error ? e.message : String(e)).slice(0, 100)}`;
+    }
+  }
+  checks.push({ name: "hook command", ok, detail });
+
   return checks;
 }
 

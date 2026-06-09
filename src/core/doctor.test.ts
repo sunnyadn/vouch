@@ -25,6 +25,27 @@ test("doctor flags missing ANTHROPIC_API_KEY as blocking and skips the network r
   }
 });
 
+// The plugin is dead if the hooks can't resolve bare `vouch` on PATH — and a green
+// round-trip hides that (doctor can be reached via `bun run src/cli.ts` with no link).
+// doctor must flag it as blocking, not stay silent.
+test("doctor flags `vouch` not resolving on PATH as a blocking hook-command issue", async () => {
+  const savedPath = process.env.PATH;
+  const savedKey = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY; // avoid a real network round-trip
+  process.env.PATH = "/nonexistent-doctor-test-dir"; // no `vouch` here
+  const dir = mkdtempSync(join(tmpdir(), "vouch-doctor-"));
+  try {
+    const checks = await runDoctor({ dir });
+    const hook = checks.find((c) => c.name === "hook command");
+    expect(hook?.ok).toBe(false);
+    expect(hook?.detail).toContain("not on PATH");
+    expect(formatDoctor(checks)).toContain("blocking issue");
+  } finally {
+    if (savedPath !== undefined) process.env.PATH = savedPath;
+    if (savedKey !== undefined) process.env.ANTHROPIC_API_KEY = savedKey;
+  }
+});
+
 test("formatDoctor renders an all-green report with no blocking line", () => {
   const out = formatDoctor([{ name: "deterministic gate", ok: true, detail: "always on." }]);
   expect(out).toContain("✓");
