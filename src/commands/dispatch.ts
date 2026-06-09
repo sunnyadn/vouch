@@ -279,7 +279,11 @@ export async function dispatch(argv: string[]): Promise<number> {
     )
     .action(async () => {
       const { runDoctor, formatDoctor } = await import("../core/doctor.ts");
-      process.stdout.write(`${formatDoctor(await runDoctor())}\n`);
+      const checks = await runDoctor();
+      process.stdout.write(`${formatDoctor(checks)}\n`);
+      // Exit non-zero on a blocking (✗) issue so CI / `vouch doctor && …` can DETECT a dead
+      // setup instead of trusting a 0 exit. Warns (⚠) are not blocking → stay 0.
+      if (checks.some((c) => c.ok === false)) process.exit(1);
     });
 
   try {
