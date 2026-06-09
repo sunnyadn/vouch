@@ -71,10 +71,13 @@ function eventsBefore(t: Traj, upto: number): CapturedEvent[] {
   return events;
 }
 
+// AgentHallu fields aren't always strings (agent_answer / content can be structured) — coerce.
+const asText = (x: unknown): string => (typeof x === "string" ? x : x == null ? "" : JSON.stringify(x));
+
 function stepText(s: Step | undefined): string {
   if (!s) return "";
   const parts: string[] = [];
-  if (s.content) parts.push(s.content);
+  if (s.content) parts.push(asText(s.content));
   for (const tc of s.tool_calls ?? []) parts.push(`[tool: ${tc.name}(${JSON.stringify(tc.arguments)})]`);
   return parts.join("\n");
 }
@@ -120,8 +123,8 @@ for (const t of trajectories) {
   // RECALL: review the labeled bad step, with the grounding gathered before it.
   // PRECISION: review the final answer, with ALL the grounding gathered.
   const action = CLEAN
-    ? t.agent_answer || stepText(t.history.at(-1))
-    : stepText(t.history.find((s) => s.step === halluStep)) || t.agent_answer;
+    ? asText(t.agent_answer) || stepText(t.history.at(-1))
+    : stepText(t.history.find((s) => s.step === halluStep)) || asText(t.agent_answer);
   const events = CLEAN ? eventsBefore(t, Number.MAX_SAFE_INTEGER) : eventsBefore(t, halluStep);
 
   let fired = 0;
