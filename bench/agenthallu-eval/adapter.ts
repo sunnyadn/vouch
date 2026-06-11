@@ -18,6 +18,7 @@ for (const line of readFileSync(join(ROOT, ".env"), "utf8").split("\n")) {
   if (m?.[1] && !process.env[m[1]]) process.env[m[1]] = m[2] ?? "";
 }
 const { anthropicReviewerAgentic } = await import("../../src/core/reviewer-agentic.ts");
+const { verifyMajority } = await import("../verify-replay/verifier.ts");
 
 const DATA = process.env.AGENTHALLU_DIR ?? "/tmp/AgentHallu-fresh/AgentHallu";
 const args = process.argv.slice(2);
@@ -29,6 +30,11 @@ const CLEAN = args.includes("--clean"); // precision mode: expect NOFIRE on clea
 const CATEGORY = flag("--category", "Tool-Use Hallucination");
 const LIMIT = Number(flag("--limit", "15"));
 const REPS = Number(flag("--reps", "2"));
+// --verify: two-stage — each detector fire is re-judged by the SAME model as a stage-2
+// verifier (majority of --vreps); the rep counts as fired only if upheld. Validated on the
+// coding gold (bench/verify-replay): kimi-detect + kimi-self-verify 10/10 at REPS=4.
+const VERIFY = args.includes("--verify");
+const VREPS = Number(flag("--vreps", "2"));
 
 interface Step {
   step: number;
@@ -133,10 +139,18 @@ if (ALL) {
 const endpoint = process.env.ANTHROPIC_BASE_URL ?? "api.anthropic.com";
 const model = process.env.VOUCH_REVIEWER_MODEL ?? "(default)";
 console.log(
-  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${ALL ? "ALL categories" : CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps\n`,
+  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${ALL ? "ALL categories" : CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps${VERIFY ? ` | TWO-STAGE self-verify ×${VREPS}` : ""}\n`,
 );
+// Stage-2 verifier = the SAME model/endpoint the detector runs on (self-verify).
+const verifierModel = {
+  name: "self",
+  apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+  baseURL: process.env.ANTHROPIC_BASE_URL ?? "",
+  model: process.env.VOUCH_REVIEWER_MODEL ?? "",
+};
 
 let hits = 0; // recall: fired-on-hallucination; precision: fired-on-clean (a FALSE positive)
+let failOpens = 0;
 const total = trajectories.length;
 const byCat = new Map<string, { good: number; n: number }>(); // per-category tally
 for (const t of trajectories) {
@@ -149,15 +163,33 @@ for (const t of trajectories) {
   const events = CLEAN ? eventsBefore(t, Number.MAX_SAFE_INTEGER) : eventsBefore(t, halluStep);
 
   let fired = 0;
+  let valid = 0; // fail-open-aware (mirrors deepseek-eval c4d002e): status:"failed" is a DEAD
+  let killed = 0; // fires the stage-2 verifier rejected (two-stage only)
   let firedIssues: { type: string; detail: string }[] = [];
   for (let r = 0; r < REPS; r++) {
-    const v = await anthropicReviewerAgentic({ action, actionType: "stop-response", events, projectFindings: [] });
+    // rep (429/error), not a silent no-fire — retry with backoff, else exclude from the denominator.
+    let v = await anthropicReviewerAgentic({ action, actionType: "stop-response", events, projectFindings: [] });
+    for (let retry = 0; v.status === "failed" && retry < 3; retry++) {
+      failOpens++;
+      await new Promise((res) => setTimeout(res, 2500 * (retry + 1)));
+      v = await anthropicReviewerAgentic({ action, actionType: "stop-response", events, projectFindings: [] });
+    }
+    if (v.status === "failed") continue;
+    valid++;
     if (v.issues.some((i) => i.severity === "block" || i.severity === "warn")) {
+      if (VERIFY) {
+        const upheld = await verifyMajority(verifierModel, { action, events }, v.issues, VREPS);
+        if (upheld === false) {
+          killed++;
+          continue; // stage-2 rejected every flag — the rep does NOT fire
+        }
+        // upheld === null (verifier dead) counts as fired: fail toward the detector's verdict
+      }
       fired++;
       firedIssues = v.issues; // keep a firing verdict so we can show WHY (esp. cry-wolf reasons)
     }
   }
-  const firedMajority = fired > REPS / 2;
+  const firedMajority = valid > 0 && fired * 2 > valid;
   if (firedMajority) hits++;
   // RECALL wants fire (✓ = caught); PRECISION wants silence (✓ = no false alarm)
   const good = CLEAN ? !firedMajority : firedMajority;
@@ -167,11 +199,14 @@ for (const t of trajectories) {
   if (good) s.good++;
   byCat.set(cat, s);
   const sub = t.hallucination_subcategory || t.hallucination_category || "clean";
-  console.log(`${good ? "✓" : "✗"} [${t.agent_type}] ${sub}  (fired ${fired}/${REPS})`);
+  console.log(
+    `${good ? "✓" : "✗"} [${t.agent_type}] ${sub}  (fired ${fired}/${valid}${killed ? `, ${killed} killed by verify` : ""}${valid < REPS ? `, ${REPS - valid} dead` : ""})`,
+  );
   // On a CRY-WOLF (clean trajectory it flagged), print why — the diagnostic for precision work.
   if (CLEAN && firedMajority) for (const i of firedIssues) console.log(`     ↳ ${i.type}: ${i.detail.slice(0, 160)}`);
 }
 
+if (failOpens) console.log(`\n⚠ ${failOpens} fail-open(s) hit during the run (retried) — quota/429 pressure.`);
 console.log("\n── Scorecard ──");
 if (ALL || CLEAN) {
   for (const [cat, s] of byCat)
