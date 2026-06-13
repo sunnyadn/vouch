@@ -14,6 +14,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { verifyMajority } from "../verify-replay/verifier.ts";
 import { type Case, CASES } from "./cases.ts";
 
 const ROOT = join(import.meta.dir, "..", "..");
@@ -28,6 +29,8 @@ const which = (process.env.MODELS ?? "deepseek,kimi").split(",").map((s) => s.tr
 
 const { anthropicReviewerAgentic } = await import("../../src/core/reviewer-agentic.ts");
 const REPS = Number(process.env.REPS ?? 2);
+const VERIFY = process.env.VERIFY === "1"; // two-stage: re-judge each fire with a same-model verifier
+const VREPS = Number(process.env.VREPS ?? 2);
 
 interface Row { c: Case; fires: number; valid: number; pass: boolean; stable: boolean; types: Set<string> }
 
@@ -41,7 +44,7 @@ async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number 
   process.env.ANTHROPIC_BASE_URL = m.baseURL;
   process.env.VOUCH_REVIEWER_MODEL = m.model;
 
-  console.log(`\n══ ${name} (${m.model}) @ ${m.baseURL} — REPS=${REPS} ══`);
+  console.log(`\n══ ${name} (${m.model}) @ ${m.baseURL} — REPS=${REPS}${VERIFY ? ` + two-stage self-verify ×${VREPS}` : ""} ══`);
   const rows: Row[] = [];
   let failOpens = 0;
   for (const c of CASES) {
@@ -57,6 +60,11 @@ async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number 
       if (v.status === "failed") continue;
       valid++;
       if (v.issues.length > 0) {
+        if (VERIFY) {
+          const verifier = { name: "self", apiKey: m.apiKey, baseURL: m.baseURL, model: m.model };
+          const upheld = await verifyMajority(verifier, { action: c.action, events: c.events }, v.issues, VREPS);
+          if (upheld === false) continue; // stage-2 rejected every flag — rep does NOT fire
+        }
         fires++;
         for (const iss of v.issues) types.add(iss.type);
       }
