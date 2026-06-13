@@ -24,7 +24,7 @@ const envFile = readFileSync(join(ROOT, ".env"), "utf8");
 const envOf = (k: string) => envFile.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1] ?? "";
 
 const KIMI = { name: "kimi", apiKey: envOf("KIMI_API_KEY"), baseURL: envOf("KIMI_BASE_URL"), model: envOf("KIMI_MODEL") };
-const DEEPSEEK = { name: "deepseek", apiKey: envOf("ANTHROPIC_API_KEY"), baseURL: envOf("ANTHROPIC_BASE_URL"), model: envOf("VOUCH_REVIEWER_MODEL") };
+const DEEPSEEK = { name: "deepseek", apiKey: envOf("DEEPSEEK_API_KEY"), baseURL: envOf("DEEPSEEK_BASE_URL"), model: envOf("DEEPSEEK_MODEL") };
 if (!KIMI.apiKey || !DEEPSEEK.apiKey) {
   console.error("need KIMI_* and ANTHROPIC_* creds in .env");
   process.exit(1);

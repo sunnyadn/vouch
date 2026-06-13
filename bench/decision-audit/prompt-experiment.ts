@@ -1,3 +1,12 @@
+// VERDICT 2026-06-13: CLAUSE DISCARDED (kept as a documented negative — do not re-try as-is).
+//   - Original purpose (fix deepseek's recall cluster) went MOOT: deployed model switched to kimi,
+//     which already catches that cluster 15/15. The clause solves a problem the deploy model lacks.
+//   - On kimi (REPS=4, paired): recall-NEUTRAL 15/15→15/15; aggregate precision within run-to-run
+//     noise (OFF 8/13 prior run, 6/13 this run; ON 7/13 inside the band). Only real effect: ONE FP
+//     fix, C10 declined-to-attribute 4/4→1/4. C6 (ablation-present) + C13 (external-with-search)
+//     cry-wolf UNFIXED. No robust on-sample win → held-out validation moot; doesn't earn a deploy slot.
+//   The VOUCH_REVIEWER_PROMPT_EXTRA hook (inert in prod) is KEPT for future experiments.
+//
 // Detector-prompt experiment: does an ALTERNATIVE-HYPOTHESIS audit clause close deepseek's
 // recall hole on the decision class (the D2/D3/D5/D9/D10 "alternative-explanation-in-trace,
 // unruled-out" cluster) WITHOUT regressing the controls?
@@ -23,7 +32,7 @@ const envFile = readFileSync(join(ROOT, ".env"), "utf8");
 const envOf = (k: string) => envFile.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1] ?? "";
 
 const MODELS_DEF: Record<string, { apiKey: string; baseURL: string; model: string }> = {
-  deepseek: { apiKey: envOf("ANTHROPIC_API_KEY"), baseURL: envOf("ANTHROPIC_BASE_URL"), model: envOf("VOUCH_REVIEWER_MODEL") },
+  deepseek: { apiKey: envOf("DEEPSEEK_API_KEY"), baseURL: envOf("DEEPSEEK_BASE_URL"), model: envOf("DEEPSEEK_MODEL") },
   kimi: { apiKey: envOf("KIMI_API_KEY"), baseURL: envOf("KIMI_BASE_URL"), model: envOf("KIMI_MODEL") },
 };
 const which = (process.env.MODELS ?? "deepseek,kimi").split(",").map((s) => s.trim());

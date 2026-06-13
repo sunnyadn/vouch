@@ -22,7 +22,7 @@ const envFile = readFileSync(join(ROOT, ".env"), "utf8");
 const envOf = (k: string) => envFile.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1] ?? "";
 
 const MODELS_DEF: Record<string, { apiKey: string; baseURL: string; model: string }> = {
-  deepseek: { apiKey: envOf("ANTHROPIC_API_KEY"), baseURL: envOf("ANTHROPIC_BASE_URL"), model: envOf("VOUCH_REVIEWER_MODEL") },
+  deepseek: { apiKey: envOf("DEEPSEEK_API_KEY"), baseURL: envOf("DEEPSEEK_BASE_URL"), model: envOf("DEEPSEEK_MODEL") },
   kimi: { apiKey: envOf("KIMI_API_KEY"), baseURL: envOf("KIMI_BASE_URL"), model: envOf("KIMI_MODEL") },
 };
 const which = (process.env.MODELS ?? "deepseek,kimi").split(",").map((s) => s.trim());
