@@ -170,6 +170,13 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
   // showed up in the corpus). So tolerate more transients than the SDK's interactive default of 2.
   const client = new Anthropic({ apiKey, maxRetries: 4 });
 
+  // Experiment hook: an optional extra clause appended to the system prompt. UNSET in production,
+  // so the deployed prompt is byte-identical — this exists ONLY so a bench can A/B a candidate
+  // prompt dimension (e.g. the alternative-hypothesis audit) without editing the live prompt.
+  // Promote a winning clause INTO AGENTIC_REVIEWER_PROMPT only after a reps-eval + held-out check.
+  const promptExtra = process.env.VOUCH_REVIEWER_PROMPT_EXTRA;
+  const systemPrompt = promptExtra ? `${AGENTIC_REVIEWER_PROMPT}\n\n${promptExtra}` : AGENTIC_REVIEWER_PROMPT;
+
   const findings = ctx.projectFindings?.length
     ? `\n\nPROJECT FINDINGS (lessons learned across sessions):\n${ctx.projectFindings.map((f) => `  • ${f}`).join("\n")}`
     : "";
@@ -204,7 +211,7 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
           model,
           max_tokens: 1500,
           temperature: 0,
-          system: AGENTIC_REVIEWER_PROMPT,
+          system: systemPrompt,
           tools: forcingTurn ? [] : [QUERY_HISTORY_TOOL as Anthropic.Tool],
           messages,
         });
