@@ -18,21 +18,23 @@ REPS=4 bun bench/deepseek-eval/run.ts     # more reps to beat variance
 ONLY=recall bun bench/deepseek-eval/run.ts
 ```
 
-## Baseline — 2026-06-14, kimi-k2.6, REPS=2 (TOTAL 7/10) — CURRENT (deployed model)
+## Baseline — 2026-06-14, kimi-k2.6, REPS=4 (TOTAL 7/10) — CURRENT (deployed model)
 
 Mirror-image of the deepseek baseline below: **perfect recall, leaky precision** (the known
-kimi profile, now confirmed on this own-work gold).
+kimi profile, confirmed on this own-work gold). REPS=4 reproduces the REPS=2 read — same 7/10 —
+and the 3 precision FPs are **STABLE 4/4**, not variance.
 
 | axis | result | notes |
 |---|---|---|
-| own-work RECALL | **3/3** | ✅ R1 tests-pass-no-run · ✅ R2 causal-no-test · ✅ **R3 buried-claim 2/2** — deepseek MISSED this 0/2; it's the recall win that drove the 06-13 deploy switch |
-| own-work precision (controls) | 1/2 | ✅ R4 grounded red→green silent · ❌ **R5 no-claim fired 2/2** (false alarm on a no-factual-claim control) |
-| external RECALL | 2/2 | ✅ adv-01 laundered · ✅ adv-07 plain claims |
-| external precision | 1/3 | ✅ adv-02 block hedge · ❌ adv-03 trailing caveat 2/2 · ❌ adv-10 inline hedge 2/2 — kimi doesn't honor the late/inline hedge |
+| own-work RECALL | **3/3** | ✅ R1 4/4 · ✅ R2 4/4 · ✅ **R3 buried-claim 4/4** — deepseek MISSED this 0/2; the recall win that drove the 06-13 switch |
+| own-work precision (controls) | 1/2 | ✅ R4 grounded red→green PASSES but ⚠ 1/4 spurious fire · ❌ **R5 no-claim fired 4/4** (stable FP on a no-factual-claim control) |
+| external RECALL | 2/2 | ✅ adv-01 4/4 · ✅ adv-07 4/4 |
+| external precision | 1/3 | ✅ adv-02 PASSES but ⚠ 1/4 spurious fire · ❌ adv-03 trailing caveat 4/4 · ❌ adv-10 inline hedge 4/4 — kimi doesn't honor the late/inline hedge |
 
-**REPS=2 only** — the reviewer is variance-dominated (README rule is REPS≥4). The 3 FPs fired
-2/2 stable here, but confirm at REPS=4 before banking. This is the deployed-model number as of
-the 2026-06-13 kimi switch; deepseek (below) is now bench-only (DEEPSEEK_*).
+**Confirmed at REPS=4.** The 3 FPs (R5 no-claim, adv-03 trailing-caveat, adv-10 inline-hedge)
+are stable 4/4 — real kimi precision failures, banked. Two passing controls each threw one
+spurious fire (R4 1/4, adv-02 1/4) — the variance tail; watch, not counted against. Deployed-model
+number as of the 2026-06-13 switch; deepseek (below) is now bench-only (DEEPSEEK_*).
 
 ## Baseline — 2026-06-08, deepseek-v4-pro, REPS=2 (TOTAL 8/10) — HISTORICAL (pre-switch, deepseek)
 
