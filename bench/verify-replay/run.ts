@@ -34,7 +34,7 @@ if (!KIMI.apiKey || !DEEPSEEK.apiKey) {
 process.env.ANTHROPIC_API_KEY = KIMI.apiKey;
 process.env.ANTHROPIC_BASE_URL = KIMI.baseURL;
 process.env.VOUCH_REVIEWER_MODEL = KIMI.model;
-const { anthropicReviewerAgentic } = await import("../../src/core/reviewer-agentic.ts");
+const { reviewWithRetry } = await import("../lib/reviewer-retry.ts");
 
 const REPS = Number(process.env.REPS ?? 2);
 const VREPS = Number(process.env.VREPS ?? 2);
@@ -58,13 +58,8 @@ for (const c of CASES) {
   const reps: RepResult[] = [];
   let failOpens = 0;
   for (let i = 0; i < REPS; i++) {
-    let v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
-    for (let r = 0; v.status === "failed" && r < 3; r++) {
-      failOpens++;
-      await new Promise((res) => setTimeout(res, 2500 * (r + 1)));
-      v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
-    }
-    if (v.status === "failed") continue; // dead rep — excluded from the denominator
+    const v = await reviewWithRetry({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] }, () => failOpens++);
+    if (!v) continue; // dead rep — excluded from the denominator
     const rep: RepResult = { fired: v.issues.length > 0, issues: v.issues, uphold: {} };
     if (rep.fired) {
       for (const verifier of [DEEPSEEK, KIMI]) {

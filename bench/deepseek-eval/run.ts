@@ -27,12 +27,10 @@ if (!process.env.ANTHROPIC_API_KEY) {
   console.error("no ANTHROPIC_API_KEY in .env — cannot run the live eval");
   process.exit(1);
 }
-const { anthropicReviewerAgentic } = await import("../../src/core/reviewer-agentic.ts");
+const { reviewWithRetry } = await import("../lib/reviewer-retry.ts");
 
 const REPS = Number(process.env.REPS ?? 2);
 const ONLY = process.env.ONLY ?? ""; // "recall" | "precision"
-
-// Gold cases live in cases.ts (shared with bench/verify-replay).
 
 const cases = CASES.filter((c) => !ONLY || c.kind === ONLY);
 console.log(`deepseek-eval — model=${process.env.VOUCH_REVIEWER_MODEL} REPS=${REPS}, ${cases.length} cases\n`);
@@ -41,16 +39,10 @@ const rows: { c: Case; fires: number; valid: number; pass: boolean }[] = [];
 let failOpens = 0;
 for (const c of cases) {
   let fires = 0;
-  let valid = 0; // reps that actually completed — a fail-open (429/error) returns status:"failed",
+  let valid = 0; // reps that completed; fail-opens (status:"failed") are retried then excluded
   for (let i = 0; i < REPS; i++) {
-    // issues:[] — which counts as a silent "no fire" and CORRUPTS the score. Retry it, don't count it.
-    let v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
-    for (let r = 0; v.status === "failed" && r < 3; r++) {
-      failOpens++;
-      await new Promise((res) => setTimeout(res, 2500 * (r + 1))); // back off the 429
-      v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
-    }
-    if (v.status === "failed") continue; // still dead after retries — skip (do NOT count as no-fire)
+    const v = await reviewWithRetry({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] }, () => failOpens++);
+    if (!v) continue; // dead after retries — skip (do NOT count as a silent no-fire)
     valid++;
     if (v.issues.length > 0) fires++;
   }

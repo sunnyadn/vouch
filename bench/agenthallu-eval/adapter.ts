@@ -17,7 +17,7 @@ for (const line of readFileSync(join(ROOT, ".env"), "utf8").split("\n")) {
   const m = line.match(/^([A-Z_]+)=(.*)$/);
   if (m?.[1] && !process.env[m[1]]) process.env[m[1]] = m[2] ?? "";
 }
-const { anthropicReviewerAgentic } = await import("../../src/core/reviewer-agentic.ts");
+const { reviewWithRetry } = await import("../lib/reviewer-retry.ts");
 const { verifyMajority } = await import("../verify-replay/verifier.ts");
 
 const DATA = process.env.AGENTHALLU_DIR ?? "/tmp/AgentHallu-fresh/AgentHallu";
@@ -167,14 +167,9 @@ for (const t of trajectories) {
   let killed = 0; // fires the stage-2 verifier rejected (two-stage only)
   let firedIssues: { type: string; detail: string }[] = [];
   for (let r = 0; r < REPS; r++) {
-    // rep (429/error), not a silent no-fire — retry with backoff, else exclude from the denominator.
-    let v = await anthropicReviewerAgentic({ action, actionType: "stop-response", events, projectFindings: [] });
-    for (let retry = 0; v.status === "failed" && retry < 3; retry++) {
-      failOpens++;
-      await new Promise((res) => setTimeout(res, 2500 * (retry + 1)));
-      v = await anthropicReviewerAgentic({ action, actionType: "stop-response", events, projectFindings: [] });
-    }
-    if (v.status === "failed") continue;
+    // fail-open (429/error) is retried then excluded — never counted as a silent no-fire.
+    const v = await reviewWithRetry({ action, actionType: "stop-response", events, projectFindings: [] }, () => failOpens++);
+    if (!v) continue;
     valid++;
     if (v.issues.some((i) => i.severity === "block" || i.severity === "warn")) {
       if (VERIFY) {

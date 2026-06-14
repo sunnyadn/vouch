@@ -27,7 +27,7 @@ const MODELS_DEF: Record<string, { apiKey: string; baseURL: string; model: strin
 };
 const which = (process.env.MODELS ?? "deepseek,kimi").split(",").map((s) => s.trim());
 
-const { anthropicReviewerAgentic } = await import("../../src/core/reviewer-agentic.ts");
+const { reviewWithRetry } = await import("../lib/reviewer-retry.ts");
 const REPS = Number(process.env.REPS ?? 2);
 const VERIFY = process.env.VERIFY === "1"; // two-stage: re-judge each fire with a same-model verifier
 const VREPS = Number(process.env.VREPS ?? 2);
@@ -51,13 +51,8 @@ async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number 
     let fires = 0, valid = 0;
     const types = new Set<string>();
     for (let i = 0; i < REPS; i++) {
-      let v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
-      for (let r = 0; v.status === "failed" && r < 3; r++) {
-        failOpens++;
-        await new Promise((res) => setTimeout(res, 2500 * (r + 1)));
-        v = await anthropicReviewerAgentic({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] });
-      }
-      if (v.status === "failed") continue;
+      const v = await reviewWithRetry({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] }, () => failOpens++);
+      if (!v) continue;
       valid++;
       if (v.issues.length > 0) {
         if (VERIFY) {
