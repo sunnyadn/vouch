@@ -30,7 +30,7 @@ export function queryHistory(
   opts?: { max?: number; perOutput?: number },
 ): HistoryHit[] {
   const max = opts?.max ?? 12;
-  const perOutput = opts?.perOutput ?? 1500;
+  const perOutput = opts?.perOutput ?? 2000;
   let re: RegExp;
   try {
     re = new RegExp(pattern, "i");
@@ -39,17 +39,35 @@ export function queryHistory(
   }
   const hits: HistoryHit[] = [];
   for (const e of events) {
-    const hay = `${e.command ?? ""}\n${e.filePath ?? ""}\n${e.stdout ?? ""}`;
+    const out = e.stdout ?? "";
+    const hay = `${e.command ?? ""}\n${e.filePath ?? ""}\n${out}`;
     if (!re.test(hay)) continue;
     hits.push({
       tool: e.tool,
       command: e.command,
       filePath: e.filePath,
       exitCode: e.exitCode,
-      output: (e.stdout ?? "").slice(0, perOutput),
+      output: windowAroundMatch(out, re, perOutput),
     });
   }
   return hits.slice(-max);
+}
+
+// Return up to `budget` chars of output CENTERED on where the pattern matched — the reviewer
+// searched for `pattern`, so the evidence it needs is AROUND the match, not necessarily the head.
+// A head-only slice made the gate miss facts reported from the TAIL of long outputs (it saw 3 of
+// 6 probe reps) → cry-wolf. An explicit "[…N more]" marker makes truncation VISIBLE, so the
+// reviewer never mistakes a cut-off view for absence-of-evidence. Falls back to the head when the
+// match is in the command/path only (not the body).
+function windowAroundMatch(out: string, re: RegExp, budget: number): string {
+  if (out.length <= budget) return out;
+  const m = out.match(re);
+  const center = m?.index ?? 0; // match in cmd/path (not body) → head window
+  const start = Math.max(0, center - Math.floor(budget / 3));
+  const end = Math.min(out.length, start + budget);
+  const head = start > 0 ? `…[${start} chars before] ` : "";
+  const tail = end < out.length ? ` …[+${out.length - end} more chars]` : "";
+  return `${head}${out.slice(start, end)}${tail}`;
 }
 
 // Render hits as the tool-result text the reviewer reads back.

@@ -16,6 +16,27 @@ test("queryHistory finds a command by name and returns its FULL output (the un-t
   expect(hits[0]!.output).toContain("141 pass"); // tail visible — the truncation cry-wolf can't happen
 });
 
+test("queryHistory windows on the MATCH so a fact in the TAIL of a long output stays visible", () => {
+  // The R6 truncation cry-wolf: a 1500-char HEAD slice hid reps reported from the tail, so the
+  // gate "saw 3 of 6" and flagged a true claim. Centering on the match keeps the tail visible.
+  const filler = "x".repeat(3000);
+  const hits = queryHistory([ev({ command: "run probe", stdout: `${filler}\nFINAL: R6 fired 6/6` })], "R6 fired");
+  expect(hits.length).toBe(1);
+  expect(hits[0]!.output).toContain("R6 fired 6/6");
+});
+
+test("queryHistory marks truncation so a cut-off view is not read as absence-of-evidence", () => {
+  const hits = queryHistory([ev({ command: "big", stdout: `HEAD-FACT\n${"y".repeat(5000)}` })], "HEAD-FACT");
+  expect(hits[0]!.output).toContain("HEAD-FACT");
+  expect(hits[0]!.output).toMatch(/\[\+\d+ more chars\]/); // explicit marker → reviewer knows there's more
+});
+
+test("queryHistory returns the WHOLE output when it fits the budget (short outputs unchanged)", () => {
+  expect(queryHistory([ev({ command: "bun test", stdout: "line1\n141 pass, 0 fail" })], "bun test")[0]!.output).toBe(
+    "line1\n141 pass, 0 fail",
+  );
+});
+
 test("queryHistory matches file reads and output text; empty when nothing matches", () => {
   const events = [
     ev({ tool: "Read", filePath: "src/auth.ts" }),
