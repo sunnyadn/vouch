@@ -3,7 +3,8 @@
 // Why this exists: this session a one-paragraph prompt tweak SILENTLY tanked the
 // bread-and-butter recall case (adv-07 FIRE→NOFIRE, stable), caught only by manual reps.
 // Every reviewer-prompt / model change needs a recall+precision gate on the real deployed
-// reviewer (anthropicReviewerAgentic) against the real model (deepseek via .env), with reps
+// reviewer (anthropicReviewerAgentic) against the deployed model (via .env — currently kimi,
+// was deepseek; the name is historical, this gate FOLLOWS whatever ANTHROPIC_* points at), reps
 // (the reviewer is non-deterministic even at temp 0). The old bench/gate-recall 78% is DEAD
 // — it scored the retired `vouch gate` + dropped KB on frozen extractions; don't revive it.
 //

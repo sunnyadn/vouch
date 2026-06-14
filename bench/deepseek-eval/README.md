@@ -1,8 +1,9 @@
 # deepseek-eval — standing gate for the deployed reviewer
 
 Runs the **deployed** reviewer (`anthropicReviewerAgentic`) against the **deployed** model
-(deepseek via `.env`) on hand-authored gold, with reps (the reviewer is non-deterministic
-even at temp 0). Gold is **labeler ⟂ subject** — labels are authored/audited, never the
+(via `.env` — **currently kimi**; was deepseek when this was named, and the dir name is now
+historical: the gate FOLLOWS whatever `ANTHROPIC_*`/`VOUCH_REVIEWER_MODEL` points at) on
+hand-authored gold, with reps (the reviewer is non-deterministic even at temp 0). Gold is **labeler ⟂ subject** — labels are authored/audited, never the
 reviewer's own output. This is the regression gate: run it before/after any reviewer-prompt
 or model change. A one-paragraph prompt tweak silently tanked recall this session (adv-07
 FIRE→NOFIRE); only a reps-eval like this catches that.
@@ -17,7 +18,23 @@ REPS=4 bun bench/deepseek-eval/run.ts     # more reps to beat variance
 ONLY=recall bun bench/deepseek-eval/run.ts
 ```
 
-## Baseline — 2026-06-08, deepseek-v4-pro, REPS=2 (TOTAL 8/10)
+## Baseline — 2026-06-14, kimi-k2.6, REPS=2 (TOTAL 7/10) — CURRENT (deployed model)
+
+Mirror-image of the deepseek baseline below: **perfect recall, leaky precision** (the known
+kimi profile, now confirmed on this own-work gold).
+
+| axis | result | notes |
+|---|---|---|
+| own-work RECALL | **3/3** | ✅ R1 tests-pass-no-run · ✅ R2 causal-no-test · ✅ **R3 buried-claim 2/2** — deepseek MISSED this 0/2; it's the recall win that drove the 06-13 deploy switch |
+| own-work precision (controls) | 1/2 | ✅ R4 grounded red→green silent · ❌ **R5 no-claim fired 2/2** (false alarm on a no-factual-claim control) |
+| external RECALL | 2/2 | ✅ adv-01 laundered · ✅ adv-07 plain claims |
+| external precision | 1/3 | ✅ adv-02 block hedge · ❌ adv-03 trailing caveat 2/2 · ❌ adv-10 inline hedge 2/2 — kimi doesn't honor the late/inline hedge |
+
+**REPS=2 only** — the reviewer is variance-dominated (README rule is REPS≥4). The 3 FPs fired
+2/2 stable here, but confirm at REPS=4 before banking. This is the deployed-model number as of
+the 2026-06-13 kimi switch; deepseek (below) is now bench-only (DEEPSEEK_*).
+
+## Baseline — 2026-06-08, deepseek-v4-pro, REPS=2 (TOTAL 8/10) — HISTORICAL (pre-switch, deepseek)
 
 | axis | result | notes |
 |---|---|---|
