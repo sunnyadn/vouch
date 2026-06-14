@@ -71,6 +71,30 @@ function extractOutput(event: Record<string, unknown>): {
   return { stdout: "", stderr: "", exitCode: 0 };
 }
 
+// Edit/Write/MultiEdit inputs ARE the change applied — an OBSERVED state mutation (the file
+// now contains new_string), confirmed by the success response, not a free-floating assertion.
+// Capturing the hunk lets the reviewer verify edit narration ("renamed X→Y") via query_history;
+// without it the trace holds the file PATH but not WHAT changed, so honest edit reports read as
+// ungrounded (the R5 false-positive class). Returns undefined for non-edit tools / malformed input.
+function extractEditDiff(tool: string, input: Record<string, unknown>): string | undefined {
+  if (tool === "Write" && typeof input.content === "string") return `Wrote file:\n${input.content}`;
+  if (tool === "Edit" && typeof input.old_string === "string" && typeof input.new_string === "string") {
+    return `Edited file:\n- ${input.old_string}\n+ ${input.new_string}`;
+  }
+  if (tool === "MultiEdit" && Array.isArray(input.edits)) {
+    const hunks = input.edits
+      .filter(
+        (e): e is { old_string: string; new_string: string } =>
+          !!e &&
+          typeof (e as Record<string, unknown>).old_string === "string" &&
+          typeof (e as Record<string, unknown>).new_string === "string",
+      )
+      .map((e) => `- ${e.old_string}\n+ ${e.new_string}`);
+    if (hunks.length) return `Edited file (${hunks.length} hunks):\n${hunks.join("\n")}`;
+  }
+  return undefined;
+}
+
 // Non-zero count before a failure word ("5 errors", "2 failed", "1 failure").
 // "0 fail" is a success, not a negative signal.
 const NEGATIVE_COUNT_RE = /\b[1-9]\d*\s+(?:fail|error|fatal)\w*/i;
@@ -82,13 +106,19 @@ export function parseCapturedEvents(raw: Record<string, unknown>[]): CapturedEve
   for (const r of raw) {
     const { tool, command, filePath } = extractToolInfo(r);
     if (!tool) continue;
-    const { stdout, stderr, exitCode } = extractOutput(r);
+    const out = extractOutput(r);
+    const { stderr, exitCode } = out;
+    let stdout = out.stdout;
+    // For a SUCCESSFUL edit, replace the bland "updated successfully" response with the actual
+    // hunk so query_history surfaces what changed; a FAILED edit keeps its error output.
+    const editDiff = exitCode === 0 ? extractEditDiff(tool, (r.tool_input ?? {}) as Record<string, unknown>) : undefined;
+    if (editDiff) stdout = cap(editDiff);
     const ts = typeof r.timestamp === "string" ? r.timestamp : undefined;
     const combined = `${stdout}\n${stderr}`;
+    // Don't keyword-scan edit CONTENT for negatives — a hunk may legitimately contain
+    // "error"/"fail" text (editing error-handling code) and that's not a failure signal.
     const isNegative =
-      exitCode !== 0 ||
-      NEGATIVE_COUNT_RE.test(combined) ||
-      NEGATIVE_KEYWORD_RE.test(combined);
+      exitCode !== 0 || (!editDiff && (NEGATIVE_COUNT_RE.test(combined) || NEGATIVE_KEYWORD_RE.test(combined)));
     events.push({ tool, command, filePath, stdout, stderr, exitCode, timestamp: ts, isNegative });
   }
   return events;

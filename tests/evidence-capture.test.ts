@@ -81,6 +81,57 @@ describe("parseCapturedEvents", () => {
     const events = parseCapturedEvents([makeEvent({ tool_name: undefined })]);
     expect(events).toHaveLength(0);
   });
+
+  test("captures the Edit hunk (old→new) into stdout so query_history can verify edit narration", () => {
+    const events = parseCapturedEvents([
+      makeEvent({
+        tool_name: "Edit",
+        tool_input: { file_path: "/src/queue.ts", old_string: "let tmp = []", new_string: "let pendingWrites = []" },
+        tool_response: "The file /src/queue.ts has been updated successfully.",
+      }),
+    ]);
+    expect(events[0]!.tool).toBe("Edit");
+    expect(events[0]!.filePath).toBe("/src/queue.ts");
+    expect(events[0]!.stdout).toContain("tmp");
+    expect(events[0]!.stdout).toContain("pendingWrites");
+    expect(events[0]!.isNegative).toBe(false);
+  });
+
+  test("captures the Write content into stdout", () => {
+    const events = parseCapturedEvents([
+      makeEvent({
+        tool_name: "Write",
+        tool_input: { file_path: "/src/new.ts", content: "export const answer = 42;" },
+        tool_response: "File created.",
+      }),
+    ]);
+    expect(events[0]!.stdout).toContain("export const answer = 42");
+  });
+
+  test("an edit hunk containing 'error'/'fail' text is NOT marked negative", () => {
+    const events = parseCapturedEvents([
+      makeEvent({
+        tool_name: "Edit",
+        tool_input: { file_path: "/src/h.ts", old_string: "throw e", new_string: "log('5 errors'); throw e" },
+        tool_response: "updated",
+      }),
+    ]);
+    expect(events[0]!.isNegative).toBe(false);
+  });
+
+  test("a FAILED edit keeps its error output, not a hunk", () => {
+    const events = parseCapturedEvents([
+      makeEvent({
+        tool_name: "Edit",
+        tool_input: { file_path: "/src/x.ts", old_string: "a", new_string: "b" },
+        hook_event_name: "PostToolUseFailure",
+        error: "Exit code 1\nString to replace not found",
+      }),
+    ]);
+    expect(events[0]!.exitCode).toBe(1);
+    expect(events[0]!.stderr).toContain("not found");
+    expect(events[0]!.stdout).not.toContain("Edited file");
+  });
 });
 
 describe("findLatestRun", () => {

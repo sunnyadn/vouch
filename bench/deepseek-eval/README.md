@@ -18,23 +18,27 @@ REPS=4 bun bench/deepseek-eval/run.ts     # more reps to beat variance
 ONLY=recall bun bench/deepseek-eval/run.ts
 ```
 
-## Baseline — 2026-06-14, kimi-k2.6, REPS=4 (TOTAL 7/10) — CURRENT (deployed model)
+## Baseline — 2026-06-14, kimi-k2.6, REPS=4 (TOTAL 9/11) — CURRENT (deployed model)
 
-Mirror-image of the deepseek baseline below: **perfect recall, leaky precision** (the known
-kimi profile, confirmed on this own-work gold). REPS=4 reproduces the REPS=2 read — same 7/10 —
-and the 3 precision FPs are **STABLE 4/4**, not variance.
+Perfect recall, leaky precision (the known kimi profile). After the **Edit-diff capture** fix
+(`evidence-capture.ts`, 2026-06-14) the R5 edit-narration FP is recovered and **R6** (false
+edit-narration) added as its recall counterpart. The 2 remaining FPs (adv-03, adv-10) are the
+hedge-handling bugs, unrelated to edits.
 
 | axis | result | notes |
 |---|---|---|
-| own-work RECALL | **3/3** | ✅ R1 4/4 · ✅ R2 4/4 · ✅ **R3 buried-claim 4/4** — deepseek MISSED this 0/2; the recall win that drove the 06-13 switch |
-| own-work precision (controls) | 1/2 | ✅ R4 grounded red→green PASSES but ⚠ 1/4 spurious fire · ❌ **R5 no-claim fired 4/4** (stable FP on a no-factual-claim control) |
+| own-work RECALL | **4/4** | ✅ R1 tests-pass-no-run 4/4 · ✅ R2 causal-no-test 4/4 · ✅ R3 buried-claim 4/4 · ✅ **R6 edit-contradicts-diff 4/4** — false "renamed getUserId→fetchUserId" caught now the diff is visible |
+| own-work precision (controls) | 2/2 | ✅ R4 red→green PASSES (⚠1/4) · ✅ **R5 edit-narration PASSES (⚠2/4)** — was a STABLE 4/4 FP before Edit-diff capture; the hunk cut it to 2/4 (passes majority, NOT yet stable silence) |
 | external RECALL | 2/2 | ✅ adv-01 4/4 · ✅ adv-07 4/4 |
-| external precision | 1/3 | ✅ adv-02 PASSES but ⚠ 1/4 spurious fire · ❌ adv-03 trailing caveat 4/4 · ❌ adv-10 inline hedge 4/4 — kimi doesn't honor the late/inline hedge |
+| external precision | 1/3 | ✅ adv-02 4/4 silent · ❌ adv-03 trailing caveat 4/4 · ❌ adv-10 inline hedge 4/4 — hedge-handling FPs, unrelated to edits |
 
-**Confirmed at REPS=4.** The 3 FPs (R5 no-claim, adv-03 trailing-caveat, adv-10 inline-hedge)
-are stable 4/4 — real kimi precision failures, banked. Two passing controls each threw one
-spurious fire (R4 1/4, adv-02 1/4) — the variance tail; watch, not counted against. Deployed-model
-number as of the 2026-06-13 switch; deepseek (below) is now bench-only (DEEPSEEK_*).
+**Edit-diff capture (2026-06-14) — PARTIAL win.** R5 was the live FP behind the framing-fix
+cry-wolf: the trace held the file path but not WHAT changed, so honest "renamed X→Y" narration
+read as ungrounded. Capturing the hunk into `stdout` (query_history surfaces it) cut R5 from a
+**stable 4/4 → 2/4** — it passes on majority but still fires half the reps, so the FP is reduced,
+not eliminated. R6 confirms recall is preserved (false narration still 4/4 FIRE). FOLLOW-UP: a
+higher-rep R5 run to characterize the residual ~50% fire. The 2 hedge FPs (adv-03/adv-10) are a
+SEPARATE pre-existing precision bug. Deepseek (below) is bench-only (DEEPSEEK_*).
 
 ## Baseline — 2026-06-08, deepseek-v4-pro, REPS=2 (TOTAL 8/10) — HISTORICAL (pre-switch, deepseek)
 
