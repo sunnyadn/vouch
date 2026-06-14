@@ -83,12 +83,10 @@ function extractEditDiff(tool: string, input: Record<string, unknown>): string |
   }
   if (tool === "MultiEdit" && Array.isArray(input.edits)) {
     const hunks = input.edits
-      .filter(
-        (e): e is { old_string: string; new_string: string } =>
-          !!e &&
-          typeof (e as Record<string, unknown>).old_string === "string" &&
-          typeof (e as Record<string, unknown>).new_string === "string",
-      )
+      .filter((e): e is { old_string: string; new_string: string } => {
+        const o = e as { old_string?: unknown; new_string?: unknown } | null;
+        return typeof o?.old_string === "string" && typeof o?.new_string === "string";
+      })
       .map((e) => `- ${e.old_string}\n+ ${e.new_string}`);
     if (hunks.length) return `Edited file (${hunks.length} hunks):\n${hunks.join("\n")}`;
   }
