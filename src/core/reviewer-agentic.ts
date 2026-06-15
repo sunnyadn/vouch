@@ -203,6 +203,9 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
     `HISTORY INDEX (use query_history for outputs/details):\n${buildHistoryIndex(ctx.events)}${findings}`;
 
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMsg }];
+  // The reviewer's query trail, attached to the verdict so a cry-wolf post-mortem can see what
+  // it actually searched (and got 0 hits on) vs never querying — the corpus persists it.
+  const queries: { pattern: string; hits: number }[] = [];
   const start = Date.now();
   // Up to MAX_AGENTIC_TURNS query turns, then ONE forcing turn with no tools. On a long trace the
   // reviewer can keep querying and never emit a verdict, which used to fall through to fail-open
@@ -241,6 +244,7 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
               const input = block.input as { pattern?: unknown };
               const pattern = typeof input?.pattern === "string" ? input.pattern : "";
               const hits = queryHistory(ctx.events, pattern);
+              queries.push({ pattern, hits: hits.length });
               if (process.env.VOUCH_DIAG)
                 console.error(`[diag] query "${pattern}" → ${hits.length} hits`);
               results.push({
@@ -279,7 +283,10 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
     }, HARD_DEADLINE_MS);
   });
   try {
-    return await Promise.race([runLoop(), backstop]);
+    const verdict = await Promise.race([runLoop(), backstop]);
+    // Attach the query trail regardless of which path produced the verdict (clean, flagged,
+    // forced, or fail-open) — an empty trail on a fail-open is itself the signal it never queried.
+    return { ...verdict, queries };
   } finally {
     clearTimeout(timer); // race settled → cancel the pending timer so we never hang
   }

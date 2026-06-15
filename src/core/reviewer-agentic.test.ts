@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import type { CapturedEvent } from "./evidence-capture.ts";
+import { parseCapturedEvents } from "./evidence-capture.ts";
 import { anthropicReviewerAgentic, queryHistory, formatHits } from "./reviewer-agentic.ts";
 
 const ev = (o: Partial<CapturedEvent>): CapturedEvent => ({
@@ -47,6 +48,21 @@ test("queryHistory matches file reads and output text; empty when nothing matche
   expect(queryHistory(events, "abc123").length).toBe(1); // commit hash in output → post-commit summary groundable
   expect(queryHistory(events, "nope").length).toBe(0);
   expect(formatHits([])).toContain("no matching");
+});
+
+test("a background launch id is searchable so a 'Launched (id)' claim is verifiable (not a cry-wolf)", () => {
+  // The harness returns empty stdout + the shell id ONLY in backgroundTaskId. Pre-fix that id was
+  // unexposed → query_history for it returned 0 hits → the reviewer flagged the truthful launch as
+  // fabrication (the #5/#6 background-launch cry-wolf class).
+  const events = parseCapturedEvents([
+    {
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      tool_input: { command: "REPS=8 bun consensus.ts > /tmp/c.log 2>&1" },
+      tool_response: { stdout: "", stderr: "", backgroundTaskId: "bapjzx7ds" },
+    },
+  ]);
+  expect(queryHistory(events, "bapjzx7ds").length).toBe(1);
 });
 
 test("no API key → verdict.status is 'skipped', NOT an indistinguishable empty pass", async () => {

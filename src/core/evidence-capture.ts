@@ -62,7 +62,13 @@ function extractOutput(event: Record<string, unknown>): {
     if (file && typeof file.content === "string") {
       return { stdout: cap(file.content), stderr: "", exitCode: 0 };
     }
-    const stdout = cap(String(r.stdout ?? r.output ?? r.result ?? JSON.stringify(r)));
+    // A background launch returns EMPTY stdout + the shell id only in `backgroundTaskId`; fold it
+    // into the searchable text so a claim citing that id ("Launched (bapjzx7ds)") is verifiable via
+    // query_history. Without this the id lives ONLY in an unexposed field → every query for it
+    // returns 0 hits → the reviewer flags the truthful launch as fabrication (the dominant
+    // background-launch cry-wolf class: #5/#6/bo7gz0aka, root-caused 2026-06-16 by query-trail replay).
+    const bg = typeof r.backgroundTaskId === "string" ? `[background task launched: ${r.backgroundTaskId}]\n` : "";
+    const stdout = cap(bg + String(r.stdout ?? r.output ?? r.result ?? JSON.stringify(r)));
     const stderr = cap(String(r.stderr ?? r.error ?? ""));
     const exitCode =
       Number(r.exit_code ?? r.exitCode ?? (r.error || r.is_error ? 1 : 0)) || 0;

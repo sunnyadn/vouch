@@ -106,6 +106,9 @@ export function captureVerdict(rec: {
         detail: i.detail,
       })),
       action: rec.action.slice(0, 2000),
+      // The reviewer's query trail — what it searched + hit counts. Makes a cry-wolf auditable:
+      // "queried the wrong term → 0 hits" vs "never queried" have different fixes.
+      queries: rec.verdict.queries ?? [],
       events: trimEvents(rec.events),
     });
     appendFileSync(corpusPath(), `${line}\n`);

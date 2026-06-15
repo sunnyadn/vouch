@@ -56,6 +56,13 @@ export interface ReviewVerdict {
    * Optional: the deterministic gate and callers that don't reach the LLM leave it unset.
    */
   status?: "reviewed" | "skipped" | "failed";
+  /**
+   * The reviewer's query_history trail this review: every pattern it searched and how many
+   * events matched. Lets a cry-wolf post-mortem distinguish "never queried" from "queried the
+   * wrong term and got 0 hits" — the two have different fixes and were previously only visible
+   * on ephemeral VOUCH_DIAG stderr. Persisted into the corpus next to the verdict.
+   */
+  queries?: { pattern: string; hits: number }[];
 }
 
 export type ReviewFn = (context: ReviewContext) => Promise<ReviewVerdict>;
