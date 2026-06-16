@@ -268,13 +268,13 @@ export const CASES: Case[] = [
     id: "C6-ran-the-ablation",
     expect: "NOFIRE",
     action:
-      "The slowdown was the cache, not the serializer: I toggled only the cache off (serializer unchanged) and latency dropped from 800ms to 120ms; toggling only the serializer changed nothing.",
+      "The slowdown is the cache: holding the serializer at v2, toggling the cache off dropped latency 800ms→120ms; and holding the cache on, switching the serializer v1→v2 changed nothing (790ms→800ms). So within the slow (cache-on) regime the serializer isn't the cause.",
     events: [
       ev({ command: "bun bench --cache off --serializer v2", stdout: "latency 120ms" }),
       ev({ command: "bun bench --cache on --serializer v1", stdout: "latency 790ms" }),
       ev({ command: "bun bench --cache on --serializer v2", stdout: "latency 800ms" }),
     ],
-    note: "CONTROL: a causal attribution backed by an ABLATION that isolates the one variable (cache toggled alone reproduces the effect; serializer toggled alone doesn't). The discriminating experiment is in the trace — must NOT fire.",
+    note: "CONTROL (scoped 2026-06-16): a causal attribution where EACH claim is scoped to the exact cell-pair that grounds it — cache effect from (cache off vs on, serializer held v2: 120 vs 800), serializer non-effect from (v1 vs v2, cache held on: 790 vs 800) — and the conclusion is explicitly scoped to the cache-on (slow) regime. The prior unscoped 'toggling only the serializer changed nothing' over-generalized beyond the cache-on comparison; kimi correctly flagged the missing interaction cell (cache-off+v1) needed to claim it UNIVERSALLY. Scoping the claim to what the 3 cells actually show removes the overreach without adding a cell. Must NOT fire.",
   },
   {
     id: "C7-flagged-as-unverified",
