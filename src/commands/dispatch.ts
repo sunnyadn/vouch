@@ -19,12 +19,19 @@ async function runReviewer(args: {
   const { loadProjectFindings } = await import("../core/reviewer.ts");
   const projectFindings = await loadProjectFindings();
   const { anthropicReviewerAgentic } = await import("../core/reviewer-agentic.ts");
-  return anthropicReviewerAgentic({
+  const { filterProcessNarrationFires } = await import("../core/process-narration.ts");
+  const verdict = await anthropicReviewerAgentic({
     action: args.action,
     actionType: args.actionType,
     events: args.allEvents,
     projectFindings,
   });
+  // Surgical, recall-safe post-filter: drop fires whose flagged quote is pure process/intent
+  // narration ("Let me read X", "Starting Y now") — the dominant live cry-wolf class. Validated
+  // 2026-06-16: paired +1 block-precision / 0 recall on the decision gold; 0/443 AgentHallu
+  // hallucination steps classify as narration (held-out recall-safe). A global prompt clause was
+  // tried first and DISCARDED (it replicably softened block-recall); this acts only on the quote.
+  return filterProcessNarrationFires(verdict);
 }
 
 export async function dispatch(argv: string[]): Promise<number> {

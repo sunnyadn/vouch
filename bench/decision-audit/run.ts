@@ -15,6 +15,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { verifyMajority } from "../verify-replay/verifier.ts";
+import { filterProcessNarrationFires } from "../../src/core/process-narration.ts";
 import { type Case, CASES } from "./cases.ts";
 
 const ROOT = join(import.meta.dir, "..", "..");
@@ -36,7 +37,7 @@ const VREPS = Number(process.env.VREPS ?? 2);
 // The deployed gate only HALTS on block (warn is advisory, exit 0), so block-level precision/recall
 // is the deployment-relevant number — the all-issue count scores a helpful advisory warn as a "fire"
 // and overstates the cry-wolf rate (2026-06-16 finding: warn vs block split the 7/13 picture).
-interface Row { c: Case; fires: number; blockFires: number; valid: number; pass: boolean; blockPass: boolean; stable: boolean; types: Set<string> }
+interface Row { c: Case; fires: number; blockFires: number; filtBlockFires: number; valid: number; pass: boolean; blockPass: boolean; filtBlockPass: boolean; stable: boolean; types: Set<string> }
 
 async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number }> {
   const m = MODELS_DEF[name];
@@ -52,7 +53,7 @@ async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number 
   const rows: Row[] = [];
   let failOpens = 0;
   for (const c of CASES) {
-    let fires = 0, blockFires = 0, valid = 0;
+    let fires = 0, blockFires = 0, filtBlockFires = 0, valid = 0;
     const types = new Set<string>();
     for (let i = 0; i < REPS; i++) {
       const v = await reviewWithRetry({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] }, () => failOpens++);
@@ -68,16 +69,23 @@ async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number 
         if (v.issues.some((iss) => iss.severity === "block")) blockFires++;
         for (const iss of v.issues) types.add(iss.type);
       }
+      // PAIRED: the narration filter is deterministic given the verdict, so score the SAME verdict
+      // with it applied — the raw-vs-filtered delta is PURE filter effect, zero run-to-run variance.
+      const filtered = filterProcessNarrationFires(v);
+      if (filtered.issues.some((iss) => iss.severity === "block")) filtBlockFires++;
     }
     const majorityFire = fires * 2 > valid;
     const blockMajority = blockFires * 2 > valid;
+    const filtBlockMajority = filtBlockFires * 2 > valid;
     const pass = valid > 0 && (c.expect === "FIRE") === majorityFire;
     const blockPass = valid > 0 && (c.expect === "FIRE") === blockMajority;
+    const filtBlockPass = valid > 0 && (c.expect === "FIRE") === filtBlockMajority;
     const stable = valid > 0 && (fires === 0 || fires === valid);
-    rows.push({ c, fires, blockFires, valid, pass, blockPass, stable, types });
+    rows.push({ c, fires, blockFires, filtBlockFires, valid, pass, blockPass, filtBlockPass, stable, types });
     const tag = valid === 0 ? "⊘ DEAD" : pass ? "✅" : "❌";
+    const filtTag = filtBlockFires !== blockFires ? ` →filt block ${filtBlockFires}/${valid}` : "";
     console.log(
-      `${tag} [${c.expect}] ${c.id}: fired ${fires}/${valid} (block ${blockFires}/${valid})${valid < REPS ? ` (${REPS - valid} fail-open)` : ""}${stable ? "" : " ⚠var"}` +
+      `${tag} [${c.expect}] ${c.id}: fired ${fires}/${valid} (block ${blockFires}/${valid}${filtTag})${valid < REPS ? ` (${REPS - valid} fail-open)` : ""}${stable ? "" : " ⚠var"}` +
         `${types.size ? `  {${[...types].join(",")}}` : ""}`,
     );
   }
@@ -87,10 +95,14 @@ async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number 
   const prec = rows.filter((r) => r.c.expect === "NOFIRE");
   const score = (rs: Row[]) => `${rs.filter((r) => r.pass).length}/${rs.length}`;
   const blockScore = (rs: Row[]) => `${rs.filter((r) => r.blockPass).length}/${rs.length}`;
+  const filtScore = (rs: Row[]) => `${rs.filter((r) => r.filtBlockPass).length}/${rs.length}`;
   // All-issue (warn|block) AND block-only. Block is the deployment number — the gate halts only on
   // block; warn is advisory. Block-precision is the cry-wolf rate that actually interrupts the agent.
-  console.log(`  ANY-ISSUE  RECALL ${score(recall)}   PRECISION ${score(prec)}   TOTAL ${score(rows)}`);
-  console.log(`  BLOCK-ONLY RECALL ${blockScore(recall)}   PRECISION ${blockScore(prec)}   TOTAL ${blockScore(rows)}   ← deployment-relevant (gate halts on block)`);
+  console.log(`  ANY-ISSUE        RECALL ${score(recall)}   PRECISION ${score(prec)}   TOTAL ${score(rows)}`);
+  console.log(`  BLOCK-ONLY       RECALL ${blockScore(recall)}   PRECISION ${blockScore(prec)}   TOTAL ${blockScore(rows)}   ← deployment-relevant (gate halts on block)`);
+  // PAIRED filter delta (same verdicts, narration filter applied): the ONLY clean way to read the
+  // filter's effect, since run-to-run precision swings ±2 from variance.
+  console.log(`  +NARRATION-FILTER RECALL ${filtScore(recall)}   PRECISION ${filtScore(prec)}   TOTAL ${filtScore(rows)}   ← paired Δ vs BLOCK-ONLY (pure filter effect)`);
   return { rows, failOpens };
 }
 
