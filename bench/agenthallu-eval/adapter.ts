@@ -150,9 +150,12 @@ const verifierModel = {
 };
 
 let hits = 0; // recall: fired-on-hallucination; precision: fired-on-clean (a FALSE positive)
+let blockHits = 0; // same, but counting only reps that fired at BLOCK severity (the gate HALTS only
+// on block; warn is advisory/exit-0). Block is the deployment-relevant number — reporting both keeps
+// this independent eval consistent with decision-audit/run.ts (2026-06-16 warn/block split).
 let failOpens = 0;
 const total = trajectories.length;
-const byCat = new Map<string, { good: number; n: number }>(); // per-category tally
+const byCat = new Map<string, { good: number; n: number }>(); // per-category tally (any-issue)
 for (const t of trajectories) {
   const halluStep = Number(t.hallucination_step);
   // RECALL: review the labeled bad step, with the grounding gathered before it.
@@ -163,6 +166,7 @@ for (const t of trajectories) {
   const events = CLEAN ? eventsBefore(t, Number.MAX_SAFE_INTEGER) : eventsBefore(t, halluStep);
 
   let fired = 0;
+  let blockFired = 0; // reps that fired with a BLOCK-severity issue (subset of `fired`)
   let valid = 0; // fail-open-aware (mirrors deepseek-eval c4d002e): status:"failed" is a DEAD
   let killed = 0; // fires the stage-2 verifier rejected (two-stage only)
   let firedIssues: { type: string; detail: string }[] = [];
@@ -181,11 +185,14 @@ for (const t of trajectories) {
         // upheld === null (verifier dead) counts as fired: fail toward the detector's verdict
       }
       fired++;
+      if (v.issues.some((i) => i.severity === "block")) blockFired++;
       firedIssues = v.issues; // keep a firing verdict so we can show WHY (esp. cry-wolf reasons)
     }
   }
   const firedMajority = valid > 0 && fired * 2 > valid;
+  const blockFiredMajority = valid > 0 && blockFired * 2 > valid;
   if (firedMajority) hits++;
+  if (blockFiredMajority) blockHits++;
   // RECALL wants fire (✓ = caught); PRECISION wants silence (✓ = no false alarm)
   const good = CLEAN ? !firedMajority : firedMajority;
   const cat = CLEAN ? "clean" : t.hallucination_category ?? "?";
@@ -195,7 +202,7 @@ for (const t of trajectories) {
   byCat.set(cat, s);
   const sub = t.hallucination_subcategory || t.hallucination_category || "clean";
   console.log(
-    `${good ? "✓" : "✗"} [${t.agent_type}] ${sub}  (fired ${fired}/${valid}${killed ? `, ${killed} killed by verify` : ""}${valid < REPS ? `, ${REPS - valid} dead` : ""})`,
+    `${good ? "✓" : "✗"} [${t.agent_type}] ${sub}  (fired ${fired}/${valid}, block ${blockFired}/${valid}${killed ? `, ${killed} killed by verify` : ""}${valid < REPS ? `, ${REPS - valid} dead` : ""})`,
   );
   // On a CRY-WOLF (clean trajectory it flagged), print why — the diagnostic for precision work.
   if (CLEAN && firedMajority) for (const i of firedIssues) console.log(`     ↳ ${i.type}: ${i.detail.slice(0, 160)}`);
@@ -208,8 +215,11 @@ if (ALL || CLEAN) {
     console.log(`  ${cat.padEnd(30)} ${s.good}/${s.n} ${CLEAN ? "silent" : "caught"} (${((s.good / s.n) * 100).toFixed(0)}%)`);
   console.log("  " + "─".repeat(40));
 }
+const pct = (n: number) => ((n / total) * 100).toFixed(0);
 if (CLEAN) {
-  console.log(`PRECISION: ${total - hits}/${total} clean correctly silent (${(((total - hits) / total) * 100).toFixed(0)}%) — ${hits} false alarms`);
+  console.log(`PRECISION  any-issue: ${total - hits}/${total} silent (${pct(total - hits)}%) — ${hits} false alarms`);
+  console.log(`PRECISION  block-only: ${total - blockHits}/${total} silent (${pct(total - blockHits)}%) — ${blockHits} block false alarms   ← deployment-relevant (gate halts on block)`);
 } else {
-  console.log(`RECALL: ${hits}/${total} caught (${((hits / total) * 100).toFixed(0)}%) — ${total - hits} missed`);
+  console.log(`RECALL  any-issue: ${hits}/${total} caught (${pct(hits)}%) — ${total - hits} missed`);
+  console.log(`RECALL  block-only: ${blockHits}/${total} caught (${pct(blockHits)}%) — ${total - blockHits} missed   ← deployment-relevant (gate halts on block)`);
 }
