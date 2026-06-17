@@ -38,7 +38,9 @@ Cry-wolf: idx 3, 5, 6, 24 (4). Defensible: idx 16, 19, 27 (3).
 
 ## Result
 
-HONEST HEADLINE: **block-precision ~77% raw / ~80% adjudicated** on AgentHallu (OpenDeepSearch).
+HONEST HEADLINE: **block-precision ~77% raw / ~80% adjudicated** on AgentHallu **OpenDeepSearch
+(web-search agents)**. This is SINGLE-FRAMEWORK — cross-framework precision is NOT yet established
+(see Caveat 2: a cross-framework probe is confounded by quota + an adapter-fidelity gap).
 
 - **Raw block-precision: 23/30 (77%)** — counts every fire as bad; the floor.
 - **More-independent estimate: ~24/30 (≈80%).** A prior BLIND neutral-prompt judge (kimi) on its
@@ -62,11 +64,30 @@ to ~80%.
 1. **Author-affiliated adjudication.** Judged by a model used in building the tool; ambiguous cases
    leaned against the gate to offset bias. Not a strictly independent (non-author human / third-party)
    number — that remains owed for a published headline.
-2. **Single framework.** All 30 clean cases are OpenDeepSearch (ReAct + CodeAct). This is precision
-   on that framework, not the cross-framework breadth of the recall leg.
+2. **Single framework — cross-framework is an OPEN question.** All 30 clean cases are OpenDeepSearch
+   (ReAct + CodeAct; the `slice(0,30)` artifact). A cross-framework probe (`precision-xframework.ts`,
+   5 clean × 7 frameworks, REPS=3) gave overall 15/35 (43%) — but that number is UNINTERPRETABLE,
+   confounded three ways: (a) 27/105 fail-opens (quota-degraded; some cases valid=0 miscounted as
+   silent); (b) an ADAPTER-FIDELITY gap — `adapter.ts eventsBefore()` extracts only `tool_calls`,
+   dropping step `content`, so agents that reason in content (Camel/OWL) are judged against an empty
+   trace and the reviewer correctly fires "no grounding" (an eval-harness capture hole, not a reviewer
+   bug); (c) gold-semantics — some BFCL function-calling fires are DEFENSIBLE (the agent misreported
+   its own actions, e.g. "sent via text" when the trace shows user-IDs; "fabricated line numbers").
+   So the single-framework ~80% does NOT auto-generalize, AND 43% is not a fair counter-number. A
+   trustworthy cross-framework figure needs an adapter fidelity fix + quota headroom + per-FP
+   adjudication. Until then, scope the precision claim to web-search agents.
 3. **Variance.** n=30, REPS=3, variance-dominated reviewer. The aggregate fire count is stable
    (~23/30 across runs) but the specific failing set reshuffles run-to-run.
-4. **The fixable target.** The 2 clear cry-wolves (idx 3, 5) are grounding-MATCH failures — the
-   answer's value is present in the trace yet `fabrication` fires anyway. idx 5 is the starkest: the
-   verdict reasons to "grounded" then blocks. That class (not research-insufficiency) is the real
-   visible-precision bug.
+4. **The precision target — diagnosed, no cheap fix.** The 2 clear cry-wolves (idx 3, 5) were
+   diagnosed with a query trail (`diagnose-grounding-match.ts`). NOT a retrieval/grounding-MATCH
+   failure as first framed: idx 5 (3/3 reps) the reviewer's detail reasons all the way to "the math
+   checks out / the answer is correct", then STILL emits `passive-fabrication BLOCK` on a "didn't
+   explicitly verify" objection — that is RESEARCH-INSUFFICIENCY (should be warn) mislabeled as
+   block-fabrication; a SEVERITY-CALIBRATION bug. idx 3 is mostly variance + a reviewer self-
+   hallucination (claimed "3617593 missing a digit" — false) + an AgentHallu artifact (no user
+   question shown). The obvious fix — a severity-discipline prompt clause — was A/B'd
+   (`../decision-audit/clause-ab.ts`) and DISCARDED: it tanked block-recall 15/16 → 12/16
+   (same-session paired), the documented blunt-instrument failure. A recall-safe deterministic filter
+   is the only avenue left, but idx 5 is hard to detect deterministically (full correct-sentence
+   quote; the signal lives in the reviewer's detail text). Given warn-is-invisible + low frequency,
+   this is a characterized limitation, not a cheap win.
