@@ -8,9 +8,17 @@
 // reads apiKey/model/baseURL at call time). Fail-open-aware (c4d002e parity): status:"failed"
 // reps retry with backoff and are excluded from the denominator, never counted as no-fire.
 //
-// Run:  bun bench/decision-audit/run.ts              (REPS=2, both models)
-//       REPS=4 bun bench/decision-audit/run.ts       (beat variance)
-//       MODELS=deepseek bun bench/decision-audit/run.ts   (one model only)
+// GATE-BACKEND BAKE-OFF: this is the台子 to vet ANY candidate gate backend on the SAME gold before
+// a live swap (the brittle-reviewer rule: never swap the deployed reviewer without a recall+precision
+// reps-eval). Direct-API backends (kimi/glm/deepseek) just need their creds in .env; "claude-p" is the
+// subscription GOLD/ceiling backend (no api key, strong model, free) — useful as a reference upper bound,
+// not a like-for-like for the deployed direct-API gate.
+//
+// Run:  bun bench/decision-audit/run.ts                    (REPS=2, deepseek+kimi)
+//       REPS=4 bun bench/decision-audit/run.ts             (beat variance)
+//       MODELS=kimi bun bench/decision-audit/run.ts        (one backend only)
+//       MODELS=kimi,glm bun bench/decision-audit/run.ts    (bake-off two candidate keys)
+//       MODELS=claude-p bun bench/decision-audit/run.ts    (subscription gold/ceiling, free)
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -22,9 +30,15 @@ const ROOT = join(import.meta.dir, "..", "..");
 const envFile = readFileSync(join(ROOT, ".env"), "utf8");
 const envOf = (k: string) => envFile.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1] ?? "";
 
+// Direct-API backends: a swap is just 3 env vars (apiKey/baseURL/model) read at call time. Drop
+// a new backend's creds in .env (e.g. GLM_API_KEY/GLM_BASE_URL/GLM_MODEL) and it's comparable here.
+// The special "claude-p" backend is NOT in this map — it routes through the subscription adapter
+// (no api key) instead of reviewWithRetry; see runModel. So this台子 compares ANY candidate gate
+// backend (kimi / glm / a cheaper Anthropic key / subscription) on the SAME gold before a live swap.
 const MODELS_DEF: Record<string, { apiKey: string; baseURL: string; model: string }> = {
   deepseek: { apiKey: envOf("DEEPSEEK_API_KEY"), baseURL: envOf("DEEPSEEK_BASE_URL"), model: envOf("DEEPSEEK_MODEL") },
   kimi: { apiKey: envOf("KIMI_API_KEY"), baseURL: envOf("KIMI_BASE_URL"), model: envOf("KIMI_MODEL") },
+  glm: { apiKey: envOf("GLM_API_KEY"), baseURL: envOf("GLM_BASE_URL"), model: envOf("GLM_MODEL") },
 };
 const which = (process.env.MODELS ?? "deepseek,kimi").split(",").map((s) => s.trim());
 
@@ -40,28 +54,50 @@ const VREPS = Number(process.env.VREPS ?? 2);
 interface Row { c: Case; fires: number; blockFires: number; filtBlockFires: number; valid: number; pass: boolean; blockPass: boolean; filtBlockPass: boolean; stable: boolean; types: Set<string> }
 
 async function runModel(name: string): Promise<{ rows: Row[]; failOpens: number }> {
-  const m = MODELS_DEF[name];
-  if (!m?.apiKey) {
-    console.log(`\n⊘ ${name}: no creds in .env — skipped\n`);
-    return { rows: [], failOpens: 0 };
+  // "claude-p" = subscription-backed reviewer (no api key); see reviewer-claude-p.ts. It's a GOLD/
+  // ceiling backend, NOT directly comparable to the deployed direct-API gate (different harness) —
+  // but it answers "what does a strong reviewer do on this gold" for free. Two-stage VERIFY is API-
+  // only (needs verifier creds), so it's skipped for claude-p.
+  const isSub = name === "claude-p";
+  let review: typeof reviewWithRetry;
+  let verifierCreds: { apiKey: string; baseURL: string; model: string } | null = null;
+  if (isSub) {
+    const { claudePReview } = await import("../lib/reviewer-claude-p.ts");
+    review = async (ctx, onFailOpen) => {
+      const v = await claudePReview(ctx);
+      if (v.status === "failed") onFailOpen?.();
+      return v.status === "failed" ? null : v;
+    };
+    console.log(`\n══ claude-p (subscription, ${process.env.VOUCH_CLAUDEP_MODEL ?? "default"}) — REPS=${REPS} ══`);
+  } else {
+    const m = MODELS_DEF[name];
+    if (!m?.apiKey) {
+      console.log(`\n⊘ ${name}: no creds in .env — skipped\n`);
+      return { rows: [], failOpens: 0 };
+    }
+    process.env.ANTHROPIC_API_KEY = m.apiKey;
+    process.env.ANTHROPIC_BASE_URL = m.baseURL;
+    process.env.VOUCH_REVIEWER_MODEL = m.model;
+    review = reviewWithRetry;
+    verifierCreds = { apiKey: m.apiKey, baseURL: m.baseURL, model: m.model };
+    console.log(`\n══ ${name} (${m.model}) @ ${m.baseURL} — REPS=${REPS}${VERIFY ? ` + two-stage self-verify ×${VREPS}` : ""} ══`);
   }
-  process.env.ANTHROPIC_API_KEY = m.apiKey;
-  process.env.ANTHROPIC_BASE_URL = m.baseURL;
-  process.env.VOUCH_REVIEWER_MODEL = m.model;
-
-  console.log(`\n══ ${name} (${m.model}) @ ${m.baseURL} — REPS=${REPS}${VERIFY ? ` + two-stage self-verify ×${VREPS}` : ""} ══`);
   const rows: Row[] = [];
   let failOpens = 0;
-  for (const c of CASES) {
+  // LIMIT caps the case count — for cheaply smoke-testing a new/slow backend (e.g. claude-p) before
+  // committing to the full ~13-case × REPS bake-off. 0 = full corpus.
+  const LIMIT = Number(process.env.LIMIT ?? 0);
+  const cases = LIMIT > 0 ? CASES.slice(0, LIMIT) : CASES;
+  for (const c of cases) {
     let fires = 0, blockFires = 0, filtBlockFires = 0, valid = 0;
     const types = new Set<string>();
     for (let i = 0; i < REPS; i++) {
-      const v = await reviewWithRetry({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] }, () => failOpens++);
+      const v = await review({ action: c.action, actionType: "stop-response", events: c.events, projectFindings: [] }, () => failOpens++);
       if (!v) continue;
       valid++;
       if (v.issues.length > 0) {
-        if (VERIFY) {
-          const verifier = { name: "self", apiKey: m.apiKey, baseURL: m.baseURL, model: m.model };
+        if (VERIFY && verifierCreds) {
+          const verifier = { name: "self", ...verifierCreds };
           const upheld = await verifyMajority(verifier, { action: c.action, events: c.events }, v.issues, VREPS);
           if (upheld === false) continue; // stage-2 rejected every flag — rep does NOT fire
         }
