@@ -100,8 +100,15 @@ export async function claudePReview(ctx: AgenticContext): Promise<ReviewVerdict>
   const findings = ctx.projectFindings?.length
     ? `\n\nPROJECT FINDINGS (lessons learned across sessions):\n${ctx.projectFindings.map((f) => `  • ${f}`).join("\n")}`
     : "";
+  // Same A/B hook as the deployed reviewer (anthropicReviewerAgentic): an env-gated extra clause
+  // appended to the criteria, so a candidate dimension (e.g. Thread-1 method/scope-consistency) can
+  // be tested here WITHOUT editing the baseline criteria. UNSET = byte-identical baseline.
+  const promptExtra = process.env.VOUCH_REVIEWER_PROMPT_EXTRA;
+  const criteria = promptExtra ? `${CRITERIA}\n\n${promptExtra}` : CRITERIA;
+  if (process.env.VOUCH_DIAG)
+    console.error(`[claudep-diag] prompt extra: ${promptExtra ? `${promptExtra.length} chars appended` : "NONE"}`);
   const prompt =
-    `${CRITERIA}\n\n` +
+    `${criteria}\n\n` +
     `ACTION (${ctx.actionType}):\n${ctx.action.slice(0, 4000)}\n\n` +
     `FULL SESSION HISTORY (${ctx.events.length} events):\n${renderEvents(ctx.events)}${findings}`;
 
