@@ -188,6 +188,17 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
   // showed up in the corpus). So tolerate more transients than the SDK's interactive default of 2.
   const client = new Anthropic({ apiKey, maxRetries: 4 });
 
+  // RECENCY WINDOW (point 1, 2026-06-21): the trace is per-project + append-only + never auto-reset,
+  // so over a long session it grows unbounded — and a big content-rich trace makes the model issue
+  // far MORE query_history calls (measured A/B: 1-event trace → 1 query / 7.6s; 1069-event trace →
+  // 59 queries / 45s, right at the 50s HARD_DEADLINE → fail-open on anything heavier). The events
+  // that ground the CURRENT response are the RECENT ones; events from earlier turns of a long session
+  // don't ground this turn's claims. So scope the reviewer to the last MAX_REVIEW_EVENTS — review cost
+  // stops scaling with session length. (Tunable via VOUCH_MAX_REVIEW_EVENTS; query_history still
+  // reaches anywhere WITHIN the window.)
+  const MAX_REVIEW_EVENTS = Number(process.env.VOUCH_MAX_REVIEW_EVENTS) || 200;
+  const events = ctx.events.slice(-MAX_REVIEW_EVENTS); // slice(-n) returns the whole array if shorter
+
   // Experiment hook: an optional extra clause appended to the system prompt. UNSET in production,
   // so the deployed prompt is byte-identical — this exists ONLY so a bench can A/B a candidate
   // prompt dimension (e.g. the alternative-hypothesis audit) without editing the live prompt.
@@ -200,7 +211,7 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
     : "";
   const userMsg =
     `ACTION (${ctx.actionType}):\n${ctx.action.slice(0, 4000)}\n\n` +
-    `HISTORY INDEX (use query_history for outputs/details):\n${buildHistoryIndex(ctx.events)}${findings}`;
+    `HISTORY INDEX (use query_history for outputs/details):\n${buildHistoryIndex(events)}${findings}`;
 
   const messages: Anthropic.MessageParam[] = [{ role: "user", content: userMsg }];
   // The reviewer's query trail, attached to the verdict so a cry-wolf post-mortem can see what
@@ -243,7 +254,7 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
             if (block.type === "tool_use" && block.name === "query_history") {
               const input = block.input as { pattern?: unknown };
               const pattern = typeof input?.pattern === "string" ? input.pattern : "";
-              const hits = queryHistory(ctx.events, pattern);
+              const hits = queryHistory(events, pattern);
               queries.push({ pattern, hits: hits.length });
               if (process.env.VOUCH_DIAG)
                 console.error(`[diag] query "${pattern}" → ${hits.length} hits`);

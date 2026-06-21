@@ -28,7 +28,11 @@ import { type Case, CASES } from "./cases.ts";
 
 const ROOT = join(import.meta.dir, "..", "..");
 const envFile = readFileSync(join(ROOT, ".env"), "utf8");
-const envOf = (k: string) => envFile.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1] ?? "";
+// Prefer process.env (bun auto-loads .env into it AND a command-line `GLM_MODEL=…` override lands
+// here) and fall back to the .env file text. The old file-only read SILENTLY IGNORED env-var
+// overrides — e.g. `GLM_MODEL=glm-5.2 bun run.ts` kept using the file's glm-4.7, so a "5.2" arm
+// actually ran 4.7. (2026-06-21 fix.)
+const envOf = (k: string) => process.env[k] || (envFile.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1] ?? "");
 
 // Direct-API backends: a swap is just 3 env vars (apiKey/baseURL/model) read at call time. Drop
 // a new backend's creds in .env (e.g. GLM_API_KEY/GLM_BASE_URL/GLM_MODEL) and it's comparable here.

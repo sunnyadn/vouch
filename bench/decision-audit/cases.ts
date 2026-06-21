@@ -23,7 +23,7 @@
 
 import type { CapturedEvent } from "../../src/core/evidence-capture.ts";
 
-const ev = (o: Partial<CapturedEvent>): CapturedEvent => ({
+export const ev = (o: Partial<CapturedEvent>): CapturedEvent => ({
   tool: "Bash", command: undefined, filePath: undefined, stdout: "", stderr: "", exitCode: 0, isNegative: false, ...o,
 });
 

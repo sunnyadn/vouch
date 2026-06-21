@@ -7,6 +7,22 @@ import type { CapturedEvent } from "../core/evidence-capture.ts";
 import { setSilent } from "../core/log.ts";
 import type { ReviewVerdict } from "../core/reviewer.ts";
 
+// Surface an ADVISE-level message that the AGENT actually receives, via a non-forcing system
+// reminder (hookSpecificOutput.additionalContext, exit 0). Verified 2026-06-21 against the Claude
+// Code hook docs: a bare exit-0 `stderr` write goes to the DEBUG LOG ONLY — invisible to BOTH the
+// agent and the human — which silently voided vouch's entire advise/warn tier (every warn-severity
+// issue reached no one). additionalContext injects the text into the agent's context WITHOUT
+// forcing continuation, so the agent sees the concern and decides — unlike exit 2, which forces one
+// reconsideration. A hook event that doesn't support the field simply ignores it, so this is never
+// worse than the old stderr. BLOCK still uses exit 2 (its stdout JSON would be ignored anyway).
+function emitAdvise(hookEventName: "Stop" | "PreToolUse", message: string): void {
+  const text = message.trim();
+  if (!text) return;
+  process.stdout.write(
+    JSON.stringify({ hookSpecificOutput: { hookEventName, additionalContext: text } }),
+  );
+}
+
 // Shared reviewer for both gates: the agentic reviewer — a tool-use loop that queries the
 // FULL un-windowed trace, fixing the windowing/truncation/post-commit-summary cry-wolves.
 // (reviewer-factored.ts is a researched burial-robust candidate, kept in bench until live
@@ -136,13 +152,18 @@ export async function dispatch(argv: string[]): Promise<number> {
           const { captureVerdict } = await import("../core/corpus.ts");
           captureVerdict({ actionType: "commit", action: message, events: allEvents, verdict });
           const healthNote = formatReviewerHealthNote(verdict);
-          if (healthNote) process.stderr.write(`${healthNote}\n`);
           const reviewMsg = formatReviewMessage(verdict);
-          if (reviewMsg) {
-            const hasBlock = verdict.issues.some((i) => i.severity === "block");
-            process.stderr.write(reviewMsg);
-            if (hasBlock) process.exit(2);
+          const hasBlock = verdict.issues.some((i) => i.severity === "block");
+          if (hasBlock) {
+            // BLOCK: exit 2 halts the commit and feeds the reason to the agent.
+            if (healthNote) process.stderr.write(`${healthNote}\n`);
+            if (reviewMsg) process.stderr.write(reviewMsg);
+            process.exit(2);
           }
+          // ADVISE: reviewer-down health note (you're ungated) + any warn-level concerns → the
+          // agent's context via additionalContext, instead of the dead exit-0 stderr.
+          const advise = [healthNote, reviewMsg].filter(Boolean).join("\n");
+          if (advise) emitAdvise("PreToolUse", advise);
         }
       } catch {
         // a hook must never break the session
@@ -168,9 +189,10 @@ export async function dispatch(argv: string[]): Promise<number> {
         const events = parseCapturedEvents(await readTrace());
         const readFiles = filesReadInSession(events);
         if (!readFiles.has(filePath)) {
-          process.stderr.write(
+          emitAdvise(
+            "PreToolUse",
             `⚠ vouch research-sufficiency: editing ${filePath.split("/").pop()} without reading it this session. ` +
-              `Read the file to ground edits in its current state.\n`,
+              `Read the file to ground edits in its current state.`,
           );
         }
       } catch {
@@ -268,12 +290,19 @@ export async function dispatch(argv: string[]): Promise<number> {
           }
         }
 
-        if (messages.length > 0) process.stderr.write(`${messages.join("\n")}\n`);
+        const combined = messages.join("\n");
         // Stop BLOCK: a block-severity reviewer issue exits 2, which feeds the message
         // back and forces the agent to keep going — it must confront the ungrounded
         // conclusion before it can stop. Guarded by alreadyForced so it fires at most
-        // once per stop-cycle. Advise-level (warn) issues stay exit 0.
-        if (reviewerBlocked && !alreadyForced) process.exit(2);
+        // once per stop-cycle (no thrash loop).
+        if (reviewerBlocked && !alreadyForced) {
+          if (combined) process.stderr.write(`${combined}\n`);
+          process.exit(2);
+        }
+        // ADVISE: warn-only concerns, OR a block that already forced its one reconsideration this
+        // cycle. Route to additionalContext so the agent RECEIVES it (non-forcing) — the old bare
+        // exit-0 stderr here reached no one.
+        if (combined) emitAdvise("Stop", combined);
       } catch {
         // a hook must never break the session
       }
