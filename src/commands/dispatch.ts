@@ -31,6 +31,7 @@ async function runReviewer(args: {
   action: string;
   actionType: "commit" | "stop-response";
   allEvents: CapturedEvent[];
+  userMessages?: string[];
 }): Promise<ReviewVerdict> {
   const { loadProjectFindings } = await import("../core/reviewer.ts");
   const projectFindings = await loadProjectFindings();
@@ -41,6 +42,7 @@ async function runReviewer(args: {
     actionType: args.actionType,
     events: args.allEvents,
     projectFindings,
+    userMessages: args.userMessages,
   });
   // Surgical, recall-safe post-filter: drop fires whose flagged quote is pure process/intent
   // narration ("Let me read X", "Starting Y now") — the dominant live cry-wolf class. Validated
@@ -256,6 +258,17 @@ export async function dispatch(argv: string[]): Promise<number> {
           const { extractLastAssistantText } = await import("../core/prose-stop.ts");
           const draft = extractLastAssistantText(transcriptText);
 
+          // Conversation evidence (off by default; gated until the A/B clears recall). The full
+          // transcript is already in hand here — surface the genuine user messages so the reviewer
+          // can verify "the user asked X" / catch misquotes, instead of cry-wolfing recap prose that
+          // references the conversation layer query_history can't see.
+          const includeConversation = process.env.VOUCH_INCLUDE_CONVERSATION === "1";
+          let userMessages: string[] | undefined;
+          if (includeConversation) {
+            const { extractUserMessages } = await import("../core/conversation-capture.ts");
+            userMessages = extractUserMessages(transcriptText);
+          }
+
           // 2a. Deterministic: absence claim without search
           if (draft && hasAbsenceClaimWithoutSearch(draft, traceEvents)) {
             messages.push(
@@ -274,6 +287,7 @@ export async function dispatch(argv: string[]): Promise<number> {
               action: draft.slice(0, 4000),
               actionType: "stop-response",
               allEvents,
+              userMessages,
             });
             const { captureVerdict } = await import("../core/corpus.ts");
             captureVerdict({
