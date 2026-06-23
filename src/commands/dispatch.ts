@@ -34,6 +34,7 @@ async function runReviewer(args: {
   userMessages?: string[];
   priorVerdicts?: string[];
   assistantMessages?: string[];
+  transcriptText?: string;
 }): Promise<ReviewVerdict> {
   const { loadProjectFindings } = await import("../core/reviewer.ts");
   const projectFindings = await loadProjectFindings();
@@ -47,6 +48,7 @@ async function runReviewer(args: {
     userMessages: args.userMessages,
     priorVerdicts: args.priorVerdicts,
     assistantMessages: args.assistantMessages,
+    transcriptText: args.transcriptText,
   });
   // Surgical, recall-safe post-filter: drop fires whose flagged quote is pure process/intent
   // narration ("Let me read X", "Starting Y now") — the dominant live cry-wolf class. Validated
@@ -301,6 +303,7 @@ export async function dispatch(argv: string[]): Promise<number> {
               userMessages,
               priorVerdicts,
               assistantMessages,
+              transcriptText, // UNGATED search-reach into the raw conversation/system layer (eye-fix)
             });
             const { captureVerdict } = await import("../core/corpus.ts");
             captureVerdict({

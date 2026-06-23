@@ -4,6 +4,7 @@ import {
   extractPriorVerdicts,
   extractUserMessages,
   searchConversation,
+  searchTranscript,
 } from "./conversation-capture.ts";
 
 // Build a transcript JSONL line for a vouch Stop-hook verdict (the real shape: type=attachment,
@@ -123,4 +124,31 @@ test("searchConversation labels each layer distinctly", () => {
   });
   expect(hit).toContain("USER MESSAGES");
   expect(hit).toContain("YOUR PRIOR VERDICTS");
+});
+
+test("searchTranscript reaches the system/attachment layer the tool trace can't contain (the eye-fix)", () => {
+  // The verified blind spot: gate verdicts live in type=system + type=attachment records, NOT the tool
+  // trace — so the reviewer fired `active-fabrication` on real events it couldn't search. searchTranscript
+  // reads the raw transcript, so a reference to a prior verdict / system-reminder is now findable.
+  const transcript = [
+    JSON.stringify({ type: "user", message: { role: "user", content: "fix the loop" } }),
+    JSON.stringify({ type: "system", content: "⚠ vouch reviewer (advise): research-insufficiency on claim Z" }),
+    verdictLine("⛔ vouch reviewer (BLOCK): fabrication detected on the prod-deploy claim"),
+    assistantLine("As the gate flagged earlier, the prod-deploy claim was unverified."),
+  ].join("\n");
+
+  // a reference to a SYSTEM-record advise → findable
+  const sysHit = searchTranscript(transcript, "research-insufficiency on claim Z");
+  expect(sysHit).toContain("TRANSCRIPT matches");
+  expect(sysHit).toContain("research-insufficiency on claim Z");
+
+  // a reference to a prior BLOCK verdict (ATTACHMENT record) → findable
+  const verdictHit = searchTranscript(transcript, "fabrication detected on the prod-deploy");
+  expect(verdictHit).toContain("fabrication detected on the prod-deploy");
+
+  // existence-only labelling carried into the result
+  expect(searchTranscript(transcript, "prod-deploy claim was unverified")).toContain("WHAT WAS SAID");
+
+  // nothing matches → empty (so a clean query adds no noise)
+  expect(searchTranscript(transcript, "nonexistent phrase xyzzy")).toBe("");
 });

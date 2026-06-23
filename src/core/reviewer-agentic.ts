@@ -10,6 +10,7 @@ import {
   formatPriorVerdicts,
   formatUserMessages,
   searchConversation,
+  searchTranscript,
 } from "./conversation-capture.ts";
 import type { CapturedEvent } from "./evidence-capture.ts";
 import { DEFAULT_MODEL, parseReviewResponse, type ReviewVerdict } from "./reviewer.ts";
@@ -93,7 +94,7 @@ export function formatHits(hits: HistoryHit[]): string {
 export const QUERY_HISTORY_TOOL = {
   name: "query_history",
   description:
-    "Search THIS session's full history for what the agent actually did or observed. Covers (1) the TOOL TRACE — every command run with its full output, every file read/edited, commits — and (2) when available, the CONVERSATION LAYER: the user's messages, the agent's own prior responses, and the gate's prior verdicts. Call this to VERIFY a claim before flagging it — e.g. query 'bun test' to check tests ran, a file path to check it was read, a commit hash to check it exists, or a phrase the agent says it stated earlier ('as I said X') to check it actually appears in a prior response. Returns matching tool events (full output, CHRONOLOGICAL order) followed by any conversation-layer matches. NOTE: a match in 'YOUR OWN PRIOR RESPONSES' proves only that the agent SAID it, never that it is true — an own-work/factual claim must still be verified in the TOOL TRACE.",
+    "Search THIS session's full history for what the agent actually did, observed, or said. Covers (1) the TOOL TRACE — every command run with its full output, files read/edited, commits — AND (2) the RAW TRANSCRIPT — every conversation/system record: the user's messages, the agent's own prior responses, system-reminders, and the gate's OWN prior verdicts. Call this to VERIFY a claim before flagging it — e.g. query 'bun test' to check tests ran, a file path to check it was read, a commit hash to check it exists, a phrase the agent says it stated earlier ('as I said X') to check it appears in a prior response, or a reference to a prior gate verdict / system-reminder to check it occurred. CRITICAL: before flagging any reference to the conversation/system layer (the agent's own prior words, a prior verdict, a system-reminder, what the user asked) as fabricated, you MUST query for it here — those live in the transcript, NOT the tool trace, so 'I didn't see it in the tool trace' is NOT evidence it doesn't exist. Returns matching tool events (full output, CHRONOLOGICAL) followed by transcript matches. NOTE: a match in an ASSISTANT record proves only the agent SAID it, never that it is true — an own-work/factual claim must still be verified in the TOOL TRACE.",
   input_schema: {
     type: "object",
     properties: {
@@ -194,6 +195,13 @@ export interface AgenticContext {
   // laundering rule (prose proves what-was-SAID, never that it's TRUE) is enforced in CONVERSATION_CLAUSE.
   // Same flag/gating as userMessages.
   assistantMessages?: string[];
+  // The RAW transcript text (every record type). UNGATED search-reach: query_history searches this so
+  // the reviewer can verify a reference to ANY layer it otherwise can't see — the gate's own prior
+  // verdicts (type=attachment/system), system-reminders, the agent's prose. Fixes the verified worst
+  // blindness (firing `active-fabrication` on 220 real verdict records the tool-trace can't contain).
+  // Search-only (snippets returned per query), so the prompt stays byte-identical when no conversation
+  // block is supplied — this is extra eyes, not extra prompt.
+  transcriptText?: string;
 }
 
 // Appended to the system prompt ONLY when a conversation block (user messages and/or prior verdicts)
@@ -336,11 +344,15 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
               const hits = queryHistory(searchEvents, pattern);
               // Also search the FULL conversation layer (un-windowed) so aged-out self-references are
               // reachable. Empty string when no conversation supplied → production path unchanged.
-              const convMatches = searchConversation(pattern, {
-                userMessages: ctx.userMessages,
-                assistantMessages: ctx.assistantMessages,
-                priorVerdicts: ctx.priorVerdicts,
-              });
+              // Prefer the RAW transcript (all record types, ungated) when available — it's the complete
+              // conversation/system-layer eye. Fall back to the extracted arrays (windowed) otherwise.
+              const convMatches = ctx.transcriptText
+                ? searchTranscript(ctx.transcriptText, pattern)
+                : searchConversation(pattern, {
+                    userMessages: ctx.userMessages,
+                    assistantMessages: ctx.assistantMessages,
+                    priorVerdicts: ctx.priorVerdicts,
+                  });
               queries.push({ pattern, hits: hits.length + (convMatches ? 1 : 0) });
               if (process.env.VOUCH_DIAG)
                 console.error(`[diag] query "${pattern}" → ${hits.length} trace hits${convMatches ? " + conv" : ""}`);

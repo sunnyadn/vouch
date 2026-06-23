@@ -232,6 +232,62 @@ export function searchConversation(pattern: string, layers: ConversationLayers, 
   return `\n---\nCONVERSATION-LAYER matches (not the tool trace):\n${sections.join("\n")}`;
 }
 
+// Search the RAW transcript (every record type: user, assistant, system, attachment) for `pattern`.
+// This is the root fix for the reviewer's worst blindness: query_history searches only the TOOL TRACE
+// (PostToolUse events), but a huge share of what the agent references — the gate's OWN prior verdicts,
+// system-reminders, the agent's prose — lives in `type=system`/`type=attachment`/assistant records that
+// the tool trace NEVER contains. Measured this session: 220 "vouch reviewer" verdict records existed in
+// the transcript (66 system + 126 attachment + ...) while the reviewer fired `active-fabrication` on them
+// as "non-existent events", because its search couldn't reach that layer. This searches it directly, so
+// "did the agent/gate/system actually say X" is answerable regardless of which layer X lives in.
+//
+// SEARCH-ONLY (like the events/searchEvents split): the raw transcript is searched on demand and only
+// matched snippets are returned — the full text never enters the prompt, so cost stays bounded. Additive
+// evidence → can only REDUCE false fabrication-fires (referent now findable); it does not touch the
+// firing criteria or the tool-trace path, so it is recall-safe by construction.
+export function searchTranscript(transcriptText: string, pattern: string, opts?: { max?: number; perHit?: number }): string {
+  const max = opts?.max ?? 12;
+  const perHit = opts?.perHit ?? 500;
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, "i");
+  } catch {
+    re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); // literal fallback
+  }
+  const hits: string[] = [];
+  for (const line of transcriptText.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: TranscriptRecord & { content?: unknown };
+    try {
+      rec = JSON.parse(t) as TranscriptRecord & { content?: unknown };
+    } catch {
+      continue;
+    }
+    // Pull the human-readable text for this record, by type.
+    let text = "";
+    const c = rec.message?.content;
+    if (typeof c === "string") text = c;
+    else if (Array.isArray(c)) {
+      text = (c as TranscriptBlock[])
+        .filter((b) => b?.type === "text" && typeof b.text === "string")
+        .map((b) => b.text as string)
+        .join("\n");
+    }
+    if (rec.attachment?.stdout) text += `\n${rec.attachment.stdout}`;
+    if (typeof rec.content === "string") text += `\n${rec.content}`; // type=system records carry text here
+    if (!text || !re.test(text)) continue;
+    const role = rec.message?.role ?? rec.attachment?.type ?? rec.type ?? "?";
+    const idx = text.match(re)?.index ?? 0;
+    const start = Math.max(0, idx - Math.floor(perHit / 3));
+    const snippet = text.slice(start, start + perHit).replace(/\s+/g, " ").trim();
+    hits.push(`  • [${rec.type}/${role}] ${start > 0 ? "…" : ""}${snippet}${start + perHit < text.length ? "…" : ""}`);
+  }
+  if (!hits.length) return "";
+  // existence-only: a match in an ASSISTANT record proves the agent SAID it, not that it is true.
+  return `\n---\nTRANSCRIPT matches (conversation/system layer — NOT the tool trace; an assistant-record match proves WHAT WAS SAID, not that it is true):\n${hits.slice(-max).join("\n")}`;
+}
+
 // Self-test: `bun src/core/conversation-capture.ts <transcript.jsonl>`
 if (import.meta.main) {
   const path =
