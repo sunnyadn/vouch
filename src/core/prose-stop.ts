@@ -40,6 +40,19 @@ interface TranscriptRecord {
   message?: { role?: string; content?: unknown };
 }
 
+// A harness/API ERROR surfaced as an assistant-role text block is NOT the agent's prose. Reviewing it
+// makes the gate fire `active-fabrication` on a SYSTEM string the agent never wrote (this session: the
+// rate-limit error "API Error: Server is temporarily limiting requests …" was flagged as the agent's
+// fabricated termination reason — eye-problem #5). Skip such drafts so the reviewer always reviews the
+// agent's last GENUINE response, never a harness error. Recall-neutral: this only changes WHICH text is
+// reviewed, never the firing logic — a genuine agent claim is still reviewed.
+const HARNESS_ERROR =
+  /^\s*(api error\b|request (?:was )?aborted|request timed out|server is temporarily limiting|rate[- ]?limit|overloaded_error|connection error|fetch failed|network error|503\b|429\b|\(eval\):)/i;
+
+export function isHarnessError(text: string): boolean {
+  return HARNESS_ERROR.test(text.trim());
+}
+
 export function extractLastAssistantText(jsonl: string): string {
   let last = "";
   for (const line of jsonl.split("\n")) {
@@ -58,7 +71,8 @@ export function extractLastAssistantText(jsonl: string): string {
       .filter((b) => b?.type === "text" && typeof b.text === "string")
       .map((b) => b.text as string)
       .join("");
-    if (text.length > 0) last = text;
+    // Skip a harness/API error masquerading as the agent's draft — keep the last GENUINE response.
+    if (text.length > 0 && !isHarnessError(text)) last = text;
   }
   return last;
 }
