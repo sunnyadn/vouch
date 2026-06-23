@@ -197,7 +197,16 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
   // stops scaling with session length. (Tunable via VOUCH_MAX_REVIEW_EVENTS; query_history still
   // reaches anywhere WITHIN the window.)
   const MAX_REVIEW_EVENTS = Number(process.env.VOUCH_MAX_REVIEW_EVENTS) || 200;
-  const events = ctx.events.slice(-MAX_REVIEW_EVENTS); // slice(-n) returns the whole array if shorter
+  // Decouple PROMPT-INDEX size from query_history REACH. The index is windowed (cost: a big index
+  // makes the model issue far more query_history calls → fail-open near the deadline), but the
+  // search itself runs over the FULL trace — so an event that aged out of the window is still
+  // REACHABLE on demand, just not pre-summarized. This fixes the aged-out-evidence cry-wolf (a
+  // claim grounded by an EARLIER turn's tool run — e.g. "doctor was green", a prior test pass —
+  // that the recency window dropped, making the reviewer report "not in history" and fire) WITHOUT
+  // re-inflating the prompt or the query count. Supersedes the old "earlier-turn events don't
+  // ground this turn" assumption for the query path: a back-reference legitimately does.
+  const events = ctx.events.slice(-MAX_REVIEW_EVENTS); // windowed → prompt index only
+  const searchEvents = ctx.events; // FULL trace → query_history reach (un-windowed)
 
   // Experiment hook: an optional extra clause appended to the system prompt. UNSET in production,
   // so the deployed prompt is byte-identical — this exists ONLY so a bench can A/B a candidate
@@ -254,7 +263,7 @@ export async function anthropicReviewerAgentic(ctx: AgenticContext): Promise<Rev
             if (block.type === "tool_use" && block.name === "query_history") {
               const input = block.input as { pattern?: unknown };
               const pattern = typeof input?.pattern === "string" ? input.pattern : "";
-              const hits = queryHistory(events, pattern);
+              const hits = queryHistory(searchEvents, pattern);
               queries.push({ pattern, hits: hits.length });
               if (process.env.VOUCH_DIAG)
                 console.error(`[diag] query "${pattern}" → ${hits.length} hits`);
