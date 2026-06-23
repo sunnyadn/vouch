@@ -30,6 +30,11 @@ interface TranscriptBlock {
 interface TranscriptRecord {
   type?: string;
   message?: { role?: string; content?: unknown };
+  // Hook output is threaded back as a `type:"attachment"` record (NOT a user/assistant turn). The
+  // Stop reviewer's own verdict lands here: attachment.command==="vouch stop review", and the
+  // verdict text is JSON in attachment.stdout → hookSpecificOutput.additionalContext. (Verified on
+  // a live transcript 2026-06-23: the `vouch reviewer (BLOCK)` records are type=attachment, not user.)
+  attachment?: { type?: string; command?: string; stdout?: string };
 }
 
 // Plain text of a user record's content. A genuine user turn is a bare string or an array with text
@@ -92,6 +97,139 @@ export function formatUserMessages(msgs: string[]): string {
   if (!msgs.length) return "";
   const body = msgs.map((m, i) => `  [${i + 1}] ${m.replace(/\n/g, "\n      ")}`).join("\n");
   return `\n\nUSER MESSAGES THIS SESSION (the user's actual words, oldest→newest):\n${body}`;
+}
+
+// The gate's OWN prior verdicts this session. These are INDEPENDENT evidence (the gate authored
+// them, not the agent), so grounding a "this was flagged before" / "that warning was a false
+// positive" reference against them is NOT circular. They live in `type:"attachment"` records
+// (command "vouch stop review"), with the verdict text as JSON in `attachment.stdout` under
+// hookSpecificOutput.additionalContext — a channel stripHarness() never sees.
+export function extractPriorVerdicts(transcriptText: string, opts?: ConversationOpts): string[] {
+  const perMsg = opts?.perMsg ?? 1500;
+  const out: string[] = [];
+  for (const line of transcriptText.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: TranscriptRecord;
+    try {
+      rec = JSON.parse(t) as TranscriptRecord;
+    } catch {
+      continue;
+    }
+    if (rec.type !== "attachment" || rec.attachment?.command !== "vouch stop review") continue;
+    const stdout = rec.attachment?.stdout;
+    if (typeof stdout !== "string" || !stdout) continue;
+    let ctx = "";
+    try {
+      const parsed = JSON.parse(stdout) as { hookSpecificOutput?: { additionalContext?: unknown } };
+      const ac = parsed.hookSpecificOutput?.additionalContext;
+      if (typeof ac === "string") ctx = ac.trim();
+    } catch {
+      continue; // a malformed hook payload is not a verdict we can surface
+    }
+    if (!ctx) continue;
+    if (/reviewer unavailable/i.test(ctx)) continue; // fail-open health note, not a verdict to ground against
+    out.push(ctx.length > perMsg ? `${ctx.slice(0, perMsg)}…[truncated]` : ctx);
+  }
+  return out.slice(-(opts?.max ?? 20));
+}
+
+// Format prior verdicts as a context block. The framing is deliberate: these ground a back-reference
+// to the gate's own earlier output; they are NOT a reason to re-fire the same objection reflexively.
+export function formatPriorVerdicts(verdicts: string[]): string {
+  if (!verdicts.length) return "";
+  const body = verdicts.map((v, i) => `  [${i + 1}] ${v.replace(/\n/g, "\n      ")}`).join("\n");
+  return `\n\nYOUR PRIOR VERDICTS THIS SESSION (the gate's OWN earlier output, oldest→newest — use ONLY to ground a reference TO a prior verdict, e.g. "this was already flagged"/"that warning was a false positive"; do NOT re-raise a past objection just because it appears here):\n${body}`;
+}
+
+// The agent's OWN PRIOR responses this session. Unlike user messages / prior verdicts, this layer is
+// NOT independent evidence — it is the agent's own prose, so it is circular to ground a claim's TRUTH
+// against it. We surface it anyway, scoped to ONE non-circular use: verifying that the agent ACTUALLY
+// SAID something it now back-references ("as I said", "I noted earlier", "I already explained"). Without
+// this the reviewer can't see the chat layer at all, so a faithful self-reference fires passive-
+// fabrication ("no evidence the agent said X") — the documented blind spot (this session: 3 such fires
+// on "让我先确认", a temporal self-narration, and a repeat). The anti-laundering rule lives in the
+// reviewer prompt (CONVERSATION_CLAUSE): a prior response proves only WHAT WAS SAID, never that its
+// content is TRUE — a factual/own-work claim is still audited in the tool trace even if asserted before.
+//
+// The CURRENT response (the action under review) is the LAST assistant turn in the transcript at Stop
+// time (it's already written). We DROP it — feeding the draft back as its own "evidence" is exactly the
+// circularity we're guarding against; only EARLIER turns are surfaced.
+export function extractAssistantMessages(transcriptText: string, opts?: ConversationOpts): string[] {
+  const perMsg = opts?.perMsg ?? 1500;
+  const all: string[] = [];
+  for (const line of transcriptText.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let rec: TranscriptRecord;
+    try {
+      rec = JSON.parse(t) as TranscriptRecord;
+    } catch {
+      continue;
+    }
+    if (rec.message?.role !== "assistant" || !Array.isArray(rec.message.content)) continue;
+    const blocks = rec.message.content as TranscriptBlock[];
+    const text = blocks
+      .filter((b) => b?.type === "text" && typeof b.text === "string")
+      .map((b) => b.text as string)
+      .join("\n")
+      .trim();
+    if (!text) continue; // a tool-use-only assistant turn carries no prose to ground a reference to
+    all.push(text.length > perMsg ? `${text.slice(0, perMsg)}…[truncated]` : text);
+  }
+  all.pop(); // drop the current draft (the action under review) — surfacing it back is circular
+  return all.slice(-(opts?.max ?? 15));
+}
+
+// Format the agent's prior responses. The framing is the load-bearing anti-laundering guard: these
+// ground ONLY the existence of an utterance, never the truth of its content.
+export function formatAssistantMessages(msgs: string[]): string {
+  if (!msgs.length) return "";
+  const body = msgs.map((m, i) => `  [${i + 1}] ${m.replace(/\n/g, "\n      ")}`).join("\n");
+  return `\n\nYOUR OWN PRIOR RESPONSES THIS SESSION (the agent's earlier prose, oldest→newest — use ONLY to verify the agent ACTUALLY SAID something it now references, e.g. "as I said"/"I noted earlier". A prior response proves WHAT WAS SAID, NOT that its content is true: a factual or own-work claim must STILL be checked in the tool trace even if asserted here — do NOT credit a claim merely because the agent said it before):\n${body}`;
+}
+
+// Search the FULL conversation layer (user messages, the agent's own prior responses, the gate's
+// prior verdicts) for `pattern` — the conversation-layer analog of queryHistory over the tool trace.
+// WHY: the prompt only surfaces a recent WINDOW of each layer (cost), so a self-reference to prose
+// from EARLIER in a long session ages out of the window and re-fires the very cry-wolf this is meant
+// to kill (measured: a referenced turn at index 4 of 30 fell outside a 15-turn window). Mirrors the
+// events/searchEvents decoupling (fix #1, a4f8cf4): window the prompt, but let the reviewer REACH the
+// whole layer on demand. Each layer is LABELLED so the anti-laundering scoping (assistant prose =
+// existence-only) survives into the query result. Returns "" when nothing matches or no layers given.
+export interface ConversationLayers {
+  userMessages?: string[];
+  assistantMessages?: string[];
+  priorVerdicts?: string[];
+}
+export function searchConversation(pattern: string, layers: ConversationLayers, perHit = 600): string {
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, "i");
+  } catch {
+    re = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"); // literal fallback
+  }
+  const sections: string[] = [];
+  const scan = (label: string, msgs: string[] | undefined) => {
+    if (!msgs?.length) return;
+    const hits = msgs.filter((m) => re.test(m));
+    if (!hits.length) return;
+    const body = hits
+      .map((m) => {
+        if (m.length <= perHit) return `  • ${m.replace(/\n/g, " ")}`;
+        const idx = m.match(re)?.index ?? 0;
+        const start = Math.max(0, idx - Math.floor(perHit / 3));
+        return `  • …${m.slice(start, start + perHit).replace(/\n/g, " ")}…`;
+      })
+      .join("\n");
+    sections.push(`${label} (${hits.length} match${hits.length > 1 ? "es" : ""}):\n${body}`);
+  };
+  scan("USER MESSAGES", layers.userMessages);
+  // existence-only: a match here proves the agent SAID it, NOT that it is true (see CONVERSATION_CLAUSE)
+  scan("YOUR OWN PRIOR RESPONSES", layers.assistantMessages);
+  scan("YOUR PRIOR VERDICTS", layers.priorVerdicts);
+  if (!sections.length) return "";
+  return `\n---\nCONVERSATION-LAYER matches (not the tool trace):\n${sections.join("\n")}`;
 }
 
 // Self-test: `bun src/core/conversation-capture.ts <transcript.jsonl>`

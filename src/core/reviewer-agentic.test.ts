@@ -1,7 +1,14 @@
 import { test, expect } from "bun:test";
+import { searchConversation } from "./conversation-capture.ts";
 import type { CapturedEvent } from "./evidence-capture.ts";
 import { parseCapturedEvents } from "./evidence-capture.ts";
-import { anthropicReviewerAgentic, queryHistory, formatHits } from "./reviewer-agentic.ts";
+import {
+  anthropicReviewerAgentic,
+  buildConversationBlock,
+  composeSystemPrompt,
+  formatHits,
+  queryHistory,
+} from "./reviewer-agentic.ts";
 
 const ev = (o: Partial<CapturedEvent>): CapturedEvent => ({
   tool: "Bash", command: undefined, filePath: undefined, stdout: "", stderr: "", exitCode: 0, isNegative: false, ...o,
@@ -77,6 +84,39 @@ test("no API key → verdict.status is 'skipped', NOT an indistinguishable empty
   } finally {
     if (saved !== undefined) process.env.ANTHROPIC_API_KEY = saved;
   }
+});
+
+test("PRODUCTION INVARIANT: feature OFF → prompt is byte-identical to the trace-only path", () => {
+  // The structural "zero production impact" claim, made testable (research-insufficiency catch
+  // 2026-06-24). With no conversation layer supplied (VOUCH_INCLUDE_CONVERSATION unset → arrays
+  // undefined), the user-message block adds ZERO bytes and the system prompt gets NO clause.
+  expect(buildConversationBlock({})).toBe(""); // off → no bytes in the user message
+  expect(buildConversationBlock({ userMessages: [], priorVerdicts: [], assistantMessages: [] })).toBe(""); // empty arrays too
+
+  const off = composeSystemPrompt(false);
+  const on = composeSystemPrompt(true);
+  expect(off).not.toContain("CONVERSATION SCOPE"); // the clause marker is absent on the off path
+  expect(off).not.toContain("YOUR OWN PRIOR RESPONSES");
+  expect(on.startsWith(off)).toBe(true); // on = off + appended clause → off path is byte-identical
+  expect(on).toContain("CONVERSATION SCOPE"); // clause present only when conversation is supplied
+  expect(on).toContain("YOUR OWN PRIOR RESPONSES");
+});
+
+test("WINDOW DECOUPLING (red→green): a self-reference that the prompt window DROPS is still REACHABLE", () => {
+  // The aged-out self-reference cry-wolf (this session: referenced prose at index 4 of 30, outside a
+  // 15-turn window). Discriminating test: SAME input, the windowed prompt block does NOT surface the
+  // target (RED — windowed-only would re-fire), but searchConversation over the full array DOES (GREEN).
+  const target = "I will first confirm the architecture before proposing";
+  const assistantMessages = [target, ...Array.from({ length: 20 }, (_, i) => `later filler turn ${i}`)];
+
+  // RED: the prompt window (12) drops the oldest turn → the referenced prose is NOT in the block.
+  const windowed = buildConversationBlock({ assistantMessages }, 12);
+  expect(windowed).not.toContain("first confirm the architecture");
+
+  // GREEN: query_history's conversation search reaches the FULL array → the prose is found.
+  const reached = searchConversation("first confirm the architecture", { assistantMessages });
+  expect(reached).toContain("first confirm the architecture");
+  expect(reached).toContain("YOUR OWN PRIOR RESPONSES"); // existence-only labelling carried into the hit
 });
 
 test("queryHistory is window-agnostic: a pre-commit event is still found after a commit", () => {

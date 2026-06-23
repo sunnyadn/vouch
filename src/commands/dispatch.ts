@@ -32,6 +32,8 @@ async function runReviewer(args: {
   actionType: "commit" | "stop-response";
   allEvents: CapturedEvent[];
   userMessages?: string[];
+  priorVerdicts?: string[];
+  assistantMessages?: string[];
 }): Promise<ReviewVerdict> {
   const { loadProjectFindings } = await import("../core/reviewer.ts");
   const projectFindings = await loadProjectFindings();
@@ -43,6 +45,8 @@ async function runReviewer(args: {
     events: args.allEvents,
     projectFindings,
     userMessages: args.userMessages,
+    priorVerdicts: args.priorVerdicts,
+    assistantMessages: args.assistantMessages,
   });
   // Surgical, recall-safe post-filter: drop fires whose flagged quote is pure process/intent
   // narration ("Let me read X", "Starting Y now") — the dominant live cry-wolf class. Validated
@@ -264,9 +268,16 @@ export async function dispatch(argv: string[]): Promise<number> {
           // references the conversation layer query_history can't see.
           const includeConversation = process.env.VOUCH_INCLUDE_CONVERSATION === "1";
           let userMessages: string[] | undefined;
+          let priorVerdicts: string[] | undefined;
+          let assistantMessages: string[] | undefined;
           if (includeConversation) {
-            const { extractUserMessages } = await import("../core/conversation-capture.ts");
-            userMessages = extractUserMessages(transcriptText);
+            const { extractUserMessages, extractPriorVerdicts, extractAssistantMessages } =
+              await import("../core/conversation-capture.ts");
+            // Generous cap: the reviewer windows these for the PROMPT but searchConversation REACHES
+            // the full arrays, so an aged-out self-reference is still verifiable (mirrors fix #1).
+            userMessages = extractUserMessages(transcriptText, { max: 200 });
+            priorVerdicts = extractPriorVerdicts(transcriptText, { max: 200 }); // gate's own output → grounds "this was flagged"
+            assistantMessages = extractAssistantMessages(transcriptText, { max: 200 }); // agent's own prose → grounds "as I said" (existence-only)
           }
 
           // 2a. Deterministic: absence claim without search
@@ -288,6 +299,8 @@ export async function dispatch(argv: string[]): Promise<number> {
               actionType: "stop-response",
               allEvents,
               userMessages,
+              priorVerdicts,
+              assistantMessages,
             });
             const { captureVerdict } = await import("../core/corpus.ts");
             captureVerdict({
