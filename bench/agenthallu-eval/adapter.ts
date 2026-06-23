@@ -35,6 +35,11 @@ const REPS = Number(flag("--reps", "2"));
 // coding gold (bench/verify-replay): kimi-detect + kimi-self-verify 10/10 at REPS=4.
 const VERIFY = args.includes("--verify");
 const VREPS = Number(flag("--vreps", "2"));
+// --transcript: build a raw transcript from the trajectory's prior agent-reasoning steps and PASS it,
+// activating the transcript-search eye-fix (869b7de). This is the RECALL HELD-OUT for that fix: if
+// recall DROPS vs the no-transcript baseline, transcript-search is laundering real hallucinations
+// (finding the bad claim echoed in the agent's own prior reasoning and wrongly grounding it).
+const TRANSCRIPT = args.includes("--transcript");
 
 interface Step {
   step: number;
@@ -79,6 +84,22 @@ function eventsBefore(t: Traj, upto: number): CapturedEvent[] {
 
 // AgentHallu fields aren't always strings (agent_answer / content can be structured) — coerce.
 const asText = (x: unknown): string => (typeof x === "string" ? x : x == null ? "" : JSON.stringify(x));
+
+// The agent's prior REASONING steps as a raw transcript (assistant records) — the conversation layer
+// the eye-fix lets the reviewer search. Steps before `upto` only (the bad step is the action, not
+// prior context). This is exactly the laundering surface: if the hallucinated claim was echoed in the
+// agent's own earlier reasoning, transcript-search will find it — and the anti-laundering clause must
+// still make the reviewer FIRE (prose proves what-was-said, not that it's true).
+function buildTranscriptText(t: Traj, upto: number): string {
+  const lines: string[] = [];
+  for (const s of t.history) {
+    if (s.step >= upto) break;
+    const txt = stepText(s);
+    if (txt)
+      lines.push(JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: txt }] } }));
+  }
+  return lines.join("\n");
+}
 
 function stepText(s: Step | undefined): string {
   if (!s) return "";
@@ -139,7 +160,7 @@ if (ALL) {
 const endpoint = process.env.ANTHROPIC_BASE_URL ?? "api.anthropic.com";
 const model = process.env.VOUCH_REVIEWER_MODEL ?? "(default)";
 console.log(
-  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${ALL ? "ALL categories" : CATEGORY} (expect FIRE)`} | ${trajectories.length} trajectories × ${REPS} reps${VERIFY ? ` | TWO-STAGE self-verify ×${VREPS}` : ""}\n`,
+  `AgentHallu → ${model} @ ${endpoint} | mode=${CLEAN ? "PRECISION (clean, expect NOFIRE)" : `RECALL ${ALL ? "ALL categories" : CATEGORY} (expect FIRE)`} | transcript-search=${TRANSCRIPT ? "ON (eye-fix arm)" : "OFF (baseline)"} | ${trajectories.length} trajectories × ${REPS} reps${VERIFY ? ` | TWO-STAGE self-verify ×${VREPS}` : ""}\n`,
 );
 // Stage-2 verifier = the SAME model/endpoint the detector runs on (self-verify).
 const verifierModel = {
@@ -172,7 +193,10 @@ for (const t of trajectories) {
   let firedIssues: { type: string; detail: string }[] = [];
   for (let r = 0; r < REPS; r++) {
     // fail-open (429/error) is retried then excluded — never counted as a silent no-fire.
-    const v = await reviewWithRetry({ action, actionType: "stop-response", events, projectFindings: [] }, () => failOpens++);
+    const transcriptText = TRANSCRIPT
+      ? buildTranscriptText(t, CLEAN ? Number.MAX_SAFE_INTEGER : halluStep)
+      : undefined;
+    const v = await reviewWithRetry({ action, actionType: "stop-response", events, projectFindings: [], transcriptText }, () => failOpens++);
     if (!v) continue;
     valid++;
     if (v.issues.some((i) => i.severity === "block" || i.severity === "warn")) {
