@@ -6,6 +6,8 @@ drift from that: fabricated results, conclusions with no investigation behind th
 *"there's no library for X"* asserted without a search. The agent follows no protocol and
 can't forget to use it — the hooks do everything. vouch watches; it doesn't ask.
 
+> **Status:** research prototype, not production-ready. See [Status & findings](#status--findings).
+
 ## How it works, in one loop
 
 vouch **observes** every step while the agent works, then **verifies** its words against
@@ -43,6 +45,18 @@ Every block names the exact span, why it's unsupported, and the fix:
 
 **[→ How it works](docs/how-it-works.md)** — the mechanism, the two grounding axes, the
 two layers (free deterministic gate + agentic LLM reviewer), and what each catch means.
+
+## Status & findings
+
+vouch is a **research prototype, not a released tool.** I built it to answer one question: can an LLM reviewer catch a coding agent's ungrounded claims reliably and cheaply enough to gate a real session? So far the honest answer is no, and the way it fails is the point.
+
+**What works.** The deterministic layer is reliable and free: it parses a commit's test-count claims and blocks them when a recorded run contradicts them. No model, no false-positive blowup. Fabricated "all tests pass" is a large share of real agent hallucination, and this catches it.
+
+**What doesn't yet.** The LLM reviewer cries wolf. On the AgentHallu benchmark its block precision is about 80% (95% CI 70–87%) with roughly 60% recall (provisional, measured under quota strain), and precision swings run to run. In practice it cried wolf often enough that it is currently disabled on its own repository, after it repeatedly blocked a test count I had verified three times.
+
+**The core open problem.** The main false-positive class, over-firing on "you did not investigate enough", resists any prompt fix that does not also cost recall. The reviewer is expensive and slow too: a large trace pushes it past the hook's time budget into fail-open (silent un-gating), and running it every turn drains reviewer quota. Reliably and cheaply catching real hallucinations without sacrificing recall is not solved here.
+
+I am sharing it because the negative result is real. The eval harness (benchmarked against AgentHallu plus self-authored gold, with blind cross-family adjudication and variance tracking) and the measured precision/recall/cost trilemma are, to me, more useful than another tool that claims to work.
 
 ## Install
 

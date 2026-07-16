@@ -28,3 +28,7 @@ bench/dogfood/fires-*.jsonl
 # pairs as fires-*.jsonl.
 bench/dogfood/p-alpha-judge-study-sample.tsv
 bench/dogfood/p-alpha-judge-study-crossvalidate.jsonl
+
+# Local agent working state — never commit (private project notes, session traces).
+.claude/
+.vouch-trace.jsonl

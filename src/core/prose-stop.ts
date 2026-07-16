@@ -44,10 +44,17 @@ interface TranscriptRecord {
 // makes the gate fire `active-fabrication` on a SYSTEM string the agent never wrote (this session: the
 // rate-limit error "API Error: Server is temporarily limiting requests …" was flagged as the agent's
 // fabricated termination reason — eye-problem #5). Skip such drafts so the reviewer always reviews the
-// agent's last GENUINE response, never a harness error. Recall-neutral: this only changes WHICH text is
-// reviewed, never the firing logic — a genuine agent claim is still reviewed.
+// agent's last GENUINE response, never a harness error.
+//
+// Each keyword must be followed by ERROR-shaped continuation (a colon, a standard HTTP status phrase, or
+// end-of-string) — NOT narrative prose. A loose prefix match (`api error\b`, `429\b`, `rate[- ]?limit`)
+// had a RECALL HOLE: a genuine draft STARTING with the keyword ("API error handling: I added…", "Rate
+// limit handling is now implemented", "429 handling: …") was wrongly skipped → dropped from review
+// entirely, so a hallucination hidden in such a draft would never be seen. Tightening closes that hole
+// (falsification-tested 2026-06-24: 3 genuine-draft holes → 0, while all real errors still skip → the
+// #5 cry-wolf is not reopened). Mid-sentence mentions were always safe (anchored `^`).
 const HARNESS_ERROR =
-  /^\s*(api error\b|request (?:was )?aborted|request timed out|server is temporarily limiting|rate[- ]?limit|overloaded_error|connection error|fetch failed|network error|503\b|429\b|\(eval\):)/i;
+  /^\s*(api error:|request (?:was )?aborted\b|request timed out\b|server is temporarily limiting|rate[- ]?limit(?:ed|\s+exceeded|\s+error|:|\s*$)|overloaded_error\b|connection error\b|fetch failed\b|network error\b|(?:429|503)\b(?:\s*$|[:.]|\s+(?:too many|service unavailable|bad gateway|temporarily|unavailable|gateway))|\(eval\):)/i;
 
 export function isHarnessError(text: string): boolean {
   return HARNESS_ERROR.test(text.trim());

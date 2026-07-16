@@ -214,6 +214,13 @@ export async function dispatch(argv: string[]): Promise<number> {
     )
     .action(async () => {
       try {
+        // Full kill-switch: VOUCH_OFF=1 silences the ENTIRE Stop hook (LLM reviewer AND the
+        // deterministic omission/absence checks). VOUCH_REVIEWER_OFF only disables the LLM path and
+        // — counterintuitively — ENABLES the deterministic unresolved-negatives fallback below, so it
+        // is not a true "off". Use VOUCH_OFF when you want vouch entirely quiet. Read at runtime, so a
+        // working-tree (symlinked) install honours it on the next Stop with no rebuild or fresh session.
+        if (process.env.VOUCH_OFF === "1") return;
+
         let payload: { transcript_path?: unknown; stop_hook_active?: unknown };
         try {
           payload = JSON.parse(await Bun.stdin.text());
