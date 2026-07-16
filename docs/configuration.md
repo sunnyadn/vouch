@@ -13,6 +13,7 @@ The reviewer needs an Anthropic-compatible endpoint and key.
 | `ANTHROPIC_BASE_URL` | Endpoint. Default `api.anthropic.com`. |
 | `VOUCH_REVIEWER_MODEL` | Model id as named on your gateway. |
 | `VOUCH_REVIEWER_OFF` | Set to `1` to skip the LLM reviewer deliberately (the deterministic gate still runs). |
+| `VOUCH_OFF` | Set to `1` to silence the **entire Stop hook** — LLM reviewer *and* the deterministic turn-end checks. The commit gate is unaffected. |
 | `VOUCH_CORPUS_PATH` | Where verdicts are logged. Default `~/.claude/vouch-corpus.jsonl`. |
 
 > **A Claude Code subscription / OAuth login does _not_ export a key.** Without one the

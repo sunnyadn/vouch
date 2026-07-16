@@ -58,6 +58,10 @@ vouch is a **research prototype, not a released tool.** I built it to answer one
 
 I am sharing it because the negative result is real. The eval harness (benchmarked against AgentHallu plus self-authored gold, with blind cross-family adjudication and variance tracking) and the measured precision/recall/cost trilemma are, to me, more useful than another tool that claims to work.
 
+**[→ The evaluation](bench/README.md)** — where each number comes from, the adjudication
+protocol, which figures you can recompute from the committed data, and which part is withheld
+(and why).
+
 ## Install
 
 **Terminal-launched Claude Code only.** Requires [Bun](https://bun.sh) ≥ 1.3.
