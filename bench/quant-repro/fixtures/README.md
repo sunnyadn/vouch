@@ -12,6 +12,22 @@ Replay a case through the deployed-native parser + a reviewer:
 bun bench/quant-repro/review-live-repro.ts --backend claude-p --dir bench/quant-repro/fixtures/<dir>
 ```
 
+## Where the three traps come from
+
+Look-ahead, multiple testing, and uncosted turnover are not a generic list. They are the
+failure modes that mattered at NLPQuant, where we were building an automated framework to
+reproduce factors from papers. The agent read a paper, built the factor, backtested it, and
+reported whether it reproduced. Hand-decomposed reproductions were the gold it was tuned
+against, and the checks that gated a run had names: look-ahead bias, OOS contamination,
+sample-size denial. The decision rule was pre-registered at a commit before the driver ran,
+so a verdict could not be chosen after seeing the numbers.
+
+vouch came out of that work, and the question is the same in both places: the agent says it
+reproduced something, and the only thing that can contradict it is the record of what it
+actually computed. `live-jt-01` is the case closest to the original setting, a
+Jegadeesh-Titman reproduction that self-corrected a parse bug and then still claimed
+"reproduces J-T" without fetching the paper's benchmark.
+
 ## How the FIRE/NOFIRE labels arise
 
 The same traps were run by **opus** and **haiku** workers. The worker model drives the outcome:
