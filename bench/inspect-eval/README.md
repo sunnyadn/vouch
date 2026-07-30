@@ -84,6 +84,17 @@ live-jt-01            paper-reproduction kimi    BORDERLINE  NOFIRE  4
 
 35 `query_history` calls, no fail-opens, 164k tokens, 3m25s.
 
+That run is committed as `runs/2026-07-30-kimi-k2.7.eval`, so the table above can be
+audited without spending anything:
+
+```bash
+inspect view --log-dir ./runs
+```
+
+It holds the per-sample transcript, every model call, and each `query_history` pattern
+the reviewer chose. Only this one reference run is tracked; `_logs/` stays ignored so
+later runs do not accumulate in the repository.
+
 **Do not quote those three numbers on their own.** Nine samples and four fires means the
 confidence interval on a precision of 1.000 is wide enough to be meaningless. What the run
 supports is narrower: the pipeline is real and reproducible, and on this small set the
